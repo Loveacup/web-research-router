@@ -111,10 +111,11 @@ def doctor_exit_code(results: List[EngineCheckResult], *, strict: bool = False) 
 # ── v5.5 外部依赖 doctor ──
 
 async def run_deps_doctor(*, deep: bool = False) -> List[Dict]:
-    """运行外部依赖健康检查。
+    """运行全量依赖健康检查。
 
     Returns:
-        [{"id": str, "status": "ok"|"degraded"|"missing", "version": str, "detail": str}, ...]
+        [{"id": str, "type": str, "status": "ok"|"degraded"|"missing",
+          "source_url": str, "required": bool, "version": str, "detail": str}, ...]
     """
     from .deps import DepRegistry
 
@@ -123,23 +124,30 @@ async def run_deps_doctor(*, deep: bool = False) -> List[Dict]:
 
     async def _check_safe(dep_id: str, dep):
         try:
-            result = await dep.health(deep=deep)
+            import asyncio as _asyncio
+            result = dep.health(deep=deep)
+            if _asyncio.iscoroutine(result):
+                result = await result
+            if _asyncio.iscoroutine(result):  # double-check for nested coroutines
+                result = await result
             return {
                 "id": dep_id,
-                "capability": dep.capability,
+                "type": dep.dep_type.value,
                 "status": result.status.value,
+                "source_url": dep.source_url,
+                "required": dep.required,
                 "version": result.version,
                 "detail": result.detail,
-                "pattern": dep.calling_pattern.value,
             }
         except Exception as exc:
             return {
                 "id": dep_id,
-                "capability": getattr(dep, "capability", "unknown"),
+                "type": getattr(dep, "dep_type", None),
                 "status": "missing",
+                "source_url": getattr(dep, "source_url", ""),
+                "required": getattr(dep, "required", True),
                 "version": "unknown",
                 "detail": str(exc),
-                "pattern": getattr(dep, "calling_pattern", "unknown"),
             }
 
     results = await asyncio.gather(

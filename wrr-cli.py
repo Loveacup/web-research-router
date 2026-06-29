@@ -383,12 +383,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_deps_report(deps_results: list) -> None:
-    """打印外部依赖检查报告。"""
+    """打印全量依赖检查报告。"""
     print()
-    print("── 外部依赖 ──")
+    print("── 全量依赖 ──")
     for d in deps_results:
         icon = {"ok": "✓", "degraded": "⚠", "missing": "✗"}.get(d["status"], "?")
-        print(f"  {icon} {d['id']} [{d['pattern']}] — {d['status']}")
+        dep_type = d.get("type", "?")
+        required = "" if d.get("required", True) else " (可选)"
+        print(f"  {icon} {d['id']} [{dep_type}]{required} — {d['status']}")
+        if d.get("source_url"):
+            print(f"     source: {d['source_url']}")
         if d.get("version") and d["version"] != "unknown":
             print(f"     version: {d['version']}")
         if d.get("detail"):

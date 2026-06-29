@@ -9,6 +9,7 @@ query → classify_intent(mode) → parallel engines → RRF fusion → ranked r
 ```
 
 ### 6 routing modes
+
 | Mode | Use case | Engines |
 |------|----------|---------|
 | discovery | "what's out there" | exa + brave + github + community |
@@ -19,6 +20,7 @@ query → classify_intent(mode) → parallel engines → RRF fusion → ranked r
 | recovery | everything failed | searxng |
 
 ### 11 engines
+
 **Public-web (7):** Exa, Brave, GitHub, Community (OpenCLI), Academic (OpenAlex+Semantic Scholar+arXiv), Skill, SearXNG
 **Local (4):** Supermemory, Session, QMD, Obsidian
 
@@ -29,26 +31,57 @@ query → classify_intent(mode) → parallel engines → RRF fusion → ranked r
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr
 
 # CLI
-wrr-cli.py search "your query"
-wrr-cli.py doctor
-wrr doctor --json
+wrr-cli.py doctor          # 引擎 + 全量依赖自检
+wrr-cli.py doctor --json   # JSON 输出
+wrr search "your query"    # 搜索（需 Hermes runtime）
 ```
 
-## Dependencies
+## Dependencies (13 total)
 
-| Engine | Dependency | Install |
-|--------|-----------|---------|
-| Community | last30days-skill / last30days-skill-cn | `git clone` |
-| Community | OpenCLI (Agent-Reach) | `npm install -g opencli` |
-| Academic | paper-search-mcp (optional) | `git clone + pip install` |
-| Exa | `EXA_API_KEY` env var | [exa.ai](https://exa.ai) |
-| Brave | `BRAVE_API_KEY` env var | [brave.com/search/api](https://brave.com/search/api/) |
-| GitHub | `GITHUB_TOKEN` env var | [github.com/settings/tokens](https://github.com/settings/tokens) |
+Run `wrr-cli.py doctor` for self-check.
+
+### Environment variables (4)
+
+| ID | Source | Required |
+|----|--------|----------|
+| `exa_api_key` | [exa.ai](https://exa.ai) | ✅ |
+| `brave_api_key` | [brave.com/search/api](https://brave.com/search/api/) | ✅ |
+| `github_token` | [github.com/settings/tokens](https://github.com/settings/tokens) | ✅ |
+| `searxng_url` | [github.com/searxng/searxng](https://github.com/searxng/searxng) | 可选 |
+
+### Git repositories (4)
+
+| ID | Source | Required |
+|----|--------|----------|
+| `last30days_en` | [mvanhorn/last30days-skill](https://github.com/mvanhorn/last30days-skill) | ✅ |
+| `last30days_cn` | [Jesseovo/last30days-skill-cn](https://github.com/Jesseovo/last30days-skill-cn) | ✅ |
+| `paper_search_mcp` | [openags/paper-search-mcp](https://github.com/openags/paper-search-mcp) | 可选 |
+| `agent_reach` | [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) | ✅ |
+
+### CLI tools (2)
+
+| ID | Source | Required |
+|----|--------|----------|
+| `opencli` | [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) | ✅ |
+| `qmd` | [github.com/qmd/qmd](https://github.com/qmd/qmd) | ✅ |
+
+### Docker containers (1)
+
+| ID | Source | Required |
+|----|--------|----------|
+| `searxng` | [github.com/searxng/searxng](https://github.com/searxng/searxng) | 可选 |
+
+### Hermes built-in tools (2)
+
+| ID | Source |
+|----|--------|
+| `supermemory` | [hermes-agent.nousresearch.com](https://hermes-agent.nousresearch.com/docs) |
+| `session_search` | [hermes-agent.nousresearch.com](https://hermes-agent.nousresearch.com/docs) |
 
 ## Testing
 
 ```bash
-PYTHONPATH=. pytest -q  # 275 tests
+PYTHONPATH=. pytest -q  # 287 tests
 ```
 
 ## License
