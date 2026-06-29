@@ -101,7 +101,7 @@ def test_doctor_v6_json_available_without_changing_legacy_json_shape():
     assert "trust" not in legacy_payload
 
     v6 = _run_cli("doctor", "--v6", "--json", "--runtime", "standalone")
-    assert v6.returncode == 0, v6.stderr
+    assert v6.stdout
     v6_payload = json.loads(v6.stdout)
 
     assert {"runtime", "env", "discovered", "resolved", "health", "summary", "trust"} <= set(v6_payload)
@@ -114,7 +114,7 @@ def test_doctor_v6_json_available_without_changing_legacy_json_shape():
 
 def test_v6_trust_project_flag_is_explicit_in_doctor_and_install_json():
     doctor = _run_cli("doctor", "--v6", "--json", "--runtime", "standalone", "--trust-project")
-    assert doctor.returncode == 0, doctor.stderr
+    assert doctor.stdout
     doctor_payload = json.loads(doctor.stdout)
     assert doctor_payload["trust"]["project"] is True
     assert doctor_payload["summary"]["trust_project_explicit"] is True
@@ -159,3 +159,11 @@ def test_v6_migration_flags_have_explicit_help_text(command: str):
         assert "--apply" in help_text
         assert "默认" in help_text
         assert "project-level manifest" in help_text
+
+
+def test_doctor_v6_returns_nonzero_when_summary_status_fails():
+    completed = _run_cli("doctor", "--v6", "--json", "--runtime", "standalone")
+    assert completed.stdout
+    payload = json.loads(completed.stdout)
+    if payload["summary"]["status"] == "fail":
+        assert completed.returncode == 1

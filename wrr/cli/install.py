@@ -51,8 +51,10 @@ def install(
 ) -> InstallReport:
     """Return the v6 install plan.
 
-    P0 is intentionally report-only. ``dry_run=False`` records the target and
-    planned writes but still does not write files.
+    This is an internal report API. During the current CLI migration gate,
+    ``wrr-cli.py install`` rejects non-dry-run calls; even if callers pass
+    ``dry_run=False`` here, this function only records planned writes and does
+    not write files. Real writes belong to a future explicit migration step.
     """
 
     resolved_cwd = Path.cwd() if cwd is None else Path(cwd)

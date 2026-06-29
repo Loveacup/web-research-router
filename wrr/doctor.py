@@ -1,4 +1,6 @@
 """WRR doctor 运行器 + 诊断汇总。"""
+from __future__ import annotations
+
 import asyncio
 import os
 from dataclasses import dataclass
@@ -23,7 +25,7 @@ async def run_doctor(
         registry: 引擎注册表
         engine: 指定单个引擎名称，None 表示检查所有
         tier: 过滤特定 tier，None 表示不过滤
-        deep: 是否执行深度检查（P0 未实现）
+        deep: 是否执行深度检查（传递给 engine/deps/v6 live health，具体探测深度由各实现决定）
 
     Returns:
         检查结果列表

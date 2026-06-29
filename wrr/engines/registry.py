@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import importlib.util
 import shutil
 import subprocess
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from wrr.engines.loader import (
     EngineDiscovery,
@@ -34,8 +35,8 @@ from wrr.runtime.state import (
 
 HealthStatus = str
 HealthMode = str
-Resolver = Callable[[str], str | None]
-RevisionResolver = Callable[..., str | None]
+Resolver = Callable[[str], Optional[str]]
+RevisionResolver = Callable[..., Optional[str]]
 
 TRUSTED_ADAPTER_LEVELS = {"builtin", "user", "entry_point"}
 
@@ -390,10 +391,13 @@ class EngineRegistry:
         if health_mode == "auto":
             health_mode = "light"
 
-        checks = tuple(
+        manifest_checks = [
             self._run_check(descriptor.manifest, check)
             for check in descriptor.manifest.health.get("checks", [])
             if isinstance(check, Mapping) and _check_applies(check, health_mode)
+        ]
+        checks = tuple(
+            [*manifest_checks, *self._requirement_health_checks(descriptor.manifest)]
         )
         health = EngineHealth(descriptor.id, _combine_health(checks), checks)
         if health_mode == "live":
@@ -434,6 +438,149 @@ class EngineRegistry:
             required=required,
             message="unsupported_health_check",
         )
+
+    def _requirement_health_checks(
+        self,
+        manifest: EnginePluginManifest,
+    ) -> tuple[HealthCheckResult, ...]:
+        """Derive light health checks from required manifest dependencies.
+
+        Manifest requirements are the source of truth. Explicit health checks are
+        still supported, but required binaries/repos/Hermes tools must affect
+        v6 doctor configured/routable state even when a manifest author forgets
+        to duplicate them under ``health.checks``.
+        """
+
+        checks: list[HealthCheckResult] = []
+        explicit_keys = _explicit_health_keys(manifest.health.get("checks", []))
+
+        for item in _list_requirements(manifest, "binaries"):
+            binary = str(item.get("binary") or item.get("name") or "")
+            required = bool(item.get("required", True))
+            if not binary or explicit_keys.get(("binary_present", binary)) is True:
+                continue
+            checks.append(
+                _binary_present_check(item, self._executable_resolver, required)
+            )
+
+        for requirement in manifest.repo_requirements:
+            if explicit_keys.get(("repo_revision", requirement.name)) is True:
+                continue
+            check: dict[str, Any] = {"type": "repo_revision", "repo": requirement.name, "required": requirement.required}
+            env_value = self.env.values.get(requirement.env) if requirement.env else None
+            if env_value is not None and env_value.value:
+                check["path"] = env_value.value
+            elif requirement.path:
+                check["path"] = requirement.path
+            elif requirement.default_path:
+                check["path"] = requirement.default_path
+            checks.append(
+                _repo_revision_check(
+                    check,
+                    manifest,
+                    requirement.required,
+                    revision_resolver=self._revision_resolver,
+                )
+            )
+
+        for item in _list_requirements(manifest, "hermes_tools"):
+            tool = str(item.get("tool") or item.get("name") or "")
+            if not tool or explicit_keys.get(("hermes_tool_present", tool)) is True:
+                continue
+            checks.append(_hermes_tool_present_check(item, self.runtime))
+
+        for item in _list_requirements(manifest, "python"):
+            package = str(item.get("package") or item.get("name") or "")
+            if not package or explicit_keys.get(("python_package_present", package)) is True:
+                continue
+            checks.append(_python_package_present_check(item))
+
+        for item in _list_requirements(manifest, "docker"):
+            container = str(item.get("container") or item.get("name") or "")
+            if not container or explicit_keys.get(("docker_container_present", container)) is True:
+                continue
+            if bool(item.get("required", True)):
+                checks.append(
+                    HealthCheckResult(
+                        type="docker_container_present",
+                        status="unhealthy",
+                        required=True,
+                        target=container,
+                        message="docker_check_not_configured",
+                    )
+                )
+        return tuple(checks)
+
+
+def _explicit_health_keys(raw_checks: Any) -> dict[tuple[str, str], bool]:
+    keys: dict[tuple[str, str], bool] = {}
+    if not isinstance(raw_checks, list):
+        return keys
+    for check in raw_checks:
+        if not isinstance(check, Mapping):
+            continue
+        check_type = str(check.get("type") or "")
+        if check_type == "binary_present":
+            target = check.get("binary") or check.get("name")
+        elif check_type == "repo_revision":
+            target = check.get("repo") or check.get("name")
+        elif check_type == "hermes_tool_present":
+            target = check.get("tool") or check.get("name")
+        elif check_type == "python_package_present":
+            target = check.get("package") or check.get("name")
+        elif check_type == "docker_container_present":
+            target = check.get("container") or check.get("name")
+        else:
+            target = check.get("target") or check.get("name")
+        if target:
+            keys[(check_type, str(target))] = bool(check.get("required", True))
+    return keys
+
+
+def _hermes_tool_present_check(
+    item: Mapping[str, Any],
+    runtime: RuntimeInfo,
+) -> HealthCheckResult:
+    tool = str(item.get("tool") or item.get("name") or "")
+    required = bool(item.get("required", True))
+    available = runtime.name == "hermes"
+    if available:
+        return HealthCheckResult(
+            type="hermes_tool_present",
+            status="healthy",
+            required=required,
+            target=tool,
+            message="hermes_tool_present",
+        )
+    return HealthCheckResult(
+        type="hermes_tool_present",
+        status="unhealthy" if required else "degraded",
+        required=required,
+        target=tool,
+        message="missing_required_hermes_tool" if required else "missing_optional_hermes_tool",
+        details={"runtime": runtime.name},
+    )
+
+
+def _python_package_present_check(item: Mapping[str, Any]) -> HealthCheckResult:
+    package = str(item.get("package") or item.get("name") or "")
+    required = bool(item.get("required", True))
+    present = bool(package and importlib.util.find_spec(package) is not None)
+    if present:
+        return HealthCheckResult(
+            type="python_package_present",
+            status="healthy",
+            required=required,
+            target=package,
+            message="python_package_present",
+        )
+    return HealthCheckResult(
+        type="python_package_present",
+        status="unhealthy" if required else "degraded",
+        required=required,
+        target=package,
+        message="missing_required_python_package" if required else "missing_optional_python_package",
+    )
 
 
 def _configured(manifest: EnginePluginManifest, env: EnvSnapshot) -> tuple[bool, list[str]]:
@@ -550,7 +697,7 @@ def _repo_revision_check(
     if path is None:
         return HealthCheckResult(
             type="repo_revision",
-            status="degraded",
+            status="unhealthy" if check_required else "degraded",
             required=check_required,
             target=None,
             message="repo_requirement_missing",
@@ -560,7 +707,7 @@ def _repo_revision_check(
     if pin_status.status in {"missing", "unavailable"}:
         return HealthCheckResult(
             type="repo_revision",
-            status="degraded",
+            status="unhealthy" if check_required else "degraded",
             required=check_required,
             target=str(path),
             message=pin_status.message,

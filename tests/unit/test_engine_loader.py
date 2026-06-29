@@ -134,3 +134,19 @@ requires_capabilities:
         "local_kb": True,
         "can_spawn_cli": True,
     }
+
+
+def test_invalid_repo_calling_pattern_is_schema_error():
+    manifest, errors = parse_engine_manifest(
+        _manifest(
+            "badrepo",
+            requirements={
+                "env": [],
+                "binaries": [],
+                "repos": [{"name": "sample", "calling_pattern": "unknown"}],
+            },
+        )
+    )
+
+    assert manifest is None
+    assert "invalid:requirements.repos[sample].calling_pattern" in errors

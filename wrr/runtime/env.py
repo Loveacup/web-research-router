@@ -6,7 +6,6 @@ This module parses .env files into an immutable report object without mutating
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
@@ -29,7 +28,7 @@ class EnvFileCandidate:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "path": str(self.path),
+            "path": _display_path(self.path),
             "source": self.source,
             "trust_level": self.trust_level,
             "priority": self.priority,
@@ -57,7 +56,7 @@ class EnvValue:
             "key": self.key,
             "value": None if self.secret else self.value,
             "source": self.source,
-            "source_path": str(self.source_path) if self.source_path else None,
+            "source_path": _display_path(self.source_path),
             "priority": self.priority,
             "secret": self.secret,
             "secret_allowed": self.secret_allowed,
@@ -81,8 +80,8 @@ class EnvConflict:
             "key": self.key,
             "winner_source": self.winner_source,
             "loser_source": self.loser_source,
-            "winner_path": str(self.winner_path) if self.winner_path else None,
-            "loser_path": str(self.loser_path) if self.loser_path else None,
+            "winner_path": _display_path(self.winner_path),
+            "loser_path": _display_path(self.loser_path),
             "reason": self.reason,
         }
 
@@ -225,6 +224,15 @@ def load_env(
     )
 
 
+def _display_path(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return f"~/{path.expanduser().resolve().relative_to(Path.home().resolve())}"
+    except ValueError:
+        return str(path)
+
+
 def _normalize_env_files(
     env_files: Sequence[Path | str | EnvFileCandidate],
     cwd: Path,
@@ -265,7 +273,10 @@ def _classify_explicit_env_path(path: Path, cwd: Path) -> tuple[TrustLevel, str]
     try:
         path.relative_to(cwd)
     except ValueError:
-        return "env_path", "explicit_env_path"
+        # A file explicitly passed by the CLI/user is user-trusted even when it
+        # lives outside the project. This is distinct from auto-discovered
+        # project env files, whose secrets remain blocked by default.
+        return "user", "explicit_env_path"
     return "project", "project_env"
 
 
@@ -350,5 +361,4 @@ def _secret_allowed(trust_level: TrustLevel, trust_project: bool) -> bool:
 def _redact(value: str, *, secret: bool) -> str:
     if not secret:
         return value
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-    return f"sha256:{digest}"
+    return "<secret-present>"

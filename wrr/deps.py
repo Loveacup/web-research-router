@@ -9,7 +9,7 @@
   - install_guide: 缺失时怎样安装/配置
   - required: 是否必需（False = 可选，缺失不阻塞）
 
-从 v5.5 的 4 个 git repo 扩展到全量 14 个依赖。
+从 v5.5 的 4 个 git repo 扩展到全量 13 个依赖。
 """
 
 from __future__ import annotations
@@ -476,7 +476,7 @@ async def _run_subprocess(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 全量依赖清单（14 项）
+# 全量依赖清单（13 项）
 # ══════════════════════════════════════════════════════════════════════
 
 DEPENDENCY_MANIFEST: List[BaseDep] = [
@@ -728,7 +728,10 @@ def manifest_to_legacy_deps(
 ) -> List[BaseDep]:
     """Convert one v6 manifest requirements block into v5 dependency objects."""
 
-    requirements = getattr(manifest, "requirements", {}) or {}
+    if isinstance(manifest, Mapping):
+        requirements = manifest.get("requirements", {}) or {}
+    else:
+        requirements = getattr(manifest, "requirements", {}) or {}
     if not isinstance(requirements, Mapping):
         return []
 
@@ -858,7 +861,10 @@ def _repo_deps_from_manifest(
             continue
         dep_id = _dep_id(item, name)
         legacy = legacy_deps.get(dep_id)
-        calling_pattern = CallingPattern(str(item.get("calling_pattern") or "subprocess"))
+        try:
+            calling_pattern = CallingPattern(str(item.get("calling_pattern") or "subprocess"))
+        except ValueError:
+            calling_pattern = CallingPattern.SUBPROCESS
         out.append(
             GitRepoDep(
                 dep_id=dep_id,

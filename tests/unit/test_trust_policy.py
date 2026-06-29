@@ -109,16 +109,17 @@ def test_project_env_does_not_satisfy_required_secret_unless_trusted(tmp_path):
     assert any(item["code"] == "trust_project_enabled" for item in trusted["findings"])
 
 
-def test_explicit_env_path_secret_is_untrusted_by_default(tmp_path):
+def test_explicit_env_path_secret_is_user_trusted_by_default(tmp_path):
     env_file = tmp_path.parent / "explicit.env"
     env_file.write_text("EXA_API_KEY=explicit-secret\n", encoding="utf-8")
     runtime = _runtime(tmp_path)
 
     snapshot = load_env(runtime, env_files=[env_file])
 
-    assert "EXA_API_KEY" not in snapshot.values
-    assert snapshot.candidates[0].trust_level == "env_path"
-    assert snapshot.ignored_values[0].ignore_reason == "untrusted_env_ignored_secret"
+    assert "EXA_API_KEY" in snapshot.values
+    assert snapshot.candidates[0].trust_level == "user"
+    assert snapshot.values["EXA_API_KEY"].secret_allowed is True
+    assert snapshot.ignored_values == []
 
 
 def test_explicit_env_file_candidate_can_still_mark_user_trusted(tmp_path):

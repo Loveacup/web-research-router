@@ -337,7 +337,8 @@ def cmd_doctor(ns) -> int:
                 f"degraded={summary['degraded']} "
                 f"unhealthy={summary['unhealthy']}"
             )
-        return 0
+        status = report.to_dict()["summary"].get("status")
+        return 1 if status == "fail" or (ns.strict and status == "warn") else 0
 
     from wrr.registry import get_registry
     from wrr.doctor import run_doctor, summarize_checks, doctor_exit_code, run_deps_doctor, summarize_deps

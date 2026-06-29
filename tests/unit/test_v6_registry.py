@@ -180,6 +180,25 @@ def test_binary_present_light_health_uses_injected_resolver(tmp_path):
     assert qmd.health.checks[0].details["path"] == "/usr/local/bin/qmd"
 
 
+def test_required_manifest_dependencies_affect_routability(tmp_path):
+    runtime = _runtime(tmp_path)
+    registry = EngineRegistry(
+        runtime=runtime,
+        env=_env(runtime),
+        include_builtin=True,
+        executable_resolver=lambda _name: None,
+    )
+
+    community = registry.get("community")
+
+    assert community is not None
+    assert community.health.status == "unhealthy"
+    assert community.routable is False
+    messages = {check.message for check in community.health.checks}
+    assert "missing_required_binary" in messages
+    assert "repo_requirement_missing" in messages or "repo_path_missing" in messages
+
+
 def test_path_and_repo_revision_checks_are_light_and_reporting_only(tmp_path):
     repo_path = tmp_path / "repo"
     present_path = tmp_path / "data"
@@ -218,8 +237,9 @@ def test_path_and_repo_revision_checks_are_light_and_reporting_only(tmp_path):
     descriptor = registry.get("local")
 
     assert descriptor is not None
-    assert descriptor.health.status == "degraded"
+    assert descriptor.health.status == "unhealthy"
     assert [check.type for check in descriptor.health.checks] == ["path_present", "repo_revision"]
     assert descriptor.health.checks[0].status == "healthy"
     assert descriptor.health.checks[1].message == "repo_path_missing"
-    assert descriptor.routable is True
+    assert descriptor.routable is False
+    assert "health_unhealthy" in descriptor.routable_reasons

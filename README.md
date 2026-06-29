@@ -4,11 +4,15 @@ Semantic search router with mode-based routing, 11 engines, and Reciprocal Rank 
 
 ## Architecture
 
+Hermes `web_search` / runtime tool entrypoint uses the v5 mode/RRF route:
+
 ```
 query → classify_intent(mode) → parallel engines → RRF fusion → ranked results
 ```
 
-### 6 routing modes
+The standalone legacy-compatible `wrr-cli.py search` command still uses the serial fallback route for compatibility unless a future migration step changes it.
+
+### 8 routing modes
 
 | Mode | Use case | Engines |
 |------|----------|---------|
@@ -16,27 +20,31 @@ query → classify_intent(mode) → parallel engines → RRF fusion → ranked r
 | grounding | "what's the fact" | exa + brave |
 | research | deep investigation | exa (deep) + brave + academic |
 | academic | papers only | openalex + semantic-scholar + arxiv |
+| platform | platform/community-specific questions | github + community |
+| broad | broad practical interest / exploratory queries | exa + brave + community |
 | local | search my stuff | supermemory + session + qmd + obsidian |
 | recovery | everything failed | searxng |
 
 ### 11 engines
 
-**Public-web (7):** Exa, Brave, GitHub, Community (OpenCLI), Academic (OpenAlex+Semantic Scholar+arXiv), Skill, SearXNG
-**Local (4):** Supermemory, Session, QMD, Obsidian
+- **Public-web (7):** Exa, Brave, GitHub, Community (OpenCLI), Academic (OpenAlex+Semantic Scholar+arXiv), Skill, SearXNG
+- **Local (4):** Supermemory, Session, QMD, Obsidian
 
 ## Quick start
+
+Requires Python >= 3.10 (`pyproject.toml` enforces this). On macOS, `/usr/bin/env python3` may resolve to Python 3.9; for direct script usage prefer a 3.10+ environment or call `python3.10 ./wrr-cli.py ...`.
 
 ```bash
 # Install as Hermes plugin
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr
 
-# Legacy-compatible CLI examples
-wrr-cli.py doctor          # 引擎 + 全量依赖自检
-wrr-cli.py doctor --json   # legacy JSON 输出，迁移窗口内 schema 保持不变
-wrr-cli.py search "your query" --provider exa --count 5
-wrr-cli.py fetch "https://example.com" --provider exa --max-chars 2000
-wrr-cli.py similar "https://example.com" --provider exa --count 5
-wrr search "your query"    # Hermes runtime tool entrypoint
+# Legacy-compatible CLI examples (run inside Python >=3.10)
+./wrr-cli.py doctor          # 引擎 + 全量依赖自检
+./wrr-cli.py doctor --json   # legacy JSON 输出，迁移窗口内 schema 保持不变
+./wrr-cli.py search "your query" --provider exa --count 5
+./wrr-cli.py fetch "https://example.com" --provider exa --max-chars 2000
+./wrr-cli.py similar "https://example.com" --provider exa --count 5
+wrr search "your query"      # Hermes runtime tool entrypoint
 ```
 
 ## v6 CLI migration gate
@@ -47,17 +55,18 @@ announced.
 
 ```bash
 # v6 doctor JSON: new shape with runtime/env/discovered/resolved/health/summary/trust
-wrr-cli.py doctor --v6 --json
+./wrr-cli.py doctor --v6 --json
 
-# Trust project-level plugins and project .env secrets only when explicitly needed
-wrr-cli.py doctor --v6 --trust-project --json
+# Trust project-level plugins and project env files only when explicitly needed
+./wrr-cli.py doctor --v6 --trust-project --json
 
-# v6 install planning is report-only unless a future migration step changes it
-wrr-cli.py install --dry-run --runtime codex --json
-wrr-cli.py install --dry-run --runtime hermes --refresh-deps --json
+# v6 install planning is report-only; --dry-run is currently required
+# (non-dry-run install exits 2 until a future migration step enables writes)
+./wrr-cli.py install --dry-run --runtime codex --json
+./wrr-cli.py install --dry-run --runtime hermes --refresh-deps --json
 
 # v6 dependency update defaults to dry-run; --apply is explicit
-wrr-cli.py update --dry-run --json
+./wrr-cli.py update --dry-run --json
 ```
 
 ## Dependencies (13 total)
@@ -105,7 +114,7 @@ Run `wrr-cli.py doctor` for self-check.
 ## Testing
 
 ```bash
-PYTHONPATH=. pytest -q  # 287 tests
+PYTHONPATH=. pytest -q
 ```
 
 ## License

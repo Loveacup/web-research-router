@@ -668,6 +668,9 @@ def _repo_requirements_or_error(
         if not isinstance(required, bool):
             errors.append(f"invalid:requirements.repos[{repo_name}].required")
             continue
+        calling_pattern = item.get("calling_pattern")
+        if calling_pattern is not None and str(calling_pattern) not in {"subprocess", "http", "mcp", "hermes_tool"}:
+            errors.append(f"invalid:requirements.repos[{repo_name}].calling_pattern")
         repos.append(
             RepoRequirement(
                 name=repo_name,

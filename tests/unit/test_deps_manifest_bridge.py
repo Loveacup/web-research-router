@@ -8,6 +8,7 @@ from wrr.deps import (
     DepType,
     builtin_manifest_legacy_deps,
     compare_manifest_bridge_to_legacy,
+    manifest_to_legacy_deps,
 )
 from wrr.engines.loader import discover_engine_plugins
 
@@ -67,3 +68,24 @@ def test_default_legacy_deps_behavior_is_unchanged():
     assert len(registry.all) == 13
     assert set(registry.all) == {dep.id for dep in DEPENDENCY_MANIFEST}
     assert "obsidian_vaults" not in registry.all
+
+
+def test_unknown_manifest_calling_pattern_does_not_crash_bridge():
+    deps = manifest_to_legacy_deps(
+        {
+            "schema_version": 1,
+            "id": "badrepo",
+            "name": "Bad Repo",
+            "kind": "web_api",
+            "capabilities": {"actions": ["search"], "domains": ["web"]},
+            "routing": {"modes": ["auto"], "weight": 1.0},
+            "requirements": {
+                "env": [],
+                "binaries": [],
+                "repos": [{"dep_id": "sample", "name": "sample", "calling_pattern": "new-mode"}],
+            },
+            "health": {"checks": []},
+        }
+    )
+
+    assert [dep.id for dep in deps] == ["sample"]

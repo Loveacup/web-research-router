@@ -133,24 +133,32 @@ def test_snapshot_serialization_redacts_secret_values(tmp_path):
 
     assert isinstance(snapshot, EnvSnapshot)
     assert isinstance(snapshot.values["EXA_API_KEY"], EnvValue)
-    assert snapshot.values["EXA_API_KEY"].redacted.startswith("sha256:")
+    assert snapshot.values["EXA_API_KEY"].redacted == "<secret-present>"
     assert "super-secret-value" not in encoded
     assert payload["values"]["EXA_API_KEY"]["value"] is None
 
 
-def test_explicit_env_file_candidate_can_mark_env_path_untrusted(tmp_path):
+def test_explicit_env_file_candidate_can_load_user_trusted_secret(tmp_path):
     env_file = tmp_path.parent / "runtime.env"
     env_file.write_text("BRAVE_API_KEY=secret\n", encoding="utf-8")
-    candidate = EnvFileCandidate(
-        path=env_file,
-        source="explicit_env_path",
-        trust_level="env_path",
-        priority=1,
-        exists=True,
-    )
     runtime = RuntimeStub(cwd=tmp_path, env_files=[])
 
-    snapshot = load_env(runtime, env_files=[candidate])
+    snapshot = load_env(runtime, env_files=[env_file])
 
-    assert "BRAVE_API_KEY" not in snapshot.values
-    assert snapshot.ignored_values[0].ignore_reason == "untrusted_env_ignored_secret"
+    assert snapshot.values["BRAVE_API_KEY"].source == "explicit_env_path"
+    assert snapshot.values["BRAVE_API_KEY"].secret_allowed is True
+    assert snapshot.ignored_values == []
+
+
+def test_snapshot_serialization_uses_home_relative_paths(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_file = home / ".hermes" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("EXA_API_KEY=user-secret\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    runtime = RuntimeStub(cwd=tmp_path / "project", env_files=[env_file])
+
+    payload = load_env(runtime).to_dict()
+
+    assert payload["candidates"][0]["path"] == "~/.hermes/.env"
+    assert payload["values"]["EXA_API_KEY"]["source_path"] == "~/.hermes/.env"
