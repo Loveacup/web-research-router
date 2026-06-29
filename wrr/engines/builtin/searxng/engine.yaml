@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "searxng",
+  "name": "SearXNG",
+  "kind": "web_api",
+  "adapter": "wrr.engines.searxng:SearxngEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["web"]
+  },
+  "routing": {
+    "modes": ["auto", "web", "default"],
+    "weight": 0.7
+  },
+  "requirements": {
+    "env": [
+      {"name": "SEARXNG_URL", "required": true, "secret": false}
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "SEARXNG_URL", "required": true}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

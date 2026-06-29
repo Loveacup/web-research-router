@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "exa",
+  "name": "Exa",
+  "kind": "web_api",
+  "adapter": "wrr.engines.exa:ExaEngine",
+  "capabilities": {
+    "actions": ["search", "extract", "similar"],
+    "domains": ["web"]
+  },
+  "routing": {
+    "modes": ["auto", "web", "default"],
+    "weight": 1.0
+  },
+  "requirements": {
+    "env": [
+      {"name": "EXA_API_KEY", "required": true, "secret": true}
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "EXA_API_KEY", "required": true}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

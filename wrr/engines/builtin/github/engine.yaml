@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "github",
+  "name": "GitHub",
+  "kind": "web_api",
+  "adapter": "wrr.engines.github:GitHubEngine",
+  "capabilities": {
+    "actions": ["search", "extract"],
+    "domains": ["code", "issues", "repositories"]
+  },
+  "routing": {
+    "modes": ["auto", "github", "code"],
+    "weight": 1.0
+  },
+  "requirements": {
+    "env": [
+      {"name": "GITHUB_TOKEN", "required": false, "secret": true}
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "GITHUB_TOKEN", "required": false}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

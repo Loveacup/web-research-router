@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "brave",
+  "name": "Brave Search",
+  "kind": "web_api",
+  "adapter": "wrr.engines.brave:BraveEngine",
+  "capabilities": {
+    "actions": ["search", "extract"],
+    "domains": ["web"]
+  },
+  "routing": {
+    "modes": ["auto", "web", "default"],
+    "weight": 0.8
+  },
+  "requirements": {
+    "env": [
+      {"name": "BRAVE_API_KEY", "aliases": ["BRAVE_SEARCH_API_KEY"], "required": true, "secret": true}
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "BRAVE_API_KEY", "aliases": ["BRAVE_SEARCH_API_KEY"], "required": true}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

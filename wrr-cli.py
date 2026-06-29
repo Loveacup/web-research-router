@@ -249,8 +249,73 @@ def cmd_test(ns) -> int:
     return 0 if overall_ok else 1
 
 
+def cmd_install(ns) -> int:
+    """v6 install surface: report-only in P0."""
+    from wrr.cli.install import install
+
+    if not ns.dry_run:
+        _eprint("✗ P0 install 仅支持 --dry-run，不写文件")
+        return 2
+
+    report = install(
+        dry_run=True,
+        runtime_hint=ns.runtime,
+        trust_project=ns.trust_project,
+        env_files=[ns.env] if ns.env else None,
+    )
+    if ns.json:
+        _emit_json(report.to_dict())
+    else:
+        payload = report.to_dict()
+        print("WRR v6 install dry-run")
+        print(f"  runtime: {payload['runtime']['name']}")
+        print(f"  config target: {payload['config_target']}")
+        print("  env candidates:")
+        for candidate in payload["env_candidates"]:
+            marker = "loaded" if candidate["loaded"] else candidate.get("reason") or "not_loaded"
+            print(f"    - {candidate['path']} [{candidate['trust_level']}, {marker}]")
+        print(f"  missing required env: {len(payload['missing_required_env'])}")
+        print("  writes performed: 0")
+    return 0
+
+
 def cmd_doctor(ns) -> int:
     """Doctor: 检查引擎健康状况和本地依赖。"""
+    if getattr(ns, "v6", False):
+        from wrr.doctor import doctor_v6
+
+        try:
+            report = doctor_v6(
+                json=ns.json,
+                deep=ns.deep,
+                trust_project=ns.trust_project,
+                runtime_hint=ns.runtime,
+                env_files=[ns.env] if ns.env else None,
+            )
+        except Exception as e:
+            _eprint(f"✗ v6 Doctor 失败: {type(e).__name__}: {e}")
+            return 1
+        if ns.json:
+            _emit_json(report.to_dict())
+        else:
+            payload = report.to_dict()
+            summary = payload["summary"]
+            print("WRR v6 doctor")
+            print(f"  runtime: {payload['runtime']['name']}")
+            print(
+                "  engines: "
+                f"discovered={summary['discovered']} "
+                f"resolved={summary['resolved']} "
+                f"routable={summary['routable']}"
+            )
+            print(
+                "  health: "
+                f"healthy={summary['healthy']} "
+                f"degraded={summary['degraded']} "
+                f"unhealthy={summary['unhealthy']}"
+            )
+        return 0
+
     from wrr.registry import get_registry
     from wrr.doctor import run_doctor, summarize_checks, doctor_exit_code, run_deps_doctor, summarize_deps
     from wrr.formatters import format_doctor_report
@@ -352,6 +417,16 @@ def build_parser() -> argparse.ArgumentParser:
     tp = sub.add_parser("test", parents=[common], help="冒烟测试 search/fetch/similar")
     tp.set_defaults(func=cmd_test)
 
+    ip = sub.add_parser("install", help="生成 v6 install 报告（P0 仅 dry-run）")
+    ip.add_argument("--dry-run", action="store_true", help="只输出计划，不写任何文件")
+    ip.add_argument("--json", action="store_true", help="输出 JSON 格式")
+    ip.add_argument("--env", metavar="PATH", help="指定 v6 env 文件")
+    ip.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"],
+                    help="显式指定 v6 runtime")
+    ip.add_argument("--trust-project", action="store_true", help="信任项目级插件和项目 .env secret")
+    ip.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
+    ip.set_defaults(func=cmd_install)
+
     # doctor 子命令（v5.1，不继承 common 中的 --provider，因需独立 --engine）
     dp = sub.add_parser("doctor", help="检查引擎健康状况和本地依赖")
     dp.add_argument("--engine", choices=["exa", "brave", "github", "skill", "searxng", "community", "academic",
@@ -363,6 +438,10 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     dp.add_argument("--strict", action="store_true", help="严格模式：warn 也视为失败（退出码 1）")
     dp.add_argument("--deep", action="store_true", help="深度探测：执行命令/API 实际验证（较慢）")
+    dp.add_argument("--v6", action="store_true", help="使用 v6 control-plane doctor")
+    dp.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"],
+                    help="显式指定 v6 runtime")
+    dp.add_argument("--trust-project", action="store_true", help="信任项目级插件和项目 .env secret")
     dp.set_defaults(func=cmd_doctor)
 
     return p
@@ -372,7 +451,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
 
-    loaded = load_env(getattr(ns, "env", None))
+    use_v6_env = ns.cmd == "install" or (ns.cmd == "doctor" and getattr(ns, "v6", False))
+    loaded = None if use_v6_env else load_env(getattr(ns, "env", None))
     if not ns.quiet and not getattr(ns, "json", False):
         if loaded:
             _eprint(f"· 已加载 env：{loaded}")

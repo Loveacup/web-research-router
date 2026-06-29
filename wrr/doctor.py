@@ -1,6 +1,9 @@
 """WRR doctor 运行器 + 诊断汇总。"""
 import asyncio
-from typing import Dict, List, Optional
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .registry import EngineRegistry
 from .schemas import EngineCheckResult
@@ -169,3 +172,146 @@ def summarize_deps(results: List[Dict]) -> Dict:
     else:
         agg = "ok"
     return {**counts, "status": agg}
+
+
+# ── v6 control-plane doctor ──
+
+@dataclass(frozen=True)
+class DoctorReport:
+    runtime: Any
+    env: Any
+    discovered: tuple[Any, ...]
+    resolved: tuple[Any, ...]
+    health: tuple[Any, ...]
+    summary: dict[str, Any]
+    trust_project: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runtime": self.runtime.to_dict(),
+            "env": _env_report(self.env, self.resolved),
+            "discovered": [item.to_dict() for item in self.discovered],
+            "resolved": [item.to_dict() for item in self.resolved],
+            "health": [item.to_dict() for item in self.health],
+            "summary": dict(self.summary),
+            "trust": {"project": self.trust_project},
+        }
+
+
+def doctor_v6(
+    *,
+    json: bool = True,
+    deep: bool = False,
+    trust_project: bool = False,
+    runtime_hint: str | None = None,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    env_files: Sequence[str | Path] | None = None,
+    plugin_paths: Iterable[str | Path] | None = None,
+) -> DoctorReport:
+    """Run the additive v6 doctor without changing legacy doctor behavior."""
+
+    from .cli.install import _filtered_env, _required_env
+    from .engines.loader import discover_engine_plugins
+    from .engines.registry import EngineRegistry as V6EngineRegistry
+    from .runtime.detect import detect_runtime
+    from .runtime.env import load_env
+
+    del json, deep  # P0 v6 doctor is report-only and light-health only.
+
+    resolved_cwd = Path.cwd() if cwd is None else Path(cwd)
+    process_env = os.environ if env is None else env
+    runtime = detect_runtime(explicit=runtime_hint, cwd=resolved_cwd, env=process_env)
+    paths = tuple(plugin_paths or (resolved_cwd / "plugins" / "engines",))
+    discoveries = tuple(discover_engine_plugins(paths, include_builtin=True))
+    required_env = _required_env(discoveries)
+    env_snapshot = load_env(
+        runtime,
+        overrides=_filtered_env(process_env, required_env),
+        env_files=env_files,
+        trust_project=trust_project,
+    )
+    registry = V6EngineRegistry(
+        runtime=runtime,
+        env=env_snapshot,
+        plugin_paths=paths,
+        discoveries=discoveries,
+        include_builtin=True,
+        trust_project=trust_project,
+    )
+    report = registry.report()
+    return DoctorReport(
+        runtime=runtime,
+        env=env_snapshot,
+        discovered=report.discovered,
+        resolved=report.resolved,
+        health=report.health,
+        summary=_summarize_v6(report),
+        trust_project=trust_project,
+    )
+
+
+def _summarize_v6(report: Any) -> dict[str, Any]:
+    health_counts = {"healthy": 0, "degraded": 0, "unhealthy": 0}
+    for item in report.health:
+        health_counts[item.status] = health_counts.get(item.status, 0) + 1
+    valid_discoveries = sum(1 for item in report.discovered if item.valid)
+    configured = sum(1 for item in report.resolved if item.configured)
+    if health_counts.get("unhealthy", 0):
+        status = "fail"
+    elif health_counts.get("degraded", 0):
+        status = "warn"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "discovered": len(report.discovered),
+        "valid_discoveries": valid_discoveries,
+        "resolved": len(report.resolved),
+        "configured": configured,
+        "healthy": health_counts.get("healthy", 0),
+        "degraded": health_counts.get("degraded", 0),
+        "unhealthy": health_counts.get("unhealthy", 0),
+        "routable": len(report.routable),
+    }
+
+
+def _env_report(env: Any, resolved: Iterable[Any]) -> dict[str, Any]:
+    relevant = _relevant_env_names(resolved)
+    return {
+        "values": {
+            key: value.to_dict()
+            for key, value in sorted(env.values.items())
+            if key in relevant
+        },
+        "candidates": [candidate.to_dict() for candidate in env.candidates],
+        "conflicts": [
+            conflict.to_dict()
+            for conflict in env.conflicts
+            if conflict.key in relevant
+        ],
+        "ignored_values": [
+            value.to_dict()
+            for value in env.ignored_values
+            if value.key in relevant
+        ],
+        "warnings": list(env.warnings),
+    }
+
+
+def _relevant_env_names(resolved: Iterable[Any]) -> set[str]:
+    names: set[str] = set()
+    for descriptor in resolved:
+        requirements = descriptor.manifest.requirements.get("env")
+        if not isinstance(requirements, list):
+            continue
+        for item in requirements:
+            if not isinstance(item, Mapping):
+                continue
+            primary = item.get("env") or item.get("name")
+            if primary:
+                names.add(str(primary))
+            aliases = item.get("aliases", [])
+            if isinstance(aliases, list):
+                names.update(str(alias) for alias in aliases if alias)
+    return names

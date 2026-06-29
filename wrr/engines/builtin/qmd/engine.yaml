@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "qmd",
+  "name": "QMD Local Knowledge",
+  "kind": "local_cli",
+  "adapter": "wrr.engines.local_qmd:LocalQmdEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["local_kb", "notes"]
+  },
+  "routing": {
+    "modes": ["auto", "local", "qmd"],
+    "weight": 1.0
+  },
+  "requirements": {
+    "env": [],
+    "binaries": [
+      {"name": "qmd", "required": true}
+    ],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "binary_present", "binary": "qmd", "required": true}
+    ]
+  },
+  "requires_capabilities": {
+    "local_kb": true,
+    "can_spawn_cli": true
+  }
+}
