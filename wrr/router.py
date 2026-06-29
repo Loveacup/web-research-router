@@ -7,14 +7,22 @@
   - per-engine timeout + 按操作的总预算 config.budget_for(op)（超预算的后续引擎标记跳过）
 """
 import asyncio
+import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 from . import config
 from .engines import _fusion
+from .engines.base import SearchEngine
 from .errors import EngineError, AllEnginesFailedError
-from .registry import EngineRegistry
 from .schemas import FallbackStep, RouterResult, SearchResult
+
+
+class SearchRegistry(Protocol):
+    """Minimal registry interface consumed by router hot paths."""
+
+    def get(self, name: str) -> Optional[SearchEngine]:
+        ...
 
 
 def build_chain(operation: str, explicit_provider: Optional[str],
@@ -60,7 +68,7 @@ def _count(operation: str, result) -> int:
     return len(getattr(result, "text", "") or "")
 
 
-async def route(operation: str, options, registry: EngineRegistry,
+async def route(operation: str, options, registry: SearchRegistry,
                 explicit_provider: Optional[str] = None) -> RouterResult:
     chain = build_chain(operation, explicit_provider, getattr(options, "query", None))
     budget = config.budget_for(operation)
@@ -154,11 +162,54 @@ async def _dispatch(registry, engine_names, options, weights, mode, budget):
     return deduped[:options.count], steps
 
 
-async def route_search_v5(options, registry: EngineRegistry) -> RouterResult:
+def _v6_router_enabled(env: Optional[Dict[str, str]] = None) -> bool:
+    source = os.environ if env is None else env
+    return source.get("WRR_V6_ROUTER") == "1"
+
+
+def _descriptor_backed_registry() -> SearchRegistry:
+    """Build a v6 descriptor-backed legacy registry for opt-in shadow routing."""
+
+    from .registry import default_registry_v6_shadow
+
+    report = default_registry_v6_shadow()
+    return report.registry
+
+
+def _route_registry(
+    registry: SearchRegistry,
+    *,
+    descriptor_registry_factory=None,
+    env: Optional[Dict[str, str]] = None,
+) -> SearchRegistry:
+    """Return the registry consumed by v5 routing.
+
+    Normal calls keep the provided legacy registry. Shadow routing is activated
+    only by the env flag or by an explicit injected factory in tests/callers.
+    """
+
+    if descriptor_registry_factory is not None:
+        return descriptor_registry_factory()
+    if _v6_router_enabled(env):
+        return _descriptor_backed_registry()
+    return registry
+
+
+async def route_search_v5(
+    options,
+    registry: SearchRegistry,
+    *,
+    descriptor_registry_factory=None,
+) -> RouterResult:
     """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
 
     显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
     """
+    registry = _route_registry(
+        registry,
+        descriptor_registry_factory=descriptor_registry_factory,
+    )
+
     # 显式 provider → 单引擎（复用 v4 route 语义，禁用 mode 路由）
     explicit = getattr(options, "provider", None)
     if explicit:

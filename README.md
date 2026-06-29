@@ -30,10 +30,34 @@ query → classify_intent(mode) → parallel engines → RRF fusion → ranked r
 # Install as Hermes plugin
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr
 
-# CLI
+# Legacy-compatible CLI examples
 wrr-cli.py doctor          # 引擎 + 全量依赖自检
-wrr-cli.py doctor --json   # JSON 输出
-wrr search "your query"    # 搜索（需 Hermes runtime）
+wrr-cli.py doctor --json   # legacy JSON 输出，迁移窗口内 schema 保持不变
+wrr-cli.py search "your query" --provider exa --count 5
+wrr-cli.py fetch "https://example.com" --provider exa --max-chars 2000
+wrr-cli.py similar "https://example.com" --provider exa --count 5
+wrr search "your query"    # Hermes runtime tool entrypoint
+```
+
+## v6 CLI migration gate
+
+v6 control-plane CLI is opt-in during the compatibility window. Old `doctor`
+behavior and old JSON consumers remain supported until the default switch is
+announced.
+
+```bash
+# v6 doctor JSON: new shape with runtime/env/discovered/resolved/health/summary/trust
+wrr-cli.py doctor --v6 --json
+
+# Trust project-level plugins and project .env secrets only when explicitly needed
+wrr-cli.py doctor --v6 --trust-project --json
+
+# v6 install planning is report-only unless a future migration step changes it
+wrr-cli.py install --dry-run --runtime codex --json
+wrr-cli.py install --dry-run --runtime hermes --refresh-deps --json
+
+# v6 dependency update defaults to dry-run; --apply is explicit
+wrr-cli.py update --dry-run --json
 ```
 
 ## Dependencies (13 total)

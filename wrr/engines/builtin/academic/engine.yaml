@@ -42,7 +42,16 @@
   "requirements": {
     "env": [],
     "binaries": [],
-    "repos": []
+    "repos": [
+      {
+        "dep_id": "paper_search_mcp",
+        "name": "paper_search_mcp",
+        "capability": "academic_search",
+        "remote": "https://github.com/openags/paper-search-mcp",
+        "required": false,
+        "description": "学术论文 MCP 搜索服务（可选增强）"
+      }
+    ]
   },
   "health": {
     "checks": []

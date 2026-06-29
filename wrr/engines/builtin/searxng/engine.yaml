@@ -20,10 +20,28 @@
   },
   "requirements": {
     "env": [
-      {"name": "SEARXNG_URL", "required": true, "secret": false}
+      {
+        "dep_id": "searxng_url",
+        "name": "SEARXNG_URL",
+        "required": false,
+        "secret": false,
+        "source_url": "https://github.com/searxng/searxng",
+        "description": "SearXNG 实例 URL（恢复模式兜底引擎）"
+      }
     ],
     "binaries": [],
-    "repos": []
+    "repos": [],
+    "docker": [
+      {
+        "dep_id": "searxng",
+        "name": "searxng",
+        "container": "searxng",
+        "health_url": "http://127.0.0.1:32080",
+        "required": false,
+        "source_url": "https://github.com/searxng/searxng",
+        "description": "SearXNG 无搜索引擎（恢复模式兜底）"
+      }
+    ]
   },
   "health": {
     "checks": [

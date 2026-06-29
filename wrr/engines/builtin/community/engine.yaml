@@ -86,9 +86,45 @@
   "requirements": {
     "env": [],
     "binaries": [
-      {"name": "opencli", "required": false}
+      {
+        "dep_id": "opencli",
+        "name": "opencli",
+        "version_flag": "--version",
+        "required": true,
+        "source_url": "https://github.com/Panniantong/Agent-Reach",
+        "description": "OpenCLI 社区搜索 CLI（Agent-Reach 提供）"
+      }
     ],
-    "repos": []
+    "repos": [
+      {
+        "dep_id": "last30days_en",
+        "name": "last30days_en",
+        "capability": "recent_web_search",
+        "env": "WRR_LAST30DAYS_EN",
+        "default_path": "~/code/last30days-skill/skills/last30days/scripts/last30days.py",
+        "remote": "https://github.com/mvanhorn/last30days-skill",
+        "required": true,
+        "description": "英文社区搜索（Reddit/X/YouTube）"
+      },
+      {
+        "dep_id": "last30days_cn",
+        "name": "last30days_cn",
+        "capability": "recent_web_search",
+        "env": "WRR_LAST30DAYS_CN",
+        "default_path": "~/code/last30days-skill-cn/skills/last30days/scripts/last30days.py",
+        "remote": "https://github.com/Jesseovo/last30days-skill-cn",
+        "required": true,
+        "description": "中文社区搜索（微博/小红书/B站/知乎等）"
+      },
+      {
+        "dep_id": "agent_reach",
+        "name": "agent_reach",
+        "capability": "internet_access",
+        "remote": "https://github.com/Panniantong/Agent-Reach",
+        "required": true,
+        "description": "Agent-Reach 互联网接入（OpenCLI 底层渠道）"
+      }
+    ]
   },
   "health": {
     "checks": [

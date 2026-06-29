@@ -53,6 +53,29 @@ def default_registry() -> EngineRegistry:
     return reg
 
 
+def default_registry_v6_shadow(**kwargs):
+    """Return a v6 descriptor-backed legacy registry parity report.
+
+    This helper is opt-in shadow mode only. ``default_registry()`` remains the
+    legacy source of truth for normal routing, doctor, and dependency behavior.
+    """
+    from .engines.adapter_bridge import compare_legacy_registry_bridge
+    from .engines.registry import EngineRegistry as V6EngineRegistry
+    from .runtime.detect import detect_runtime
+    from .runtime.env import load_env
+
+    intentional_gaps = kwargs.pop("intentional_gaps", None)
+    runtime = kwargs.pop("runtime", None) or detect_runtime(cwd=kwargs.pop("cwd", None))
+    env = kwargs.pop("env", None) or load_env(runtime)
+
+    v6_registry = V6EngineRegistry(runtime=runtime, env=env, **kwargs)
+    descriptors = v6_registry.resolve()
+    compare_kwargs = {}
+    if intentional_gaps is not None:
+        compare_kwargs["intentional_gaps"] = intentional_gaps
+    return compare_legacy_registry_bridge(default_registry(), descriptors, **compare_kwargs)
+
+
 _SHARED: Optional[EngineRegistry] = None
 
 

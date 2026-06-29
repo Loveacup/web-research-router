@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "id": "local_supermemory",
+  "name": "Local Supermemory",
+  "kind": "hermes_tool",
+  "adapter": "wrr.engines.local_supermemory:LocalSupermemoryEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["memory", "local", "personal"]
+  },
+  "routing": {
+    "modes": ["auto", "local", "memory"],
+    "weight": 1.0,
+    "triggers": [
+      {
+        "name": "memory_keywords",
+        "match": {
+          "keywords": ["记忆", "supermemory", "长期偏好", "历史决策"]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [],
+    "binaries": [],
+    "repos": [],
+    "hermes_tools": [
+      {
+        "dep_id": "supermemory",
+        "name": "supermemory_search",
+        "required": true,
+        "source_url": "https://hermes-agent.nousresearch.com/docs",
+        "description": "云端长期记忆检索"
+      }
+    ]
+  },
+  "health": {
+    "checks": []
+  },
+  "requires_capabilities": {
+    "agent_memory": true
+  }
+}

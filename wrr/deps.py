@@ -20,7 +20,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -659,3 +659,320 @@ class DepRegistry:
 
     def by_type(self, dep_type: DepType) -> List[BaseDep]:
         return [d for d in self._deps.values() if d.dep_type == dep_type]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# v6 manifest -> v5 dependency bridge
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ManifestDepsBridgeReport:
+    """Comparison report for legacy deps and manifest-derived legacy deps."""
+
+    legacy_ids: Tuple[str, ...]
+    manifest_ids: Tuple[str, ...]
+    required_missing_ids: Tuple[str, ...]
+    type_alignment: Dict[str, Dict[str, Tuple[str, ...]]]
+    intentional_type_gaps: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def no_required_dependency_disappears(self) -> bool:
+        return not self.required_missing_ids
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "no_required_dependency_disappears": self.no_required_dependency_disappears,
+            "legacy_ids": list(self.legacy_ids),
+            "manifest_ids": list(self.manifest_ids),
+            "required_missing_ids": list(self.required_missing_ids),
+            "type_alignment": {
+                dep_type: {
+                    "legacy": list(values["legacy"]),
+                    "manifest": list(values["manifest"]),
+                    "missing": list(values["missing"]),
+                    "extra": list(values["extra"]),
+                }
+                for dep_type, values in self.type_alignment.items()
+            },
+            "intentional_type_gaps": dict(self.intentional_type_gaps),
+        }
+
+
+def builtin_manifest_legacy_deps() -> List[BaseDep]:
+    """Return legacy dependency objects generated from builtin v6 manifests.
+
+    This is an additive bridge for parity tests and migration tooling. The
+    default ``DepRegistry`` still reads the static ``DEPENDENCY_MANIFEST``.
+    """
+
+    from wrr.engines.loader import discover_engine_plugins
+
+    deps: Dict[str, BaseDep] = {}
+    legacy = _legacy_deps_by_id()
+    for discovery in discover_engine_plugins(include_builtin=True):
+        if not discovery.valid or discovery.manifest is None:
+            continue
+        for dep in manifest_to_legacy_deps(discovery.manifest, legacy_deps=legacy):
+            existing = deps.get(dep.id)
+            if existing is None:
+                deps[dep.id] = dep
+                continue
+            existing.required = existing.required or dep.required
+    return list(deps.values())
+
+
+def manifest_to_legacy_deps(
+    manifest: Any,
+    *,
+    legacy_deps: Mapping[str, BaseDep] | None = None,
+) -> List[BaseDep]:
+    """Convert one v6 manifest requirements block into v5 dependency objects."""
+
+    requirements = getattr(manifest, "requirements", {}) or {}
+    if not isinstance(requirements, Mapping):
+        return []
+
+    legacy_deps = legacy_deps or _legacy_deps_by_id()
+    deps: List[BaseDep] = []
+    deps.extend(_env_deps_from_manifest(requirements, legacy_deps))
+    deps.extend(_binary_deps_from_manifest(requirements, legacy_deps))
+    deps.extend(_repo_deps_from_manifest(requirements, legacy_deps))
+    deps.extend(_docker_deps_from_manifest(requirements, legacy_deps))
+    deps.extend(_hermes_tool_deps_from_manifest(requirements, legacy_deps))
+    return deps
+
+
+def compare_manifest_bridge_to_legacy(
+    *,
+    legacy_deps: Iterable[BaseDep] = DEPENDENCY_MANIFEST,
+    manifest_deps: Iterable[BaseDep] | None = None,
+) -> ManifestDepsBridgeReport:
+    """Compare static v5 deps with the builtin manifest-derived deps view."""
+
+    legacy_list = list(legacy_deps)
+    manifest_list = list(manifest_deps) if manifest_deps is not None else builtin_manifest_legacy_deps()
+    legacy_by_id = {dep.id: dep for dep in legacy_list}
+    manifest_by_id = {dep.id: dep for dep in manifest_list}
+
+    required_missing = tuple(
+        sorted(
+            dep_id
+            for dep_id, dep in legacy_by_id.items()
+            if dep.required and dep_id not in manifest_by_id
+        )
+    )
+
+    type_alignment: Dict[str, Dict[str, Tuple[str, ...]]] = {}
+    intentional_type_gaps: Dict[str, str] = {}
+    for dep_type in DepType:
+        legacy_ids = {dep.id for dep in legacy_list if dep.dep_type == dep_type}
+        manifest_ids = {dep.id for dep in manifest_list if dep.dep_type == dep_type}
+        missing = legacy_ids - manifest_ids
+        extra = manifest_ids - legacy_ids
+        type_alignment[dep_type.value] = {
+            "legacy": tuple(sorted(legacy_ids)),
+            "manifest": tuple(sorted(manifest_ids)),
+            "missing": tuple(sorted(missing)),
+            "extra": tuple(sorted(extra)),
+        }
+        if dep_type == DepType.PYTHON_PKG and not legacy_ids and not manifest_ids:
+            intentional_type_gaps[dep_type.value] = (
+                "legacy enum exists, but v5 DEPENDENCY_MANIFEST declares no python_pkg deps"
+            )
+
+    return ManifestDepsBridgeReport(
+        legacy_ids=tuple(dep.id for dep in legacy_list),
+        manifest_ids=tuple(dep.id for dep in manifest_list),
+        required_missing_ids=required_missing,
+        type_alignment=type_alignment,
+        intentional_type_gaps=intentional_type_gaps,
+    )
+
+
+def _legacy_deps_by_id() -> Dict[str, BaseDep]:
+    return {dep.id: dep for dep in DEPENDENCY_MANIFEST}
+
+
+def _env_deps_from_manifest(
+    requirements: Mapping[str, Any],
+    legacy_deps: Mapping[str, BaseDep],
+) -> List[BaseDep]:
+    out: List[BaseDep] = []
+    for item in _requirement_items(requirements, "env"):
+        var_name = str(item.get("env") or item.get("name") or "")
+        if not var_name:
+            continue
+        dep_id = _dep_id(item, _env_dep_id(var_name))
+        legacy = legacy_deps.get(dep_id)
+        out.append(
+            EnvVarDep(
+                dep_id=dep_id,
+                var_name=var_name,
+                source_url=_source_url(item, legacy, f"env:{var_name}"),
+                description=_description(item, legacy, f"{var_name} environment variable"),
+                required=_required(item, legacy),
+                install_guide=_install_guide(item, legacy),
+            )
+        )
+    return out
+
+
+def _binary_deps_from_manifest(
+    requirements: Mapping[str, Any],
+    legacy_deps: Mapping[str, BaseDep],
+) -> List[BaseDep]:
+    out: List[BaseDep] = []
+    for item in _requirement_items(requirements, "binaries"):
+        binary = str(item.get("binary") or item.get("name") or "")
+        if not binary:
+            continue
+        dep_id = _dep_id(item, binary)
+        legacy = legacy_deps.get(dep_id)
+        out.append(
+            CliToolDep(
+                dep_id=dep_id,
+                binary=binary,
+                version_flag=str(item.get("version_flag") or "--version"),
+                source_url=_source_url(item, legacy, f"binary:{binary}"),
+                description=_description(item, legacy, f"{binary} command"),
+                required=_required(item, legacy),
+                install_guide=_install_guide(item, legacy),
+                extra_paths=[
+                    str(path)
+                    for path in item.get("extra_paths", [])
+                    if isinstance(path, str)
+                ],
+            )
+        )
+    return out
+
+
+def _repo_deps_from_manifest(
+    requirements: Mapping[str, Any],
+    legacy_deps: Mapping[str, BaseDep],
+) -> List[BaseDep]:
+    out: List[BaseDep] = []
+    for item in _requirement_items(requirements, "repos"):
+        name = str(item.get("name") or item.get("repo") or "")
+        if not name:
+            continue
+        dep_id = _dep_id(item, name)
+        legacy = legacy_deps.get(dep_id)
+        calling_pattern = CallingPattern(str(item.get("calling_pattern") or "subprocess"))
+        out.append(
+            GitRepoDep(
+                dep_id=dep_id,
+                capability=str(item.get("capability") or name),
+                source_url=_source_url(item, legacy, str(item.get("remote") or f"repo:{name}")),
+                description=_description(item, legacy, f"{name} repository"),
+                required=_required(item, legacy),
+                env_var=str(item["env"]) if item.get("env") else None,
+                fallback_path=str(item["default_path"]) if item.get("default_path") else None,
+                install_guide=_install_guide(item, legacy),
+                calling_pattern=calling_pattern,
+            )
+        )
+    return out
+
+
+def _docker_deps_from_manifest(
+    requirements: Mapping[str, Any],
+    legacy_deps: Mapping[str, BaseDep],
+) -> List[BaseDep]:
+    out: List[BaseDep] = []
+    for item in _requirement_items(requirements, "docker"):
+        container = str(item.get("container") or item.get("name") or "")
+        if not container:
+            continue
+        dep_id = _dep_id(item, container)
+        legacy = legacy_deps.get(dep_id)
+        out.append(
+            DockerDep(
+                dep_id=dep_id,
+                container_name=container,
+                health_url=str(item.get("health_url") or ""),
+                source_url=_source_url(item, legacy, f"docker:{container}"),
+                description=_description(item, legacy, f"{container} container"),
+                required=_required(item, legacy),
+                install_guide=_install_guide(item, legacy),
+            )
+        )
+    return out
+
+
+def _hermes_tool_deps_from_manifest(
+    requirements: Mapping[str, Any],
+    legacy_deps: Mapping[str, BaseDep],
+) -> List[BaseDep]:
+    out: List[BaseDep] = []
+    for item in _requirement_items(requirements, "hermes_tools"):
+        tool_name = str(item.get("tool") or item.get("name") or "")
+        if not tool_name:
+            continue
+        dep_id = _dep_id(item, tool_name)
+        legacy = legacy_deps.get(dep_id)
+        out.append(
+            HermesToolDep(
+                dep_id=dep_id,
+                tool_name=tool_name,
+                source_url=_source_url(item, legacy, "https://hermes-agent.nousresearch.com/docs"),
+                description=_description(item, legacy, f"{tool_name} Hermes tool"),
+            )
+        )
+        out[-1].required = _required(item, legacy)
+    return out
+
+
+def _requirement_items(requirements: Mapping[str, Any], key: str) -> List[Mapping[str, Any]]:
+    value = requirements.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _dep_id(item: Mapping[str, Any], fallback: str) -> str:
+    return str(item.get("dep_id") or item.get("id") or fallback)
+
+
+def _env_dep_id(var_name: str) -> str:
+    return {
+        "EXA_API_KEY": "exa_api_key",
+        "BRAVE_API_KEY": "brave_api_key",
+        "GITHUB_TOKEN": "github_token",
+        "SEARXNG_URL": "searxng_url",
+    }.get(var_name, var_name.lower())
+
+
+def _required(item: Mapping[str, Any], legacy: BaseDep | None) -> bool:
+    if "required" in item:
+        return bool(item["required"])
+    if legacy is not None:
+        return bool(legacy.required)
+    return True
+
+
+def _source_url(item: Mapping[str, Any], legacy: BaseDep | None, fallback: str) -> str:
+    value = item.get("source_url") or item.get("remote")
+    if value:
+        return str(value)
+    if legacy is not None:
+        return legacy.source_url
+    return fallback
+
+
+def _description(item: Mapping[str, Any], legacy: BaseDep | None, fallback: str) -> str:
+    value = item.get("description")
+    if value:
+        return str(value)
+    if legacy is not None:
+        return legacy.description
+    return fallback
+
+
+def _install_guide(item: Mapping[str, Any], legacy: BaseDep | None) -> List[str]:
+    value = item.get("install_guide")
+    if isinstance(value, list):
+        return [str(step) for step in value]
+    if legacy is not None:
+        return list(legacy.install_guide)
+    return []

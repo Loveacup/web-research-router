@@ -20,7 +20,15 @@
   },
   "requirements": {
     "env": [
-      {"name": "BRAVE_API_KEY", "aliases": ["BRAVE_SEARCH_API_KEY"], "required": true, "secret": true}
+      {
+        "dep_id": "brave_api_key",
+        "name": "BRAVE_API_KEY",
+        "aliases": ["BRAVE_SEARCH_API_KEY"],
+        "required": true,
+        "secret": true,
+        "source_url": "https://brave.com/search/api/",
+        "description": "Brave 搜索 API key"
+      }
     ],
     "binaries": [],
     "repos": []

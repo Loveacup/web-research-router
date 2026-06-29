@@ -200,7 +200,8 @@ def test_install_refresh_deps_includes_dependency_update_report(tmp_path):
         refresh_deps=True,
     ).to_dict()
 
-    assert discovered_report["dependency_updates"][0]["engine_id"] == discovery.engine_id
+    engine_ids = {item["engine_id"] for item in discovered_report["dependency_updates"]}
+    assert discovery.engine_id in engine_ids
 
 
 def test_doctor_v6_reports_repo_commit_revision_and_drift(tmp_path):

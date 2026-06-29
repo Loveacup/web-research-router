@@ -21,7 +21,15 @@
   "requirements": {
     "env": [],
     "binaries": [
-      {"name": "qmd", "required": true}
+      {
+        "dep_id": "qmd",
+        "name": "qmd",
+        "version_flag": "--version",
+        "required": true,
+        "source_url": "https://github.com/qmd/qmd",
+        "description": "qmd 全文搜索引擎（Obsidian vault 索引）",
+        "extra_paths": ["/opt/homebrew/bin/qmd"]
+      }
     ],
     "repos": []
   },

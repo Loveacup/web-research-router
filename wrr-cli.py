@@ -440,27 +440,64 @@ def build_parser() -> argparse.ArgumentParser:
     tp = sub.add_parser("test", parents=[common], help="冒烟测试 search/fetch/similar")
     tp.set_defaults(func=cmd_test)
 
-    ip = sub.add_parser("install", help="生成 v6 install 报告（P0 仅 dry-run）")
-    ip.add_argument("--dry-run", action="store_true", help="只输出计划，不写任何文件")
+    ip = sub.add_parser(
+        "install",
+        help="生成 v6 install 报告；当前必须显式 --dry-run，默认不写文件",
+        description=(
+            "生成 v6 install 迁移报告。当前迁移窗口内 install 是 opt-in dry-run "
+            "surface；不会创建配置或写入依赖。"
+        ),
+    )
+    ip.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="必填：只输出 v6 install 计划，不写配置、不克隆 repo、不修改依赖",
+    )
     ip.add_argument("--json", action="store_true", help="输出 JSON 格式")
     ip.add_argument("--env", metavar="PATH", help="指定 v6 env 文件")
     ip.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"],
                     help="显式指定 v6 runtime")
-    ip.add_argument("--trust-project", action="store_true", help="信任项目级插件和项目 .env secret")
-    ip.add_argument("--refresh-deps", action="store_true", help="刷新 v6 repo 依赖；默认仅 dry-run 计划")
+    ip.add_argument(
+        "--trust-project",
+        action="store_true",
+        help="显式信任项目级插件、adapter 和项目 .env secret；默认不信任 project scope",
+    )
+    ip.add_argument(
+        "--refresh-deps",
+        action="store_true",
+        help="把 v6 repo 依赖刷新计划并入 install 报告；配合 --dry-run 时只列计划",
+    )
     ip.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     ip.set_defaults(func=cmd_install)
 
-    up = sub.add_parser("update", help="刷新 v6 repo 依赖")
-    up.add_argument("--dry-run", action="store_true", default=True, help="只输出计划，不执行 git 操作")
+    up = sub.add_parser(
+        "update",
+        help="规划或执行 v6 repo 依赖刷新；默认 dry-run",
+        description=(
+            "刷新 v6 manifest 声明的 managed repo 依赖。默认只输出计划；"
+            "只有传 --apply 才会执行允许的 git clone/fetch/checkout。"
+        ),
+    )
+    up.add_argument("--dry-run", action="store_true", default=True, help="默认行为：只输出计划，不执行 git 操作")
     up.add_argument("--apply", action="store_false", dest="dry_run", help="执行允许的 git clone/fetch/checkout")
     up.add_argument("--json", action="store_true", help="输出 JSON 格式")
-    up.add_argument("--trust-project", action="store_true", help="允许 project-level remote clone")
+    up.add_argument(
+        "--trust-project",
+        action="store_true",
+        help="显式允许 project-level manifest 的 remote clone；默认拒绝 project remote clone",
+    )
     up.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     up.set_defaults(func=cmd_update)
 
     # doctor 子命令（v5.1，不继承 common 中的 --provider，因需独立 --engine）
-    dp = sub.add_parser("doctor", help="检查引擎健康状况和本地依赖")
+    dp = sub.add_parser(
+        "doctor",
+        help="检查引擎健康状况和本地依赖；默认保持 legacy JSON",
+        description=(
+            "默认运行 legacy doctor，保持旧 JSON schema。传 --v6 才启用 v6 "
+            "control-plane doctor。"
+        ),
+    )
     dp.add_argument("--engine", choices=["exa", "brave", "github", "skill", "searxng", "community", "academic",
                                          "local_supermemory", "local_session", "local_qmd", "local_obsidian"],
                     help="仅检查指定引擎")
@@ -470,10 +507,18 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     dp.add_argument("--strict", action="store_true", help="严格模式：warn 也视为失败（退出码 1）")
     dp.add_argument("--deep", action="store_true", help="深度探测：执行命令/API 实际验证（较慢）")
-    dp.add_argument("--v6", action="store_true", help="使用 v6 control-plane doctor")
+    dp.add_argument(
+        "--v6",
+        action="store_true",
+        help="opt-in 使用 v6 control-plane doctor；不改变默认 legacy doctor 输出",
+    )
     dp.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"],
                     help="显式指定 v6 runtime")
-    dp.add_argument("--trust-project", action="store_true", help="信任项目级插件和项目 .env secret")
+    dp.add_argument(
+        "--trust-project",
+        action="store_true",
+        help="仅配合 --v6：显式信任项目级插件、adapter 和项目 .env secret",
+    )
     dp.set_defaults(func=cmd_doctor)
 
     return p

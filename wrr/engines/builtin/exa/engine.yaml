@@ -20,7 +20,14 @@
   },
   "requirements": {
     "env": [
-      {"name": "EXA_API_KEY", "required": true, "secret": true}
+      {
+        "dep_id": "exa_api_key",
+        "name": "EXA_API_KEY",
+        "required": true,
+        "secret": true,
+        "source_url": "https://exa.ai",
+        "description": "Exa 语义搜索 API key"
+      }
     ],
     "binaries": [],
     "repos": []

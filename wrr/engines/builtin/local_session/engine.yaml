@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "id": "local_session",
+  "name": "Local Session Search",
+  "kind": "hermes_tool",
+  "adapter": "wrr.engines.local_session:LocalSessionEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["session", "conversation", "local"]
+  },
+  "routing": {
+    "modes": ["auto", "local", "session"],
+    "weight": 1.0,
+    "triggers": [
+      {
+        "name": "session_keywords",
+        "match": {
+          "keywords": ["刚才", "上次对话", "历史对话", "session"]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [],
+    "binaries": [],
+    "repos": [],
+    "hermes_tools": [
+      {
+        "dep_id": "session_search",
+        "name": "session_search",
+        "required": true,
+        "source_url": "https://hermes-agent.nousresearch.com/docs",
+        "description": "本地历史对话检索"
+      }
+    ]
+  },
+  "health": {
+    "checks": []
+  },
+  "requires_capabilities": {
+    "conversation_history": true
+  }
+}

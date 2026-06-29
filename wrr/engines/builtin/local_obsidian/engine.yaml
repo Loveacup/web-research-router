@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "id": "local_obsidian",
+  "name": "Local Obsidian",
+  "kind": "local_filesystem",
+  "adapter": "wrr.engines.local_obsidian:LocalObsidianEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["local_kb", "notes", "obsidian"]
+  },
+  "routing": {
+    "modes": ["auto", "local", "obsidian"],
+    "weight": 0.8,
+    "triggers": [
+      {
+        "name": "obsidian_keywords",
+        "match": {
+          "keywords": ["Obsidian", "vault", "笔记里", "我写过"]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [
+      {
+        "dep_id": "obsidian_vaults",
+        "name": "WRR_OBSIDIAN_VAULTS",
+        "required": false,
+        "secret": false,
+        "source_url": "https://obsidian.md",
+        "description": "Obsidian vault path override"
+      }
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "WRR_OBSIDIAN_VAULTS", "required": false}
+    ]
+  },
+  "requires_capabilities": {
+    "local_kb": true
+  }
+}
