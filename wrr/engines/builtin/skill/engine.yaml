@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "id": "skill",
+  "name": "Skill Discovery",
+  "kind": "web_api",
+  "adapter": "wrr.engines.skill_discovery:SkillDiscoveryEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["code", "skills", "repositories"]
+  },
+  "routing": {
+    "modes": ["auto", "discovery", "github", "code"],
+    "weight": 0.25,
+    "triggers": [
+      {
+        "name": "skill_keywords",
+        "match": {
+          "keywords": [
+            "找 skill",
+            "skill 推荐",
+            "推荐 skill",
+            "skill.md",
+            "agent skill",
+            "find skill"
+          ]
+        }
+      },
+      {
+        "name": "skill_intent_regex",
+        "match": {
+          "regex": [
+            "skill.*(找|推荐|有没有|find|recommend|discover)",
+            "(找|推荐|有没有|find|recommend|discover).*skill"
+          ]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [
+      {"name": "GITHUB_TOKEN", "required": false, "secret": true}
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "GITHUB_TOKEN", "required": false}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

@@ -185,6 +185,7 @@ class DoctorReport:
     health: tuple[Any, ...]
     summary: dict[str, Any]
     trust_project: bool
+    findings: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -193,6 +194,7 @@ class DoctorReport:
             "discovered": [item.to_dict() for item in self.discovered],
             "resolved": [item.to_dict() for item in self.resolved],
             "health": [item.to_dict() for item in self.health],
+            "findings": list(self.findings),
             "summary": dict(self.summary),
             "trust": {"project": self.trust_project},
         }
@@ -217,13 +219,15 @@ def doctor_v6(
     from .runtime.detect import detect_runtime
     from .runtime.env import load_env
 
-    del json, deep  # P0 v6 doctor is report-only and light-health only.
+    del json
 
     resolved_cwd = Path.cwd() if cwd is None else Path(cwd)
     process_env = os.environ if env is None else env
     runtime = detect_runtime(explicit=runtime_hint, cwd=resolved_cwd, env=process_env)
     paths = tuple(plugin_paths or (resolved_cwd / "plugins" / "engines",))
-    discoveries = tuple(discover_engine_plugins(paths, include_builtin=True))
+    discoveries = tuple(
+        discover_engine_plugins(paths, include_builtin=True, trust_project=trust_project)
+    )
     required_env = _required_env(discoveries)
     env_snapshot = load_env(
         runtime,
@@ -239,15 +243,20 @@ def doctor_v6(
         include_builtin=True,
         trust_project=trust_project,
     )
-    report = registry.report()
+    report = registry.report(health_mode="live" if deep else "light")
+    findings = _trust_findings(env_snapshot, report.resolved, trust_project=trust_project)
+    summary = _summarize_v6(report)
+    summary["findings"] = len(findings)
+    summary["trust_project_explicit"] = trust_project
     return DoctorReport(
         runtime=runtime,
         env=env_snapshot,
         discovered=report.discovered,
         resolved=report.resolved,
         health=report.health,
-        summary=_summarize_v6(report),
+        summary=summary,
         trust_project=trust_project,
+        findings=findings,
     )
 
 
@@ -297,6 +306,64 @@ def _env_report(env: Any, resolved: Iterable[Any]) -> dict[str, Any]:
         ],
         "warnings": list(env.warnings),
     }
+
+
+def _trust_findings(
+    env: Any,
+    resolved: Iterable[Any],
+    *,
+    trust_project: bool,
+) -> tuple[dict[str, Any], ...]:
+    findings: list[dict[str, Any]] = []
+    if trust_project:
+        findings.append(
+            {
+                "code": "trust_project_enabled",
+                "severity": "info",
+                "message": "Project-level plugin adapters and project .env secrets are explicitly trusted.",
+            }
+        )
+
+    for value in env.ignored_values:
+        if value.ignore_reason == "project_env_ignored_secret":
+            findings.append(
+                {
+                    "code": "project_env_ignored_secret",
+                    "severity": "warn",
+                    "key": value.key,
+                    "path": str(value.source_path) if value.source_path else None,
+                }
+            )
+
+    for descriptor in resolved:
+        discovery = descriptor.discovery
+        for reason in discovery.blocked_reasons:
+            findings.append(
+                {
+                    "code": reason,
+                    "severity": "warn",
+                    "engine_id": descriptor.id,
+                    "path": str(discovery.path),
+                    "adapter": descriptor.manifest.adapter,
+                    "trust_level": discovery.trust_level,
+                }
+            )
+        if (
+            descriptor.manifest.adapter
+            and discovery.trust_level != "builtin"
+            and descriptor.adapter_load_allowed
+        ):
+            findings.append(
+                {
+                    "code": "non_builtin_adapter",
+                    "severity": "info",
+                    "engine_id": descriptor.id,
+                    "path": str(discovery.path),
+                    "adapter": descriptor.manifest.adapter,
+                    "trust_level": discovery.trust_level,
+                }
+            )
+    return tuple(findings)
 
 
 def _relevant_env_names(resolved: Iterable[Any]) -> set[str]:

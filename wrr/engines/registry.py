@@ -16,14 +16,26 @@ from typing import Any, Callable, Iterable, Mapping
 from wrr.engines.loader import (
     EngineDiscovery,
     EnginePluginManifest,
+    RepoRequirement,
     discover_engine_plugins,
+    verify_repo_pin,
 )
 from wrr.runtime.detect import RuntimeInfo
 from wrr.runtime.env import EnvSnapshot
+from wrr.runtime.state import (
+    DEFAULT_HEALTH_TTL_SEC,
+    circuit_status,
+    get_cached_health,
+    record_engine_failure,
+    set_cached_health,
+    state_path,
+)
 
 
 HealthStatus = str
+HealthMode = str
 Resolver = Callable[[str], str | None]
+RevisionResolver = Callable[..., str | None]
 
 TRUSTED_ADAPTER_LEVELS = {"builtin", "user", "entry_point"}
 
@@ -65,6 +77,17 @@ class HealthCheckResult:
             "details": dict(self.details),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "HealthCheckResult":
+        return cls(
+            type=str(payload.get("type") or "unknown"),
+            status=str(payload.get("status") or "unhealthy"),
+            required=bool(payload.get("required", True)),
+            message=str(payload.get("message") or ""),
+            target=str(payload["target"]) if payload.get("target") is not None else None,
+            details=dict(payload.get("details") or {}),
+        )
+
 
 @dataclass(frozen=True)
 class EngineHealth:
@@ -78,6 +101,19 @@ class EngineHealth:
             "status": self.status,
             "checks": [check.to_dict() for check in self.checks],
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "EngineHealth":
+        raw_checks = payload.get("checks") or []
+        return cls(
+            engine_id=str(payload.get("engine_id") or ""),
+            status=str(payload.get("status") or "unhealthy"),
+            checks=tuple(
+                HealthCheckResult.from_dict(check)
+                for check in raw_checks
+                if isinstance(check, Mapping)
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -203,6 +239,9 @@ class EngineRegistry:
         include_builtin: bool = True,
         trust_project: bool = False,
         executable_resolver: Resolver | None = None,
+        revision_resolver: RevisionResolver | None = None,
+        state_file: str | Path | None = None,
+        health_ttl_sec: int = DEFAULT_HEALTH_TTL_SEC,
     ) -> None:
         self.runtime = runtime
         self.env = env
@@ -211,27 +250,48 @@ class EngineRegistry:
         self.trust_project = trust_project
         self._discoveries = tuple(discoveries) if discoveries is not None else None
         self._executable_resolver = executable_resolver or shutil.which
+        self._revision_resolver = revision_resolver
+        self.state_file = Path(state_file).expanduser() if state_file is not None else state_path(runtime)
+        self.health_ttl_sec = health_ttl_sec
 
     def discover(self) -> tuple[EngineDiscovery, ...]:
         if self._discoveries is None:
             self._discoveries = tuple(
-                discover_engine_plugins(self.plugin_paths, include_builtin=self.include_builtin)
+                discover_engine_plugins(
+                    self.plugin_paths,
+                    include_builtin=self.include_builtin,
+                    trust_project=self.trust_project,
+                )
             )
         return self._discoveries
 
-    def resolve(self) -> tuple[EngineDescriptor, ...]:
+    def resolve(
+        self,
+        *,
+        action: str | None = None,
+        domain: str | None = None,
+    ) -> tuple[EngineDescriptor, ...]:
         return tuple(
             self._resolve_discovery(discovery)
             for discovery in self.discover()
             if discovery.valid and discovery.manifest is not None
+            and _capability_matches(discovery.manifest, action=action, domain=domain)
         )
 
-    def health(self, descriptors: Iterable[EngineDescriptor] | None = None) -> tuple[EngineHealth, ...]:
-        return tuple(self._health_descriptor(descriptor) for descriptor in (descriptors or self.resolve()))
+    def health(
+        self,
+        descriptors: Iterable[EngineDescriptor] | None = None,
+        *,
+        mode: HealthMode = "light",
+    ) -> tuple[EngineHealth, ...]:
+        return tuple(
+            self._health_descriptor(descriptor, mode=mode)
+            for descriptor in (descriptors or self.resolve())
+        )
 
-    def report(self) -> RegistryReport:
+    def report(self, *, health_mode: HealthMode = "light") -> RegistryReport:
         resolved = self.resolve()
-        health_by_id = {item.engine_id: item for item in self.health(resolved)}
+        health_by_id = {item.engine_id: item for item in self.health(resolved, mode=health_mode)}
         resolved_with_health = tuple(
             descriptor.with_health(health_by_id[descriptor.id]) for descriptor in resolved
         )
@@ -242,13 +302,25 @@ class EngineRegistry:
         )
 
     def routable(self) -> tuple[EngineDescriptor, ...]:
-        return self.report().routable
+        return self.report(health_mode="auto").routable
 
-    def get(self, engine_id: str) -> EngineDescriptor | None:
-        for descriptor in self.report().resolved:
+    def get(
+        self,
+        engine_id: str,
+        *,
+        action: str | None = None,
+        domain: str | None = None,
+    ) -> EngineDescriptor | None:
+        for descriptor in self.resolve(action=action, domain=domain):
             if descriptor.id == engine_id:
-                return descriptor
+                return descriptor.with_health(self._health_descriptor(descriptor, mode="light"))
         return None
+
+    def record_engine_failure(self, engine_id: str, reason: str):
+        return record_engine_failure(engine_id, reason, path=self.state_file)
+
+    def circuit_status(self, engine_id: str):
+        return circuit_status(engine_id, path=self.state_file)
 
     def _resolve_discovery(self, discovery: EngineDiscovery) -> EngineDescriptor:
         manifest = discovery.manifest
@@ -287,13 +359,52 @@ class EngineRegistry:
             resolve_reasons=tuple(reasons),
         )
 
-    def _health_descriptor(self, descriptor: EngineDescriptor) -> EngineHealth:
+    def _health_descriptor(self, descriptor: EngineDescriptor, *, mode: HealthMode) -> EngineHealth:
+        breaker = circuit_status(descriptor.id, path=self.state_file)
+        if breaker.open:
+            return EngineHealth(
+                descriptor.id,
+                "unhealthy",
+                (
+                    HealthCheckResult(
+                        type="circuit_breaker",
+                        status="unhealthy",
+                        required=True,
+                        message="circuit_open",
+                        details=breaker.to_dict(),
+                    ),
+                ),
+            )
+
+        health_mode = _normalize_health_mode(mode)
+        cached = None
+        if health_mode in {"auto", "live"}:
+            cached = get_cached_health(
+                descriptor.id,
+                "live",
+                self.health_ttl_sec,
+                path=self.state_file,
+            )
+        if cached is not None:
+            return EngineHealth.from_dict(cached)
+        if health_mode == "auto":
+            health_mode = "light"
+
         checks = tuple(
             self._run_check(descriptor.manifest, check)
             for check in descriptor.manifest.health.get("checks", [])
-            if isinstance(check, Mapping)
+            if isinstance(check, Mapping) and _check_applies(check, health_mode)
         )
-        return EngineHealth(descriptor.id, _combine_health(checks), checks)
+        health = EngineHealth(descriptor.id, _combine_health(checks), checks)
+        if health_mode == "live":
+            set_cached_health(
+                descriptor.id,
+                "live",
+                health.to_dict(),
+                self.health_ttl_sec,
+                path=self.state_file,
+            )
+        return health
 
     def _run_check(
         self,
@@ -309,7 +420,14 @@ class EngineRegistry:
         if check_type == "path_present":
             return _path_present_check(check, required)
         if check_type == "repo_revision":
-            return _repo_revision_check(check, manifest, required)
+            return _repo_revision_check(
+                check,
+                manifest,
+                required,
+                revision_resolver=self._revision_resolver,
+            )
+        if check_type == "live_probe":
+            return _live_probe_check(check, required)
         return HealthCheckResult(
             type=check_type,
             status="degraded" if not required else "unhealthy",
@@ -327,6 +445,22 @@ def _configured(manifest: EnginePluginManifest, env: EnvSnapshot) -> tuple[bool,
         if not any(name in env.values for name in names):
             reasons.append(f"missing_required_env:{names[0]}")
     return not reasons, reasons
+
+
+def _capability_matches(
+    manifest: EnginePluginManifest,
+    *,
+    action: str | None,
+    domain: str | None,
+) -> bool:
+    capabilities = manifest.capabilities
+    actions = capabilities.get("actions", [])
+    domains = capabilities.get("domains", [])
+    if action is not None and action not in actions:
+        return False
+    if domain is not None and domain not in domains:
+        return False
+    return True
 
 
 def _env_present_check(
@@ -404,66 +538,141 @@ def _repo_revision_check(
     check: Mapping[str, Any],
     manifest: EnginePluginManifest,
     required: bool,
+    *,
+    revision_resolver: RevisionResolver | None = None,
 ) -> HealthCheckResult:
-    path = _repo_path(check, manifest)
-    if path is None or not path.exists():
+    requirement = _repo_requirement(check, manifest)
+    path = _repo_path(check, manifest, requirement=requirement)
+    expected_pin = str(check.get("pin")) if check.get("pin") else (
+        requirement.pin if requirement is not None else None
+    )
+    check_required = required if requirement is None else requirement.required
+    if path is None:
         return HealthCheckResult(
             type="repo_revision",
             status="degraded",
-            required=required,
-            target=str(path) if path else None,
-            message="repo_path_missing",
+            required=check_required,
+            target=None,
+            message="repo_requirement_missing",
         )
 
-    revision = _git_revision(path)
-    if revision is None:
+    pin_status = verify_repo_pin(path, expected_pin, revision_resolver=revision_resolver)
+    if pin_status.status in {"missing", "unavailable"}:
         return HealthCheckResult(
             type="repo_revision",
             status="degraded",
-            required=required,
+            required=check_required,
             target=str(path),
-            message="repo_revision_unavailable",
+            message=pin_status.message,
+            details=_repo_details(requirement, pin_status),
         )
+
+    if pin_status.status == "mismatch":
+        return HealthCheckResult(
+            type="repo_revision",
+            status="unhealthy" if check_required else "degraded",
+            required=check_required,
+            target=str(path),
+            message="repo_pin_mismatch",
+            details=_repo_details(requirement, pin_status),
+        )
+
     return HealthCheckResult(
         type="repo_revision",
         status="healthy",
-        required=required,
+        required=check_required,
         target=str(path),
         message="repo_revision",
-        details={"revision": revision},
+        details=_repo_details(requirement, pin_status),
     )
 
 
-def _repo_path(check: Mapping[str, Any], manifest: EnginePluginManifest) -> Path | None:
-    if check.get("path"):
-        return Path(str(check["path"])).expanduser()
-
+def _repo_requirement(
+    check: Mapping[str, Any],
+    manifest: EnginePluginManifest,
+) -> RepoRequirement | None:
     repo_name = check.get("repo")
-    for requirement in _list_requirements(manifest, "repos"):
-        if repo_name and requirement.get("name") != repo_name:
+    for requirement in manifest.repo_requirements:
+        if repo_name and requirement.name != repo_name:
             continue
-        raw_path = requirement.get("path") or requirement.get("default_path")
-        if raw_path:
-            return Path(str(raw_path)).expanduser()
+        return requirement
     return None
 
 
-def _git_revision(path: Path) -> str | None:
+def _repo_path(
+    check: Mapping[str, Any],
+    manifest: EnginePluginManifest,
+    *,
+    requirement: RepoRequirement | None = None,
+) -> Path | None:
+    if check.get("path"):
+        return Path(str(check["path"])).expanduser()
+
+    if requirement is None:
+        requirement = _repo_requirement(check, manifest)
+    if requirement is None:
+        return None
+    raw_path = requirement.path or requirement.default_path
+    if raw_path:
+        return Path(raw_path).expanduser()
+    return None
+
+
+def _repo_details(
+    requirement: RepoRequirement | None,
+    pin_status: Any,
+) -> dict[str, Any]:
+    details = pin_status.to_dict()
+    details["revision"] = pin_status.current_revision
+    details["commit"] = pin_status.current_revision
+    if requirement is not None:
+        details["repo"] = requirement.name
+        details["remote"] = requirement.remote
+        details["pin"] = requirement.pin
+        details["default_path"] = requirement.default_path
+    return details
+
+
+def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckResult:
+    command = check.get("command")
+    if not isinstance(command, list) or not command:
+        return HealthCheckResult(
+            type="live_probe",
+            status="unhealthy" if required else "degraded",
+            required=required,
+            message="invalid_live_probe",
+        )
     try:
         completed = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            [str(part) for part in command],
             check=False,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=2,
+            timeout=float(check.get("timeout_sec") or 2),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    revision = completed.stdout.strip()
-    if completed.returncode != 0 or not revision:
-        return None
-    return revision
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return HealthCheckResult(
+            type="live_probe",
+            status="unhealthy" if required else "degraded",
+            required=required,
+            message="live_probe_failed",
+            details={"error": type(exc).__name__},
+        )
+    if completed.returncode == 0:
+        return HealthCheckResult(
+            type="live_probe",
+            status="healthy",
+            required=required,
+            message="live_probe_ok",
+        )
+    return HealthCheckResult(
+        type="live_probe",
+        status="unhealthy" if required else "degraded",
+        required=required,
+        message="live_probe_failed",
+        details={"returncode": completed.returncode},
+    )
 
 
 def _combine_health(checks: tuple[HealthCheckResult, ...]) -> HealthStatus:
@@ -472,6 +681,19 @@ def _combine_health(checks: tuple[HealthCheckResult, ...]) -> HealthStatus:
     if any(check.status != "healthy" for check in checks):
         return "degraded"
     return "healthy"
+
+
+def _normalize_health_mode(mode: HealthMode) -> str:
+    if mode in {"light", "live", "auto"}:
+        return mode
+    return "light"
+
+
+def _check_applies(check: Mapping[str, Any], mode: str) -> bool:
+    level = str(check.get("level") or "light")
+    if mode == "live":
+        return level in {"light", "live"}
+    return level == "light"
 
 
 def _routability(

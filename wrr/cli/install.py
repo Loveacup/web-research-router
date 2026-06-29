@@ -20,6 +20,7 @@ class InstallReport:
     env: EnvSnapshot
     missing_required_env: tuple[dict[str, Any], ...]
     planned_writes: tuple[dict[str, Any], ...]
+    dependency_updates: tuple[dict[str, Any], ...]
     trust_project: bool
     summary: dict[str, Any]
 
@@ -31,6 +32,7 @@ class InstallReport:
             "env_candidates": [candidate.to_dict() for candidate in self.env.candidates],
             "missing_required_env": list(self.missing_required_env),
             "planned_writes": list(self.planned_writes),
+            "dependency_updates": list(self.dependency_updates),
             "trust": {"project": self.trust_project},
             "summary": dict(self.summary),
         }
@@ -45,6 +47,7 @@ def install(
     env: Mapping[str, str] | None = None,
     env_files: Sequence[str | Path] | None = None,
     plugin_paths: Iterable[str | Path] | None = None,
+    refresh_deps: bool = False,
 ) -> InstallReport:
     """Return the v6 install plan.
 
@@ -56,7 +59,9 @@ def install(
     process_env = os.environ if env is None else env
     runtime = detect_runtime(explicit=runtime_hint, cwd=resolved_cwd, env=process_env)
     paths = tuple(plugin_paths or (resolved_cwd / "plugins" / "engines",))
-    discoveries = tuple(discover_engine_plugins(paths, include_builtin=True))
+    discoveries = tuple(
+        discover_engine_plugins(paths, include_builtin=True, trust_project=trust_project)
+    )
     required_env = _required_env(discoveries)
     snapshot = load_env(
         runtime,
@@ -67,6 +72,21 @@ def install(
     missing = _missing_required_env(discoveries, snapshot)
     config_target = Path.home() / ".config" / "wrr" / "config.yaml"
     planned_writes = ({"path": str(config_target), "action": "create_or_update_config"},)
+    dependency_updates: tuple[dict[str, Any], ...] = ()
+    dependency_summary: dict[str, Any] = {"repos": 0, "planned": 0, "refused": 0}
+    if refresh_deps:
+        from wrr.cli.update import update
+
+        update_report = update(
+            dry_run=dry_run,
+            trust_project=trust_project,
+            cwd=resolved_cwd,
+            env=process_env,
+            plugin_paths=paths,
+            discoveries=discoveries,
+        )
+        dependency_updates = tuple(item.to_dict() for item in update_report.repos)
+        dependency_summary = update_report.summary
 
     return InstallReport(
         dry_run=dry_run,
@@ -75,12 +95,14 @@ def install(
         env=snapshot,
         missing_required_env=tuple(missing),
         planned_writes=() if dry_run else planned_writes,
+        dependency_updates=dependency_updates,
         trust_project=trust_project,
         summary={
             "status": "dry_run" if dry_run else "report_only",
             "writes_performed": 0,
             "discovered": len(discoveries),
             "missing_required_env": len(missing),
+            "dependency_updates": dependency_summary,
         },
     )
 

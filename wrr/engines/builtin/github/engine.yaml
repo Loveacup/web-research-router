@@ -10,7 +10,20 @@
   },
   "routing": {
     "modes": ["auto", "github", "code"],
-    "weight": 1.0
+    "weight": 1.0,
+    "triggers": [
+      {
+        "name": "github_site_filter",
+        "match": {
+          "keywords": ["site:github.com"]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
   },
   "requirements": {
     "env": [

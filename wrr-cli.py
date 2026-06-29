@@ -262,6 +262,7 @@ def cmd_install(ns) -> int:
         runtime_hint=ns.runtime,
         trust_project=ns.trust_project,
         env_files=[ns.env] if ns.env else None,
+        refresh_deps=ns.refresh_deps,
     )
     if ns.json:
         _emit_json(report.to_dict())
@@ -275,8 +276,30 @@ def cmd_install(ns) -> int:
             marker = "loaded" if candidate["loaded"] else candidate.get("reason") or "not_loaded"
             print(f"    - {candidate['path']} [{candidate['trust_level']}, {marker}]")
         print(f"  missing required env: {len(payload['missing_required_env'])}")
+        print(f"  dependency updates: {len(payload['dependency_updates'])}")
         print("  writes performed: 0")
     return 0
+
+
+def cmd_update(ns) -> int:
+    """v6 dependency update surface."""
+    from wrr.cli.update import update
+
+    report = update(
+        dry_run=ns.dry_run,
+        trust_project=ns.trust_project,
+    )
+    payload = report.to_dict()
+    if ns.json:
+        _emit_json(payload)
+    else:
+        summary = payload["summary"]
+        print("WRR v6 dependency update")
+        print(f"  repos: {summary['repos']}")
+        print(f"  planned: {summary['planned']}")
+        print(f"  refused: {summary['refused']}")
+        print(f"  failed: {summary['failed']}")
+    return 1 if payload["summary"]["status"] == "fail" else 0
 
 
 def cmd_doctor(ns) -> int:
@@ -424,8 +447,17 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"],
                     help="显式指定 v6 runtime")
     ip.add_argument("--trust-project", action="store_true", help="信任项目级插件和项目 .env secret")
+    ip.add_argument("--refresh-deps", action="store_true", help="刷新 v6 repo 依赖；默认仅 dry-run 计划")
     ip.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     ip.set_defaults(func=cmd_install)
+
+    up = sub.add_parser("update", help="刷新 v6 repo 依赖")
+    up.add_argument("--dry-run", action="store_true", default=True, help="只输出计划，不执行 git 操作")
+    up.add_argument("--apply", action="store_false", dest="dry_run", help="执行允许的 git clone/fetch/checkout")
+    up.add_argument("--json", action="store_true", help="输出 JSON 格式")
+    up.add_argument("--trust-project", action="store_true", help="允许 project-level remote clone")
+    up.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
+    up.set_defaults(func=cmd_update)
 
     # doctor 子命令（v5.1，不继承 common 中的 --provider，因需独立 --engine）
     dp = sub.add_parser("doctor", help="检查引擎健康状况和本地依赖")

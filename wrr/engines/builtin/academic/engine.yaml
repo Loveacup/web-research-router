@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "id": "academic",
+  "name": "Academic",
+  "kind": "web_api",
+  "adapter": "wrr.engines.academic:AcademicEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["academic", "papers", "research", "web"]
+  },
+  "routing": {
+    "modes": ["auto", "academic", "research"],
+    "weight": 0.3,
+    "triggers": [
+      {
+        "name": "academic_keywords",
+        "match": {
+          "keywords": [
+            "论文",
+            "综述",
+            "survey",
+            "methodology",
+            "algorithm",
+            "paper",
+            "arxiv",
+            "doi",
+            "citation",
+            "preprint",
+            "peer review",
+            "literature",
+            "state of the art"
+          ]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": []
+  },
+  "requires_capabilities": {}
+}

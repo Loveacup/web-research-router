@@ -237,7 +237,7 @@ def _normalize_env_files(
             continue
         path = Path(item).expanduser()
         resolved = path.resolve() if path.exists() else path.absolute()
-        trust_level, source = _classify_path(resolved, cwd.resolve())
+        trust_level, source = _classify_explicit_env_path(resolved, cwd.resolve())
         candidates.append(
             EnvFileCandidate(
                 path=resolved,
@@ -259,6 +259,14 @@ def _classify_path(path: Path, cwd: Path) -> tuple[TrustLevel, str]:
     else:
         return "project", "project_env"
     return "user", "runtime_env"
+
+
+def _classify_explicit_env_path(path: Path, cwd: Path) -> tuple[TrustLevel, str]:
+    try:
+        path.relative_to(cwd)
+    except ValueError:
+        return "env_path", "explicit_env_path"
+    return "project", "project_env"
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:

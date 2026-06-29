@@ -128,6 +128,11 @@ BACKUP_HINT = (
 # ══════════════════════════════════════════════════════════════════════
 
 RRF_K = 60                                     # Cormack 2009 默认，业界标准
+FUSION_DEFAULTS = {
+    "rrf_k": RRF_K,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply",
+}
 
 # 连续时间衰减半衰期 τ（小时），按平台
 RECENCY_TAU = {

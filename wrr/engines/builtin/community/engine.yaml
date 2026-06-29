@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "id": "community",
+  "name": "Community",
+  "kind": "web_api",
+  "adapter": "wrr.engines.community:CommunityEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["community", "social", "forums", "web"]
+  },
+  "routing": {
+    "modes": ["auto", "platform", "research", "discovery", "broad"],
+    "weight": 0.3,
+    "triggers": [
+      {
+        "name": "community_sites",
+        "match": {
+          "keywords": [
+            "site:reddit.com",
+            "site:news.ycombinator.com",
+            "site:twitter.com",
+            "site:x.com",
+            "site:zhihu.com",
+            "site:weibo.com"
+          ]
+        }
+      },
+      {
+        "name": "community_platform_names",
+        "match": {
+          "keywords": [
+            "reddit",
+            "hacker news",
+            "hackernews",
+            "hn",
+            "twitter",
+            "v2ex",
+            "zhihu",
+            "微博",
+            "weibo",
+            "小红书",
+            "xiaohongshu"
+          ]
+        }
+      },
+      {
+        "name": "practical_intent",
+        "match": {
+          "keywords": [
+            "怎么用",
+            "如何使用",
+            "使用方法",
+            "操作指南",
+            "教程",
+            "快捷键",
+            "实战",
+            "实践",
+            "经验",
+            "踩坑",
+            "避坑",
+            "最佳实践",
+            "推荐",
+            "值得",
+            "哪个好",
+            "怎么选",
+            "how to",
+            "guide",
+            "tutorial",
+            "shortcuts",
+            "keybindings",
+            "best practice",
+            "tips",
+            "tricks",
+            "gotchas",
+            "worth it"
+          ]
+        }
+      }
+    ]
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [],
+    "binaries": [
+      {"name": "opencli", "required": false}
+    ],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "binary_present", "binary": "opencli", "required": false}
+    ]
+  },
+  "requires_capabilities": {}
+}
