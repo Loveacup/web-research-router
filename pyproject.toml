@@ -1,10 +1,10 @@
 [build-system]
 requires = ["setuptools>=61.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-research-router"
-version = "5.5.0"
+version = "6.0.0"
 description = "Semantic search router with 11 engines, mode-based routing, and RRF fusion"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,13 +19,19 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
 ]
-dependencies = []
+dependencies = [
+    "httpx>=0.28",
+    "PyYAML>=6",
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.scripts]
-wrr = "wrr-cli:main"
+wrr = "wrr._cli:main"
+
+[tool.setuptools.package-data]
+wrr = ["engines/builtin/*/engine.yaml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

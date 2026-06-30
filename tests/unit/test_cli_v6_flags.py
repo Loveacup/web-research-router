@@ -16,11 +16,7 @@ CLI = ROOT / "wrr-cli.py"
 
 
 def _load_cli_module():
-    spec = importlib.util.spec_from_file_location("wrr_cli_script", CLI)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    import wrr._cli as module
     return module
 
 

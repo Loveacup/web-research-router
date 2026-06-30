@@ -660,6 +660,17 @@ class DepRegistry:
     def by_type(self, dep_type: DepType) -> List[BaseDep]:
         return [d for d in self._deps.values() if d.dep_type == dep_type]
 
+    def by_capability(self, capability: str) -> List[BaseDep]:
+        """v5 兼容：按 capability 筛选依赖（原始 ExternalDep 的语义）。
+
+        当前 BaseDep 不再强制声明 capability 字段；
+        仅 GitRepoDep 和其他在 __init__ 中设置了 capability 属性的依赖会被匹配。
+        """
+        return [
+            d for d in self._deps.values()
+            if getattr(d, "capability", None) == capability
+        ]
+
 
 # ══════════════════════════════════════════════════════════════════════
 # v6 manifest -> v5 dependency bridge

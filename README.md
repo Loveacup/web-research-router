@@ -36,7 +36,7 @@ Requires Python >= 3.10 (`pyproject.toml` enforces this). On macOS, `/usr/bin/en
 
 ```bash
 # Install as Hermes plugin
-ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr
+ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 
 # Legacy-compatible CLI examples (run inside Python >=3.10)
 ./wrr-cli.py doctor          # 引擎 + 全量依赖自检
@@ -46,6 +46,35 @@ ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr
 ./wrr-cli.py similar "https://example.com" --provider exa --count 5
 wrr search "your query"      # Hermes runtime tool entrypoint
 ```
+
+## Packaging & install
+
+Three interchangeable entrypoints share one codebase at package version `6.0.0`:
+
+```bash
+# 1) pip install — exposes the `wrr` console script ([project.scripts] wrr = wrr._cli:main).
+#    Verify the install with the v6 standalone runtime doctor:
+pip install .
+wrr doctor --v6 --json --runtime standalone
+
+# 2) Direct script — still works without install, on any Python >= 3.10:
+./wrr-cli.py doctor --json
+./wrr-cli.py search "your query" --provider exa --count 5
+
+# 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
+#    plugin.yaml `version` is kept aligned with the package version (6.0.0).
+ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
+```
+
+Notes:
+- The v6 migration gate stays **opt-in**: pip/console install does not flip the
+  default router to v6: legacy `doctor`/`search` behavior is unchanged unless you
+  pass `--v6` (see below).
+- Wheel verification should confirm the built-in engine manifests are packaged:
+  `pyproject.toml` ships `engines/builtin/*/engine.yaml` via `[tool.*] package-data`
+  (`wrr = ["engines/builtin/*/engine.yaml"]`). After `python -m build`, inspect the
+  wheel (`unzip -l dist/*.whl | grep engine.yaml`) to ensure every builtin engine
+  manifest is present before publishing.
 
 ## v6 CLI migration gate
 

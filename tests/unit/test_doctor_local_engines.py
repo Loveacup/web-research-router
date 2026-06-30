@@ -72,13 +72,9 @@ def test_doctor_summary_counts_local_fails():
 
 def test_cli_choices_include_local_engines():
     """CLI parser 的 --provider 和 doctor --engine 都应含 4 个本地引擎。"""
-    import importlib.util
-    here = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    spec = importlib.util.spec_from_file_location(
-        "wrr_cli", os.path.join(here, "wrr-cli.py"))
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
-    parser = cli.build_parser()
+    from wrr._cli import build_parser
+
+    parser = build_parser()
 
     local = {"local_supermemory", "local_session", "local_qmd", "local_obsidian"}
     found_provider = set()

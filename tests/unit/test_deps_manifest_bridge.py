@@ -70,6 +70,25 @@ def test_default_legacy_deps_behavior_is_unchanged():
     assert "obsidian_vaults" not in registry.all
 
 
+def test_by_capability_recent_web_search_order_matches_manifest():
+    registry = DepRegistry.get()
+
+    ids = [dep.id for dep in registry.by_capability("recent_web_search")]
+    assert ids == ["last30days_en", "last30days_cn"]
+
+
+def test_by_capability_unknown_returns_empty():
+    registry = DepRegistry.get()
+
+    assert registry.by_capability("no_such_capability") == []
+
+
+def test_registry_all_count_is_thirteen():
+    registry = DepRegistry.get()
+
+    assert len(registry.all) == 13
+
+
 def test_unknown_manifest_calling_pattern_does_not_crash_bridge():
     deps = manifest_to_legacy_deps(
         {
