@@ -272,7 +272,7 @@ def test_community_last30days_missing_warn():
 
 
 def test_community_deep_probe_ok():
-    """Community deep=True: opencli --version 成功 → ok。"""
+    """Community deep=True: opencli --version 成功 + daemon ready → ok。"""
     from wrr.engines._probe import CommandProbeResult
 
     async def mock_probe_command(cmd, args, timeout):
@@ -284,9 +284,13 @@ def test_community_deep_probe_ok():
             stdout="opencli version 1.0.0\n",
         )
 
+    async def mock_check_ready(*, timeout):
+        return (True, "opencli ready")
+
     with patch("shutil.which", return_value="/usr/local/bin/opencli"):
         with patch("wrr.engines._probe.probe_command", side_effect=mock_probe_command):
-            result = run(CommunityEngine().health_check(deep=True))
+            with patch("wrr.engines.community._check_opencli_ready", side_effect=mock_check_ready):
+                result = run(CommunityEngine().health_check(deep=True))
 
     assert result.status == "ok"
     assert "opencli available" in result.summary

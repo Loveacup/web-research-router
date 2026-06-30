@@ -173,6 +173,51 @@ def deduplicate(results: List[SearchResult]) -> List[SearchResult]:
     return unique
 
 
+async def _check_opencli_ready(*, timeout: float = 5.0) -> Tuple[bool, str]:
+    """检查 OpenCLI daemon + Chrome extension 是否可用，不可用时尝试自动恢复。
+
+    返回 (ready, detail)：
+      - ready=True：可以安全调用 opencli 搜索
+      - ready=False：尝试恢复失败，detail 包含可操作错误信息
+
+    恢复策略：
+      1. 快速检查 daemon 状态（`opencli daemon status`）
+      2. extension 断连 → 重启 daemon → 等待重连 → 再次检查
+      3. daemon 不运行/无法恢复 → 直接返回失败
+    """
+    rc, out = await _run_cmd(["opencli", "daemon", "status"], timeout=timeout)
+    if rc != 0 or not out.strip():
+        return (False, "opencli daemon not running — try: opencli daemon start")
+    out_lower = out.lower()
+
+    if "not running" in out_lower:
+        # daemon 没跑 → 尝试启动（opencli daemon 只有 restart，没有 start）
+        rc2, _ = await _run_cmd(["opencli", "daemon", "restart"], timeout=timeout)
+        if rc2 != 0:
+            return (False, "opencli daemon not running and restart failed — try: opencli daemon restart")
+        await asyncio.sleep(2.0)
+        rc3, out3 = await _run_cmd(["opencli", "daemon", "status"], timeout=timeout)
+        if rc3 == 0 and "connected" in out3.lower():
+            return (True, "opencli reconnected after daemon restart")
+        return (False, "opencli daemon restarted but extension not connected — is Chrome running?")
+
+    if "connected" in out_lower and "extension" in out_lower:
+        return (True, "opencli ready")
+
+    # Extension disconnected → 尝试重启 daemon 让 extension 重连
+    if "disconnected" in out_lower or "not connected" in out_lower:
+        rc2, _ = await _run_cmd(["opencli", "daemon", "restart"], timeout=timeout)
+        if rc2 != 0:
+            return (False, "opencli extension disconnected; daemon restart failed")
+        await asyncio.sleep(2.5)
+        rc3, out3 = await _run_cmd(["opencli", "daemon", "status"], timeout=timeout)
+        if rc3 == 0 and "connected" in out3.lower():
+            return (True, "opencli reconnected after daemon restart")
+        return (False, "opencli extension still disconnected after restart — try: opencli daemon restart")
+
+    return (False, f"opencli status unknown: {out[:200]}")
+
+
 # ── 子进程（集中一处，便于单测 monkeypatch）──────────────────────────
 async def _run_cmd(cli: List[str], timeout: float) -> Tuple[Optional[int], str]:
     """运行命令，返回 (returncode, stdout)；超时/异常返回 (None, '').
@@ -208,7 +253,21 @@ class CommunityEngine(SearchEngine):
     name = "community"
     tier = 2  # 本地 CLI 依赖
 
+    def __init__(self) -> None:
+        super().__init__()
+        # 单次搜索内缓存 opencli 连接检查结果，避免对每个源重复探测
+        self._opencli_ready_checked: Optional[Tuple[bool, str]] = None
+
+    async def _preflight_opencli(self) -> Tuple[bool, str]:
+        """预检 OpenCLI daemon + Chrome extension 连接，每个搜索只做一次。"""
+        if self._opencli_ready_checked is not None:
+            return self._opencli_ready_checked
+        self._opencli_ready_checked = await _check_opencli_ready(timeout=5.0)
+        return self._opencli_ready_checked
+
     async def search(self, options: SearchOptions) -> List[SearchResult]:
+        ready, _detail = await self._preflight_opencli()
+        self._opencli_ready_checked = None  # reset for next search
         sources = self._detect_sources(options.query)
         now = datetime.now(timezone.utc)
         gathered = await asyncio.gather(
@@ -233,6 +292,8 @@ class CommunityEngine(SearchEngine):
         替代 search() 的「线性合并不可比分」做法（研究报告 §2）。源内仍用
         calculate_score 排序，magnitude 不出源；跨源用秩融合，多源命中自动加分。
         """
+        ready, _detail = await self._preflight_opencli()
+        self._opencli_ready_checked = None  # reset for next search
         sources = self._detect_sources(options.query)
         now = datetime.now(timezone.utc)
         gathered = await asyncio.gather(
@@ -306,6 +367,10 @@ class CommunityEngine(SearchEngine):
         return out
 
     async def _fetch_opencli(self, cfg, options) -> List[Dict[str, Any]]:
+        # 如果预检 opencli 不可用（daemon/extension 断连且无法恢复），
+        # 直接返回空，避免无用超时等待
+        if self._opencli_ready_checked is not None and not self._opencli_ready_checked[0]:
+            return []
         cli = cfg["cli"] + [options.query, "-f", "json",
                             "--limit", str(min(options.count, 20))]
         rc, out = await _run_cmd(cli, config.COMMUNITY_SOURCE_TIMEOUT)
@@ -360,7 +425,7 @@ class CommunityEngine(SearchEngine):
         """检查 opencli 是否可用。
 
         P0 (deep=False): shutil.which 仅检查存在性
-        P1 (deep=True): probe_command 执行 --version 验证可用性
+        P1 (deep=True): 执行 --version + daemon status + extension 连接检查
         """
         from ._probe import probe_command
 
@@ -384,7 +449,9 @@ class CommunityEngine(SearchEngine):
                 evidence={"command.opencli": "missing"},
             )
 
-        # Deep 检查：执行 --version
+        conn_detail = ""  # 初始化以避免 Pyright unbound warning
+
+        # Deep 检查：执行 --version + daemon/extension 状态
         if deep:
             probe_result = await probe_command("opencli", ("--version",), timeout=3.0)
             if probe_result.status == "timeout":
@@ -424,8 +491,32 @@ class CommunityEngine(SearchEngine):
                     },
                 )
 
-        # opencli OK，检查 last30days（如果启用）
-        details = f"opencli found at: {opencli_path}"
+            # deep: 额外检查 daemon + Chrome extension 连接
+            ready, conn_detail = await _check_opencli_ready(timeout=5.0)
+            if not ready:
+                return EngineCheckResult(
+                    engine=self.name,
+                    status="fail",
+                    tier=self.tier,
+                    summary="opencli daemon/extension not connected",
+                    details=conn_detail,
+                    requirements=["command:opencli", "chrome:extension"],
+                    repair=[
+                        "Make sure Chrome is running with OpenCLI extension enabled.",
+                        "Check: opencli doctor",
+                        "Restart daemon if needed: opencli daemon restart",
+                        "Ensure extension is installed and enabled in chrome://extensions/",
+                        f"Ensure Chrome Browser Bridge extension is connected to daemon on port 19825",
+                    ],
+                    evidence={
+                        "command.opencli": opencli_path,
+                        "extension.connectivity": conn_detail,
+                    },
+                )
+
+            details = f"opencli found at: {opencli_path}; {conn_detail}"
+        else:
+            details = f"opencli found at: {opencli_path}"
         if config.COMMUNITY_INCLUDE_LAST30DAYS:
             l30_issues = []
             for label, path in [("last30days_en", _L30_EN), ("last30days_cn", _L30_CN)]:
@@ -466,5 +557,8 @@ class CommunityEngine(SearchEngine):
             summary="opencli available",
             details=details,
             active_backend="opencli",
-            evidence={"command.opencli": opencli_path},
+            evidence={
+                "command.opencli": opencli_path,
+                **({"extension.connectivity": conn_detail} if deep else {}),
+            },
         )
