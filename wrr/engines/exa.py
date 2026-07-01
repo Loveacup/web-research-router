@@ -23,6 +23,22 @@ EXA_FINDSIMILAR_URL = "https://api.exa.ai/findSimilar"
 # ── 查询分类 → 模式选择（质量优先）────────────────────────────────────
 MODE_ROUTING = config.EXA_MODE_ROUTING
 
+EXA_SEARCH_TYPES = {"auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"}
+
+WRR_MODE_TO_EXA_TYPE = {
+    # WRR router modes are not Exa API search types. Map them at the engine
+    # boundary so explicit WRR modes (e.g. handler arg mode="grounding") don't
+    # leak into Exa's `type` field and cause HTTP 400.
+    "discovery": "auto",
+    "broad": "auto",
+    "grounding": "auto",
+    "platform": "auto",
+    "local": "auto",
+    "recovery": "auto",
+    "research": "deep-lite",
+    "academic": "deep",
+}
+
 
 def classify_query(query: str) -> str:
     """基于查询特征自动分类，返回模式类型。"""
@@ -48,7 +64,9 @@ def get_search_mode(options: SearchOptions) -> str:
     """确定搜索模式。显式 mode 优先，否则自动路由。"""
     # 用户显式指定 mode
     if options.mode:
-        return options.mode
+        if options.mode in EXA_SEARCH_TYPES:
+            return options.mode
+        return WRR_MODE_TO_EXA_TYPE.get(options.mode, "auto")
     
     # 自动路由
     query_type = classify_query(options.query)

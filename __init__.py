@@ -7,36 +7,86 @@ wrr.doctor / wrr.engines.loader），所有重依赖在 ``register(ctx)`` 内部
 
 __version__ = "6.0.0"
 
-# ── 最小 JSON schema（与 wrr/tools/*.py 的 handler 参数对齐）──────────────
+_SEARCH_PROVIDERS = [
+    "exa", "brave", "community", "academic", "github", "skill", "searxng",
+    "local_supermemory", "local_session", "local_qmd", "local_obsidian",
+]
+_FETCH_PROVIDERS = ["exa", "brave"]
+_SIMILAR_PROVIDERS = ["exa"]
+
+# ── OpenAI function schemas（与 wrr/tools/*.py 的 handler 参数对齐）────────
+#
+# Hermes registry expects tool schemas in OpenAI function format:
+# {"name", "description", "parameters": {"type", "properties", "required"}}.
+# A bare JSON schema ({"type", "properties", "required"}) is technically
+# stored by the registry, but it reaches the model without a `parameters`
+# object. In real agent-in-loop E2E this let the model call `web_search` with
+# `{}` once before self-correcting. Keep the required fields under
+# `parameters` so provider-side schema validation can guide the model before
+# the handler runs.
 _SEARCH_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "query": {"type": "string", "description": "搜索查询"},
-        "max_results": {"type": "integer", "description": "返回结果上限"},
-        "provider": {"type": "string", "description": "显式指定引擎（可选）"},
-        "mode": {"type": "string", "description": "显式 mode 覆盖自动分类（可选）"},
+    "name": "web_search",
+    "description": (
+        "Search the web through WRR. The `query` field is required; never call "
+        "this tool with empty arguments. Prefer omitting `provider` and using "
+        "`mode` for WRR routing. If `provider` is set, it must be a concrete "
+        "engine name from the enum, never an output/fusion label like "
+        "`rrf:grounding`. Returns fused results plus provider, mode, and "
+        "fallback_chain metadata when available."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "搜索查询（必填）"},
+            "max_results": {"type": "integer", "description": "返回结果上限"},
+            "provider": {
+                "type": "string",
+                "enum": _SEARCH_PROVIDERS,
+                "description": (
+                    "可选：只在需要强制单引擎时填写具体引擎名。默认应省略，让 WRR 按 mode 路由。"
+                    "禁止填写输出里的融合 provider，例如 rrf:grounding / rrf:research。"
+                ),
+            },
+            "mode": {"type": "string", "description": "显式 mode 覆盖自动分类（可选）"},
+        },
+        "required": ["query"],
     },
-    "required": ["query"],
 }
 
 _FETCH_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "url": {"type": "string", "description": "要抽取的页面 URL"},
-        "max_characters": {"type": "integer", "description": "抽取正文字符上限"},
-        "provider": {"type": "string", "description": "显式指定引擎（可选）"},
+    "name": "web_fetch",
+    "description": "Fetch/extract a page through WRR. The `url` field is required.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "要抽取的页面 URL（必填）"},
+            "max_characters": {"type": "integer", "description": "抽取正文字符上限"},
+            "provider": {
+                "type": "string",
+                "enum": _FETCH_PROVIDERS,
+                "description": "可选：强制单引擎抽取。只能是具体引擎名，不能是 rrf:* 融合标签。",
+            },
+        },
+        "required": ["url"],
     },
-    "required": ["url"],
 }
 
 _SIMILAR_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "url": {"type": "string", "description": "参考 URL"},
-        "max_results": {"type": "integer", "description": "返回相似页面上限"},
-        "provider": {"type": "string", "description": "显式指定引擎（可选）"},
+    "name": "web_similar",
+    "description": "Find pages similar to a reference URL through WRR. The `url` field is required.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "参考 URL（必填）"},
+            "max_results": {"type": "integer", "description": "返回相似页面上限"},
+            "provider": {
+                "type": "string",
+                "enum": _SIMILAR_PROVIDERS,
+                "description": "可选：强制单引擎 similar。只能是具体引擎名，不能是 rrf:* 融合标签。",
+            },
+        },
+        "required": ["url"],
     },
-    "required": ["url"],
 }
 
 

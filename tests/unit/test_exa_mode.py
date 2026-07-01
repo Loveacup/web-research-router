@@ -29,8 +29,20 @@ def test_get_search_mode_auto_routing():
 
 
 def test_get_search_mode_explicit_override():
-    # 显式 mode 优先于自动路由
+    # 显式 Exa search type 优先于自动路由
     assert exa_mod.get_search_mode(SearchOptions("survey", mode="fast")) == "fast"
+
+
+def test_get_search_mode_maps_wrr_router_modes_to_exa_types():
+    # WRR router modes are internal; leaking them into Exa's API `type` field
+    # causes HTTP 400. Agent-in-loop E2E hit this with mode="grounding".
+    assert exa_mod.get_search_mode(SearchOptions("go release notes", mode="grounding")) == "auto"
+    assert exa_mod.get_search_mode(SearchOptions("deep comparison", mode="research")) == "deep-lite"
+    assert exa_mod.get_search_mode(SearchOptions("survey", mode="academic")) == "deep"
+
+
+def test_get_search_mode_unknown_explicit_mode_falls_back_to_auto():
+    assert exa_mod.get_search_mode(SearchOptions("anything", mode="not-an-exa-type")) == "auto"
 
 
 def test_get_timeout_for_mode():

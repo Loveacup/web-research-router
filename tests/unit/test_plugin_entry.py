@@ -6,7 +6,7 @@
   - 存在 callable ``register(ctx)``；
   - MockCtx 调用后注册 web_search / web_fetch / web_similar 3 个 tool；
   - 三者 is_async=True、toolset="wrr"；
-  - schema required 正确（query / url / url）。
+  - OpenAI function schema 的 parameters.required 正确（query / url / url）。
 """
 import importlib.util
 import subprocess
@@ -134,21 +134,63 @@ def test_schema_required_fields():
     mod = _load_entry()
     ctx = MockCtx()
     mod.register(ctx)
-    assert ctx.tools["web_search"]["schema"]["required"] == ["query"]
-    assert ctx.tools["web_fetch"]["schema"]["required"] == ["url"]
-    assert ctx.tools["web_similar"]["schema"]["required"] == ["url"]
+    assert ctx.tools["web_search"]["schema"]["parameters"]["required"] == ["query"]
+    assert ctx.tools["web_fetch"]["schema"]["parameters"]["required"] == ["url"]
+    assert ctx.tools["web_similar"]["schema"]["parameters"]["required"] == ["url"]
+
+
+def test_schemas_are_openai_function_format():
+    """Hermes registry forwards schema as-is; parameters must be nested.
+
+    A bare JSON schema reaches the model without an argument schema and can
+    produce empty tool calls (observed in Agent-in-loop E2E). Keep this as a
+    regression test for plugin tools that override Hermes built-ins.
+    """
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+    for name, t in ctx.tools.items():
+        schema = t["schema"]
+        assert schema["name"] == name
+        assert isinstance(schema.get("description"), str) and schema["description"]
+        assert schema.get("parameters", {}).get("type") == "object", name
+        assert "properties" in schema["parameters"], name
 
 
 def test_schema_properties_align_with_handlers():
     mod = _load_entry()
     ctx = MockCtx()
     mod.register(ctx)
-    assert set(ctx.tools["web_search"]["schema"]["properties"]) == {
+    assert set(ctx.tools["web_search"]["schema"]["parameters"]["properties"]) == {
         "query", "max_results", "provider", "mode",
     }
-    assert set(ctx.tools["web_fetch"]["schema"]["properties"]) == {
+    assert set(ctx.tools["web_fetch"]["schema"]["parameters"]["properties"]) == {
         "url", "max_characters", "provider",
     }
-    assert set(ctx.tools["web_similar"]["schema"]["properties"]) == {
+    assert set(ctx.tools["web_similar"]["schema"]["parameters"]["properties"]) == {
         "url", "max_results", "provider",
     }
+
+
+def test_provider_schema_rejects_fusion_labels():
+    """`provider` is input-only and must be a concrete engine name.
+
+    Agent-in-loop E2E showed the model copying output provider labels such as
+    `rrf:grounding` back into the input provider field. The enum and wording
+    should make that invalid at schema level.
+    """
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+    search_provider = ctx.tools["web_search"]["schema"]["parameters"]["properties"]["provider"]
+    assert "enum" in search_provider
+    assert "exa" in search_provider["enum"]
+    assert "brave" in search_provider["enum"]
+    assert "rrf:grounding" not in search_provider["enum"]
+    assert "rrf:" in search_provider["description"]
+
+    fetch_provider = ctx.tools["web_fetch"]["schema"]["parameters"]["properties"]["provider"]
+    assert fetch_provider["enum"] == ["exa", "brave"]
+
+    similar_provider = ctx.tools["web_similar"]["schema"]["parameters"]["properties"]["provider"]
+    assert similar_provider["enum"] == ["exa"]
