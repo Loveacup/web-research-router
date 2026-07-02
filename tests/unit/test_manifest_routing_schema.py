@@ -141,6 +141,14 @@ def test_manifest_parser_accepts_health_layer_failure_category_and_future_sectio
                 "level": "live",
                 "failure_category": "timeout",
             },
+            {
+                "type": "live_probe",
+                "command": ["opencli", "daemon", "status"],
+                "level": "live",
+                "stdout_contains": ["Extension: connected"],
+                "stdout_not_contains": ["Extension: disconnected"],
+                "failure_category": "daemon_disconnected",
+            },
         ],
         "probes": {"live": []},
         "recovery": [],
@@ -153,6 +161,33 @@ def test_manifest_parser_accepts_health_layer_failure_category_and_future_sectio
     assert manifest is not None
     assert manifest.health["checks"][0]["layer"] == "static"
     assert manifest.health["checks"][1]["level"] == "live"
+    assert manifest.health["checks"][2]["stdout_contains"] == ["Extension: connected"]
+
+
+def test_manifest_parser_rejects_invalid_stdout_matcher_types():
+    payload = _manifest("bad_matcher_schema").to_dict()
+    payload["health"] = {
+        "checks": [
+            {
+                "type": "live_probe",
+                "command": ["opencli", "daemon", "status"],
+                "level": "live",
+                "stdout_contains": 123,
+            },
+            {
+                "type": "live_probe",
+                "command": ["opencli", "daemon", "status"],
+                "level": "live",
+                "stdout_not_contains": ["Extension: disconnected", ""],
+            },
+        ]
+    }
+
+    manifest, errors = parse_engine_manifest(payload)
+
+    assert manifest is None
+    assert "invalid:health.checks[0].stdout_contains" in errors
+    assert "invalid:health.checks[1].stdout_not_contains" in errors
 
 
 def test_manifest_parser_rejects_invalid_health_layer_and_failure_category():

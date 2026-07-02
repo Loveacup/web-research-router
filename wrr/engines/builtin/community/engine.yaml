@@ -128,7 +128,18 @@
   },
   "health": {
     "checks": [
-      {"type": "binary_present", "binary": "opencli", "required": false}
+      {"type": "binary_present", "binary": "opencli", "required": false},
+      {
+        "type": "live_probe",
+        "level": "live",
+        "required": true,
+        "command": ["opencli", "daemon", "status"],
+        "timeout_sec": 5,
+        "stdout_contains": ["Extension: connected"],
+        "stdout_not_contains": ["Extension: disconnected"],
+        "failure_category": "daemon_disconnected",
+        "remediation": "Open Chrome with the OpenCLI extension connected, then run `wrr doctor --deep` to refresh live health. Restart/recovery is deferred to H4."
+      }
     ]
   },
   "requires_capabilities": {}

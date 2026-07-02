@@ -906,12 +906,29 @@ def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckRe
             ),
         )
     if completed.returncode == 0:
+        stdout = completed.stdout or ""
+        failed, message = _stream_match_failed(stdout, check)
+        if not failed:
+            return HealthCheckResult(
+                type="live_probe",
+                status="healthy",
+                required=required,
+                message="live_probe_ok",
+                layer=_check_layer(check, default="live"),
+            )
         return HealthCheckResult(
             type="live_probe",
-            status="healthy",
+            status="unhealthy" if required else "degraded",
             required=required,
-            message="live_probe_ok",
+            message=message or "live_probe_output_mismatch",
+            details={
+                "returncode": completed.returncode,
+                "stdout_contains": list(_string_list(check.get("stdout_contains"))),
+                "stdout_not_contains": list(_string_list(check.get("stdout_not_contains"))),
+                "stdout_excerpt": stdout[:200],
+            },
             layer=_check_layer(check, default="live"),
+            failure_category=_manifest_failure_category(check, "daemon_disconnected"),
         )
     return HealthCheckResult(
         type="live_probe",
@@ -922,6 +939,33 @@ def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckRe
         layer=_check_layer(check, default="live"),
         failure_category=_manifest_failure_category(check, "daemon_disconnected"),
     )
+
+
+def _string_list(value: Any) -> tuple[str, ...]:
+    """Normalize a matcher value into a tuple of non-empty strings."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value if str(item))
+    return ()
+
+
+def _stream_match_failed(text: str, check: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Evaluate stdout matcher rules for a live probe.
+
+    ``stdout_contains`` requires at least one listed substring to be present;
+    ``stdout_not_contains`` rejects when any listed substring is present. Returns
+    ``(failed, message)`` where ``message`` names the specific mismatch.
+    """
+    rejected = _string_list(check.get("stdout_not_contains"))
+    if rejected and any(token in text for token in rejected):
+        return True, "live_probe_output_rejected"
+    required = _string_list(check.get("stdout_contains"))
+    if required and not any(token in text for token in required):
+        return True, "live_probe_output_mismatch"
+    return False, None
 
 
 def _combine_health(checks: tuple[HealthCheckResult, ...]) -> HealthStatus:

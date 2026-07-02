@@ -253,21 +253,9 @@ class CommunityEngine(SearchEngine):
     name = "community"
     tier = 2  # 本地 CLI 依赖
 
-    def __init__(self) -> None:
-        super().__init__()
-        # 单次搜索内缓存 opencli 连接检查结果，避免对每个源重复探测
-        self._opencli_ready_checked: Optional[Tuple[bool, str]] = None
-
-    async def _preflight_opencli(self) -> Tuple[bool, str]:
-        """预检 OpenCLI daemon + Chrome extension 连接，每个搜索只做一次。"""
-        if self._opencli_ready_checked is not None:
-            return self._opencli_ready_checked
-        self._opencli_ready_checked = await _check_opencli_ready(timeout=5.0)
-        return self._opencli_ready_checked
-
     async def search(self, options: SearchOptions) -> List[SearchResult]:
-        ready, _detail = await self._preflight_opencli()
-        self._opencli_ready_checked = None  # reset for next search
+        # H3 (v6.1): 搜索热路径不再预检/重启 OpenCLI daemon。daemon/extension
+        # 连接性由 v6 registry 的 live_probe 健康检查负责（离线缓存 → routable）。
         sources = self._detect_sources(options.query)
         now = datetime.now(timezone.utc)
         gathered = await asyncio.gather(
@@ -292,8 +280,7 @@ class CommunityEngine(SearchEngine):
         替代 search() 的「线性合并不可比分」做法（研究报告 §2）。源内仍用
         calculate_score 排序，magnitude 不出源；跨源用秩融合，多源命中自动加分。
         """
-        ready, _detail = await self._preflight_opencli()
-        self._opencli_ready_checked = None  # reset for next search
+        # H3 (v6.1): 同 search()，热路径不做 daemon 预检/重启。
         sources = self._detect_sources(options.query)
         now = datetime.now(timezone.utc)
         gathered = await asyncio.gather(
@@ -367,10 +354,6 @@ class CommunityEngine(SearchEngine):
         return out
 
     async def _fetch_opencli(self, cfg, options) -> List[Dict[str, Any]]:
-        # 如果预检 opencli 不可用（daemon/extension 断连且无法恢复），
-        # 直接返回空，避免无用超时等待
-        if self._opencli_ready_checked is not None and not self._opencli_ready_checked[0]:
-            return []
         cli = cfg["cli"] + [options.query, "-f", "json",
                             "--limit", str(min(options.count, 20))]
         rc, out = await _run_cmd(cli, config.COMMUNITY_SOURCE_TIMEOUT)

@@ -162,6 +162,128 @@ def test_routable_ignores_live_probe_without_explicit_layer(tmp_path, monkeypatc
     assert load_state(state_file).health_cache == {}
 
 
+class _FakeCompleted:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+_DAEMON_DISCONNECTED = (
+    "Daemon: running (PID 27065)\n"
+    "Version: v1.8.4\n"
+    "Uptime: 46h 19m\n"
+    "Extension: disconnected\n"
+    "Memory: 11.3 MB\n"
+    "Port: 19825\n"
+)
+_DAEMON_CONNECTED = _DAEMON_DISCONNECTED.replace(
+    "Extension: disconnected", "Extension: connected"
+)
+
+
+def _matcher_manifest(engine_id: str):
+    return {
+        "schema_version": 1,
+        "id": engine_id,
+        "name": engine_id.title(),
+        "kind": "web_api",
+        "adapter": f"wrr.engines.{engine_id}:{engine_id.title()}Engine",
+        "capabilities": {"actions": ["search"], "domains": ["web"]},
+        "routing": {"modes": ["auto", "web"], "weight": 1.0},
+        "requirements": {"env": [], "binaries": [], "repos": []},
+        "health": {
+            "checks": [
+                {
+                    "type": "live_probe",
+                    "level": "live",
+                    "required": True,
+                    "command": ["opencli", "daemon", "status"],
+                    "timeout_sec": 5,
+                    "stdout_contains": ["Extension: connected"],
+                    "stdout_not_contains": ["Extension: disconnected"],
+                    "failure_category": "daemon_disconnected",
+                }
+            ]
+        },
+        "requires_capabilities": {},
+    }
+
+
+def _matcher_plugin(tmp_path, engine_id="probe"):
+    plugin_dir = tmp_path / "plugins" / "engines" / engine_id
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "engine.yaml").write_text(
+        json.dumps(_matcher_manifest(engine_id)), encoding="utf-8"
+    )
+    return tmp_path / "plugins" / "engines"
+
+
+def test_live_probe_stdout_not_contains_marks_daemon_disconnected(tmp_path, monkeypatch):
+    plugin_paths = _matcher_plugin(tmp_path)
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: _FakeCompleted(0, _DAEMON_DISCONNECTED),
+    )
+    registry = _registry(tmp_path, tmp_path / "state.json", plugin_paths)
+
+    health = registry.health(mode="live")[0]
+
+    assert health.status == "unhealthy"
+    live = health.checks[0]
+    assert live.type == "live_probe"
+    assert live.message == "live_probe_output_rejected"
+    assert live.failure_category == "daemon_disconnected"
+
+
+def test_live_probe_stdout_contains_required_connected(tmp_path, monkeypatch):
+    plugin_paths = _matcher_plugin(tmp_path)
+    # returncode 0 but stdout lacks the required "Extension: connected" token.
+    lacking = "Daemon: running\nExtension: pending\n"
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: _FakeCompleted(0, lacking),
+    )
+    registry = _registry(tmp_path, tmp_path / "state.json", plugin_paths)
+
+    health = registry.health(mode="live")[0]
+
+    # required=True -> unhealthy
+    assert health.status == "unhealthy"
+    live = health.checks[0]
+    assert live.message == "live_probe_output_mismatch"
+    assert live.failure_category == "daemon_disconnected"
+
+
+def test_cached_disconnected_live_health_makes_community_not_routable_without_probe(
+    tmp_path, monkeypatch
+):
+    plugin_paths = _matcher_plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: _FakeCompleted(0, _DAEMON_DISCONNECTED),
+    )
+    live = _registry(tmp_path, state_file, plugin_paths).health(mode="live")[0]
+    assert live.status == "unhealthy"
+
+    # Now the hot path must reuse the cached live failure and never probe again.
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("subprocess must not run on routable hot path")
+        ),
+    )
+    report = _registry(tmp_path, state_file, plugin_paths).report(health_mode="auto")
+
+    assert [descriptor.id for descriptor in report.routable] == []
+    probe = report.resolved[0]
+    assert probe.routable is False
+    assert "health_unhealthy" in probe.routable_reasons
+
+
 def test_circuit_breaker_state_survives_registry_instances(tmp_path):
     plugin_paths, _marker = _plugin(tmp_path)
     state_file = tmp_path / "state.json"

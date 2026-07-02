@@ -58,6 +58,33 @@ def test_search_rrf_aggregates_multi_source():
     assert all(r.url for r in out)
 
 
+def test_search_rrf_does_not_probe_or_restart_opencli_daemon():
+    """H3 (v6.1): search_rrf 热路径不得执行 opencli daemon status/restart。"""
+    recorded: list = []
+    orig = cm._run_cmd
+
+    async def guard(cli, timeout):
+        if cli[:3] == ["opencli", "daemon", "status"]:
+            raise AssertionError("search_rrf hot path must not run opencli daemon status")
+        if cli[:3] == ["opencli", "daemon", "restart"]:
+            raise AssertionError("search_rrf hot path must not run opencli daemon restart")
+        recorded.append(cli)
+        joined = " ".join(cli).lower()
+        if "reddit" in joined:
+            return (0, json.dumps(_REDDIT[:1]))
+        return (0, "[]")
+
+    cm._run_cmd = guard
+    try:
+        out = run(cm.CommunityEngine().search_rrf(
+            SearchOptions("python site:reddit.com", count=5)))
+    finally:
+        cm._run_cmd = orig
+    assert len(out) == 1
+    assert all(cli[:3] != ["opencli", "daemon", "status"] for cli in recorded)
+    assert all(cli[:3] != ["opencli", "daemon", "restart"] for cli in recorded)
+
+
 def test_search_rrf_respects_count():
     orig = cm._run_cmd
     cm._run_cmd = _fake_run_factory({"reddit": _REDDIT, "twitter": _TWITTER,

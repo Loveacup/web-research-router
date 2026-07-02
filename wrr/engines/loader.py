@@ -363,6 +363,9 @@ def _validate_health_schema(health: Mapping[str, Any], errors: list[str]) -> Non
             category = check.get("failure_category")
             if category is not None and str(category) not in HEALTH_FAILURE_CATEGORIES:
                 errors.append(f"invalid:health.checks[{index}].failure_category")
+            for matcher_key in ("stdout_contains", "stdout_not_contains"):
+                if matcher_key in check and not _valid_stream_matcher(check.get(matcher_key)):
+                    errors.append(f"invalid:health.checks[{index}].{matcher_key}")
 
     probes = health.get("probes")
     if probes is not None and not isinstance(probes, (list, Mapping)):
@@ -844,6 +847,15 @@ def _bool_mapping_or_error(value: Any, field_name: str, errors: list[str]) -> di
 
 def _non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_stream_matcher(value: Any) -> bool:
+    """A stdout/stderr matcher must be a non-empty string or a non-empty list of them."""
+    if _non_empty_string(value):
+        return True
+    if isinstance(value, list):
+        return bool(value) and all(_non_empty_string(item) for item in value)
+    return False
 
 
 def _valid_adapter_reference(value: Any) -> bool:
