@@ -193,6 +193,7 @@ def test_required_manifest_dependencies_affect_routability(tmp_path):
         env=_env(runtime),
         include_builtin=True,
         executable_resolver=lambda _name: None,
+        revision_resolver=lambda _path, _ref: None,
     )
 
     community = registry.get("community")
@@ -202,7 +203,11 @@ def test_required_manifest_dependencies_affect_routability(tmp_path):
     assert community.routable is False
     messages = {check.message for check in community.health.checks}
     assert "missing_required_binary" in messages
-    assert "repo_requirement_missing" in messages or "repo_path_missing" in messages
+    assert (
+        "repo_requirement_missing" in messages
+        or "repo_path_missing" in messages
+        or "repo_revision_unavailable" in messages
+    )
     opencli = next(check for check in community.health.checks if check.message == "missing_required_binary")
     assert opencli.layer == "static"
     assert opencli.failure_category == "dependency_missing"
