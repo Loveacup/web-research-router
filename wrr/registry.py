@@ -69,7 +69,10 @@ def default_registry_v6_shadow(**kwargs):
     env = kwargs.pop("env", None) or load_env(runtime)
 
     v6_registry = V6EngineRegistry(runtime=runtime, env=env, **kwargs)
-    descriptors = v6_registry.resolve()
+    # H2 policy: only bridge descriptors the routability evaluator marks routable
+    # (auto-mode health: cached live or light/static fallback, never live probes),
+    # not raw resolve() output.
+    descriptors = v6_registry.routable()
     compare_kwargs = {}
     if intentional_gaps is not None:
         compare_kwargs["intentional_gaps"] = intentional_gaps

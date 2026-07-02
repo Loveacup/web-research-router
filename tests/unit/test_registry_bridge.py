@@ -65,19 +65,53 @@ def test_bridge_registry_uses_legacy_provider_names(tmp_path):
     assert "qmd" not in registry.names()
 
 
-def test_default_registry_v6_shadow_reports_parity_with_documented_gaps(tmp_path):
+def test_default_registry_v6_shadow_bridges_routable_descriptors(tmp_path):
+    """H2: the shadow bridge consumes ``routable()``, not raw ``resolve()``.
+
+    In an unconfigured standalone env only policy-routable descriptors (those with
+    healthy light/static checks, no missing required env/binaries/repos) are
+    bridged. Legacy providers that need API keys / binaries surface as ``missing``
+    rather than being bridged.
+    """
+
     runtime = _runtime(tmp_path)
+    env = _env(runtime)
+    state_file = tmp_path / "state.json"
 
-    report = default_registry_v6_shadow(runtime=runtime, env=_env(runtime))
+    report = default_registry_v6_shadow(runtime=runtime, env=env, state_file=state_file)
 
+    # Re-derive the expected routable policy output through the legacy bridge
+    # naming rules (e.g. descriptor ``qmd`` -> legacy ``local_qmd``).
+    v6_registry = V6EngineRegistry(
+        runtime=runtime,
+        env=env,
+        include_builtin=True,
+        state_file=state_file,
+    )
+    routable = v6_registry.routable()
+    bridged_registry, bridge_errors = registry_from_descriptors(routable)
+    expected_bridged = set(bridged_registry.names()) - set(DEFAULT_INTENTIONAL_GAPS)
+
+    assert bridge_errors == {}
     assert set(report.v5_provider_ids) == V5_PROVIDER_IDS
-    assert set(report.bridged_provider_ids) == V5_PROVIDER_IDS - set(DEFAULT_INTENTIONAL_GAPS)
-    assert set(report.intentional_gap_ids) == set(DEFAULT_INTENTIONAL_GAPS)
-    assert report.missing_provider_ids == ()
-    assert report.unexpected_provider_ids == ()
+    # Bridged providers equal the routable policy output, not all legacy providers.
+    assert set(report.bridged_provider_ids) == expected_bridged
+    # Routability filtered the set down: it is a strict subset of legacy providers.
+    assert expected_bridged < V5_PROVIDER_IDS - set(DEFAULT_INTENTIONAL_GAPS)
+    # Routable descriptors bridge cleanly; no adapter errors, nothing unexpected.
     assert report.adapter_errors == {}
-    assert report.parity is True
-    assert report.to_dict()["parity"] is True
+    assert report.unexpected_provider_ids == ()
+    # Non-routable legacy providers surface as missing (minus documented gaps).
+    assert set(report.missing_provider_ids) == (
+        V5_PROVIDER_IDS - expected_bridged - set(DEFAULT_INTENTIONAL_GAPS)
+    )
+    assert set(report.intentional_gap_ids) == (
+        (V5_PROVIDER_IDS - expected_bridged) & set(DEFAULT_INTENTIONAL_GAPS)
+    )
+    # Parity now reflects routable-policy filtering rather than full legacy coverage.
+    assert report.missing_provider_ids != ()
+    assert report.parity is False
+    assert report.to_dict()["parity"] is False
 
 
 def test_default_registry_behavior_is_unchanged():

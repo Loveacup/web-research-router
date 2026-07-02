@@ -1,6 +1,7 @@
 """P0-T4 v6 registry resolve and light health tests."""
 
 import json
+import sys
 
 from wrr.engines.loader import parse_engine_manifest
 from wrr.engines.registry import EngineRegistry, check_runtime_capabilities
@@ -251,6 +252,81 @@ def test_path_and_repo_revision_checks_are_light_and_reporting_only(tmp_path):
     assert descriptor.health.checks[1].message == "repo_path_missing"
     assert descriptor.routable is False
     assert "health_unhealthy" in descriptor.routable_reasons
+
+
+def test_routable_filters_light_static_failures_and_ignores_live_layer(tmp_path, monkeypatch):
+    engines_dir = tmp_path / "plugins" / "engines"
+
+    good_dir = engines_dir / "good"
+    good_dir.mkdir(parents=True)
+    (good_dir / "engine.yaml").write_text(
+        json.dumps(
+            _manifest(
+                "good",
+                requires_capabilities={},
+                health={
+                    "checks": [
+                        {"type": "env_present", "env": "OPTIONAL_KEY", "required": False},
+                        # live/recovery layers must be ignored on the auto hot path;
+                        # if they ran they would flip health to unhealthy.
+                        {
+                            "type": "live_probe",
+                            "level": "live",
+                            "required": True,
+                            "command": [sys.executable, "-c", "import sys; sys.exit(1)"],
+                        },
+                        {
+                            "type": "binary_present",
+                            "binary": "definitely-missing-binary",
+                            "required": True,
+                            "level": "recovery",
+                        },
+                    ]
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    bad_dir = engines_dir / "bad"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "engine.yaml").write_text(
+        json.dumps(
+            _manifest(
+                "bad",
+                requires_capabilities={},
+                health={
+                    "checks": [
+                        {"type": "env_present", "env": "REQUIRED_MISSING", "required": True},
+                    ]
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    runtime = _runtime(tmp_path)
+    registry = EngineRegistry(
+        runtime=runtime,
+        env=_env(runtime),
+        plugin_paths=[engines_dir],
+        include_builtin=False,
+        trust_project=True,
+        state_file=tmp_path / "state.json",
+    )
+
+    monkeypatch.setattr(
+        "wrr.engines.registry._live_probe_check",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("live probe must not run on routable hot path")
+        ),
+    )
+
+    resolved_ids = {descriptor.id for descriptor in registry.resolve()}
+    routable_ids = [descriptor.id for descriptor in registry.routable()]
+
+    assert resolved_ids == {"good", "bad"}
+    assert routable_ids == ["good"]
 
 
 def test_manifest_health_layer_and_failure_category_are_reported(tmp_path):

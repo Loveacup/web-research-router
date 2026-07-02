@@ -978,8 +978,31 @@ def _env_name_implies_auth(name: str) -> bool:
     )
 
 
+# Type-based default layer for health checks that omit an explicit ``layer``.
+# ``live_probe`` executes a subprocess, so it must default to the ``live`` layer
+# and never leak into ``light``/``auto`` (hot-path) evaluation.
+_CHECK_TYPE_DEFAULT_LAYER: dict[str, str] = {
+    "live_probe": "live",
+}
+
+
+def _effective_check_layer(check: Mapping[str, Any]) -> str:
+    """Resolve the layer of a check, honoring type-based defaults.
+
+    An explicit ``layer``/``level`` wins when valid; otherwise the check type
+    decides (``live_probe`` -> ``live``), falling back to ``light``. This keeps
+    the hot path from ever scheduling a ``live``/``recovery`` probe just because
+    a manifest author omitted the layer field.
+    """
+
+    raw = check.get("layer") or check.get("level")
+    if raw is not None and str(raw) in PROBE_LAYERS:
+        return str(raw)
+    return _CHECK_TYPE_DEFAULT_LAYER.get(str(check.get("type") or ""), "light")
+
+
 def _check_applies(check: Mapping[str, Any], mode: str) -> bool:
-    layer = str(check.get("layer") or check.get("level") or "light")
+    layer = _effective_check_layer(check)
     if mode == "live":
         return layer in {"static", "light", "live"}
     return layer in {"static", "light"}

@@ -1,6 +1,8 @@
 """Router v6 shadow consumption tests."""
 
 import asyncio
+import json
+import sys
 
 import pytest
 
@@ -128,6 +130,78 @@ def test_without_v6_router_env_flag_keeps_legacy_registry(monkeypatch):
     assert result.fallback_chain[0].ok is True
     assert result.fallback_chain[1].ok is False
     assert result.fallback_chain[1].error == "unknown provider: brave"
+
+
+def _routable_probe_manifest(engine_id, marker):
+    """Manifest that is routable via light/static checks but carries a live probe."""
+
+    return {
+        "schema_version": 1,
+        "id": engine_id,
+        "name": engine_id.title(),
+        "kind": "web_api",
+        # Real importable adapter so the bridge instantiates a SearchEngine.
+        "adapter": "wrr.engines.exa:ExaEngine",
+        "capabilities": {"actions": ["search"], "domains": ["web"]},
+        "routing": {"modes": ["auto", "web"], "weight": 1.0},
+        "requirements": {"env": [], "binaries": [], "repos": []},
+        "health": {
+            "checks": [
+                {"type": "env_present", "env": "OPTIONAL_KEY", "required": False},
+                {
+                    "type": "live_probe",
+                    "level": "live",
+                    "required": True,
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
+                        ),
+                    ],
+                },
+            ]
+        },
+        "requires_capabilities": {},
+    }
+
+
+def test_default_registry_v6_shadow_bridges_only_routable_without_live_probe(tmp_path, monkeypatch):
+    from wrr.runtime.detect import detect_runtime
+    from wrr.runtime.env import load_env
+    from wrr.registry import default_registry_v6_shadow
+
+    marker = tmp_path / "probe.marker"
+    plugin_dir = tmp_path / "plugins" / "engines" / "exa"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "engine.yaml").write_text(
+        json.dumps(_routable_probe_manifest("exa", marker)),
+        encoding="utf-8",
+    )
+
+    runtime = detect_runtime(explicit="standalone", cwd=tmp_path, env={})
+    env = load_env(runtime, overrides={}, env_files=[])
+
+    monkeypatch.setattr(
+        "wrr.engines.registry._live_probe_check",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("shadow bridge must not run live probes")
+        ),
+    )
+
+    report = default_registry_v6_shadow(
+        runtime=runtime,
+        env=env,
+        plugin_paths=[tmp_path / "plugins" / "engines"],
+        include_builtin=False,
+        trust_project=True,
+        state_file=tmp_path / "state.json",
+    )
+
+    # Bridge instantiated the single routable descriptor's adapter, no probe ran.
+    assert report.registry.names() == ["exa"]
+    assert not marker.exists()
 
 
 def test_without_v6_router_env_flag_empty_legacy_registry_stays_empty(monkeypatch):

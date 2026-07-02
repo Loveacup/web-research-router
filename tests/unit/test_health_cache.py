@@ -115,6 +115,53 @@ def test_auto_health_reuses_live_cache_but_does_not_run_live_probe(tmp_path):
     assert not marker.exists()
 
 
+def _explode(*_args, **_kwargs):
+    raise AssertionError("live probe must not run on routable hot path")
+
+
+def test_routable_hot_path_never_runs_live_probe(tmp_path, monkeypatch):
+    plugin_paths, marker = _plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+    registry = _registry(tmp_path, state_file, plugin_paths)
+
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+
+    routable = registry.routable()
+
+    assert [descriptor.id for descriptor in routable] == ["probe"]
+    # health resolved via light/static only -> optional env missing => degraded
+    assert not marker.exists()
+    # auto/light hot path must not persist a live-health cache entry
+    assert load_state(state_file).health_cache == {}
+
+
+def test_routable_ignores_live_probe_without_explicit_layer(tmp_path, monkeypatch):
+    """A live_probe that omits ``layer``/``level`` must still be treated as live."""
+
+    engine_id = "probelayerless"
+    marker = tmp_path / f"{engine_id}.marker"
+    plugin_dir = tmp_path / "plugins" / "engines" / engine_id
+    plugin_dir.mkdir(parents=True)
+    manifest = _manifest(engine_id, str(marker))
+    # Drop the explicit live layer to prove the type-based default guards it.
+    for check in manifest["health"]["checks"]:
+        check.pop("level", None)
+        check.pop("layer", None)
+    (plugin_dir / "engine.yaml").write_text(json.dumps(manifest), encoding="utf-8")
+
+    plugin_paths = tmp_path / "plugins" / "engines"
+    state_file = tmp_path / "state.json"
+    registry = _registry(tmp_path, state_file, plugin_paths)
+
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+
+    routable = registry.routable()
+
+    assert [descriptor.id for descriptor in routable] == [engine_id]
+    assert not marker.exists()
+    assert load_state(state_file).health_cache == {}
+
+
 def test_circuit_breaker_state_survives_registry_instances(tmp_path):
     plugin_paths, _marker = _plugin(tmp_path)
     state_file = tmp_path / "state.json"
