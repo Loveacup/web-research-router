@@ -43,6 +43,10 @@ def test_missing_required_env_is_unhealthy_and_not_routable(tmp_path):
     assert exa.configured is False
     assert "missing_required_env:EXA_API_KEY" in exa.resolve_reasons
     assert exa.health.status == "unhealthy"
+    assert exa.health.reason == "missing_required_env"
+    assert exa.health.failure_category == "auth_missing"
+    assert exa.health.checks[0].layer == "light"
+    assert exa.health.checks[0].failure_category == "auth_missing"
     assert exa.routable is False
     assert "health_unhealthy" in exa.routable_reasons
     assert set(report.to_dict()) == {"discovered", "resolved", "health", "routable"}
@@ -178,6 +182,7 @@ def test_binary_present_light_health_uses_injected_resolver(tmp_path):
     assert qmd.health.status == "healthy"
     assert qmd.routable is True
     assert qmd.health.checks[0].details["path"] == "/usr/local/bin/qmd"
+    assert qmd.health.checks[0].layer == "light"
 
 
 def test_required_manifest_dependencies_affect_routability(tmp_path):
@@ -197,6 +202,9 @@ def test_required_manifest_dependencies_affect_routability(tmp_path):
     messages = {check.message for check in community.health.checks}
     assert "missing_required_binary" in messages
     assert "repo_requirement_missing" in messages or "repo_path_missing" in messages
+    opencli = next(check for check in community.health.checks if check.message == "missing_required_binary")
+    assert opencli.layer == "static"
+    assert opencli.failure_category == "dependency_missing"
 
 
 def test_path_and_repo_revision_checks_are_light_and_reporting_only(tmp_path):
@@ -243,3 +251,42 @@ def test_path_and_repo_revision_checks_are_light_and_reporting_only(tmp_path):
     assert descriptor.health.checks[1].message == "repo_path_missing"
     assert descriptor.routable is False
     assert "health_unhealthy" in descriptor.routable_reasons
+
+
+def test_manifest_health_layer_and_failure_category_are_reported(tmp_path):
+    plugin_dir = tmp_path / "plugins" / "engines" / "live"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "engine.yaml").write_text(
+        json.dumps(
+            _manifest(
+                "live",
+                health={
+                    "checks": [
+                        {
+                            "type": "unknown_check",
+                            "required": True,
+                            "level": "light",
+                            "failure_category": "schema_error",
+                        }
+                    ]
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    runtime = _runtime(tmp_path)
+    registry = EngineRegistry(
+        runtime=runtime,
+        env=_env(runtime),
+        plugin_paths=[tmp_path / "plugins" / "engines"],
+        include_builtin=False,
+        trust_project=True,
+    )
+
+    descriptor = registry.get("live")
+
+    assert descriptor is not None
+    check = descriptor.health.checks[0]
+    assert check.message == "unsupported_health_check"
+    assert check.layer == "light"
+    assert check.failure_category == "schema_error"

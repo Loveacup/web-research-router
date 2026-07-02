@@ -263,7 +263,14 @@ def doctor_v6(
 
 
 def _summarize_v6(report: Any) -> dict[str, Any]:
-    health_counts = {"healthy": 0, "degraded": 0, "unhealthy": 0}
+    health_counts = {
+        "unknown": 0,
+        "healthy": 0,
+        "degraded": 0,
+        "unhealthy": 0,
+        "disabled": 0,
+        "cooldown": 0,
+    }
     for item in report.health:
         health_counts[item.status] = health_counts.get(item.status, 0) + 1
     valid_discoveries = sum(1 for item in report.discovered if item.valid)
@@ -280,9 +287,12 @@ def _summarize_v6(report: Any) -> dict[str, Any]:
         "valid_discoveries": valid_discoveries,
         "resolved": len(report.resolved),
         "configured": configured,
+        "unknown": health_counts.get("unknown", 0),
         "healthy": health_counts.get("healthy", 0),
         "degraded": health_counts.get("degraded", 0),
         "unhealthy": health_counts.get("unhealthy", 0),
+        "disabled": health_counts.get("disabled", 0),
+        "cooldown": health_counts.get("cooldown", 0),
         "routable": len(report.routable),
     }
 

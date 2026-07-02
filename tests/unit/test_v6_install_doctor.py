@@ -43,6 +43,9 @@ def test_doctor_v6_json_shape_contains_control_plane_sections(tmp_path):
     assert {"runtime", "env", "discovered", "resolved", "health", "summary", "trust"} <= set(payload)
     assert payload["runtime"]["name"] == "standalone"
     assert payload["summary"]["discovered"] >= 5
+    assert {"unknown", "healthy", "degraded", "unhealthy", "disabled", "cooldown"} <= set(
+        payload["summary"]
+    )
     assert any(item["id"] == "exa" for item in payload["resolved"])
 
 
@@ -52,6 +55,10 @@ def test_doctor_v6_missing_required_env_is_unhealthy_and_not_routable(tmp_path):
 
     assert exa["configured"] is False
     assert exa["health"]["status"] == "unhealthy"
+    assert exa["health"]["reason"] == "missing_required_env"
+    assert exa["health"]["failure_category"] == "auth_missing"
+    assert exa["health"]["checks"][0]["layer"] == "light"
+    assert exa["health"]["checks"][0]["failure_category"] == "auth_missing"
     assert exa["routable"] is False
     assert "EXA_API_KEY" not in payload["env"]["values"]
 

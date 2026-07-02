@@ -20,6 +20,19 @@ BUILTIN_DIR = Path(__file__).resolve().parent / "builtin"
 TRUST_BUILTIN = "builtin"
 TRUST_PROJECT = "project"
 TRUST_USER = "user"
+HEALTH_FAILURE_CATEGORIES = frozenset(
+    {
+        "dependency_missing",
+        "auth_missing",
+        "auth_error",
+        "daemon_disconnected",
+        "timeout",
+        "rate_limit",
+        "schema_error",
+        "empty_result",
+    }
+)
+HEALTH_PROBE_LAYERS = frozenset({"static", "light", "live", "recovery"})
 
 
 @dataclass(frozen=True)
@@ -305,6 +318,8 @@ def parse_engine_manifest(payload: Mapping[str, Any]) -> tuple[EnginePluginManif
     checks = health.get("checks") if health is not None else None
     if checks is not None and not isinstance(checks, list):
         errors.append("invalid:health.checks")
+    if health is not None:
+        _validate_health_schema(health, errors)
 
     repo_requirements = _repo_requirements_or_error(requirements or {}, errors)
 
@@ -333,6 +348,31 @@ def parse_engine_manifest(payload: Mapping[str, Any]) -> tuple[EnginePluginManif
         ),
         [],
     )
+
+
+def _validate_health_schema(health: Mapping[str, Any], errors: list[str]) -> None:
+    checks = health.get("checks")
+    if isinstance(checks, list):
+        for index, check in enumerate(checks):
+            if not isinstance(check, Mapping):
+                errors.append(f"invalid:health.checks[{index}]")
+                continue
+            layer = check.get("layer", check.get("level"))
+            if layer is not None and str(layer) not in HEALTH_PROBE_LAYERS:
+                errors.append(f"invalid:health.checks[{index}].layer")
+            category = check.get("failure_category")
+            if category is not None and str(category) not in HEALTH_FAILURE_CATEGORIES:
+                errors.append(f"invalid:health.checks[{index}].failure_category")
+
+    probes = health.get("probes")
+    if probes is not None and not isinstance(probes, (list, Mapping)):
+        errors.append("invalid:health.probes")
+    recovery = health.get("recovery")
+    if recovery is not None and not isinstance(recovery, (list, Mapping)):
+        errors.append("invalid:health.recovery")
+    breaker = health.get("breaker")
+    if breaker is not None and not isinstance(breaker, Mapping):
+        errors.append("invalid:health.breaker")
 
 
 def default_fusion_config() -> dict[str, Any]:

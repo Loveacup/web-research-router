@@ -124,6 +124,57 @@ def test_manifest_parser_rejects_bad_domains_and_bad_trigger_match():
     assert "invalid:routing.triggers[0].match.regex" in errors
 
 
+def test_manifest_parser_accepts_health_layer_failure_category_and_future_sections():
+    payload = _manifest("health_schema").to_dict()
+    payload["health"] = {
+        "checks": [
+            {
+                "type": "env_present",
+                "env": "EXAMPLE_API_KEY",
+                "required": True,
+                "layer": "static",
+                "failure_category": "auth_missing",
+            },
+            {
+                "type": "live_probe",
+                "command": ["true"],
+                "level": "live",
+                "failure_category": "timeout",
+            },
+        ],
+        "probes": {"live": []},
+        "recovery": [],
+        "breaker": {"failure_threshold": 3},
+    }
+
+    manifest, errors = parse_engine_manifest(payload)
+
+    assert errors == []
+    assert manifest is not None
+    assert manifest.health["checks"][0]["layer"] == "static"
+    assert manifest.health["checks"][1]["level"] == "live"
+
+
+def test_manifest_parser_rejects_invalid_health_layer_and_failure_category():
+    payload = _manifest("bad_health_schema").to_dict()
+    payload["health"] = {
+        "checks": [
+            {
+                "type": "env_present",
+                "env": "EXAMPLE_API_KEY",
+                "layer": "deep",
+                "failure_category": "missing_everything",
+            }
+        ]
+    }
+
+    manifest, errors = parse_engine_manifest(payload)
+
+    assert manifest is None
+    assert "invalid:health.checks[0].layer" in errors
+    assert "invalid:health.checks[0].failure_category" in errors
+
+
 def test_merge_routing_config_documents_p1_merge_rules():
     manifest = _manifest("merge")
 

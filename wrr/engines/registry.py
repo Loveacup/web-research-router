@@ -38,6 +38,22 @@ HealthMode = str
 Resolver = Callable[[str], Optional[str]]
 RevisionResolver = Callable[..., Optional[str]]
 
+HEALTH_STATUSES = frozenset(
+    {"unknown", "healthy", "degraded", "unhealthy", "disabled", "cooldown"}
+)
+FAILURE_CATEGORIES = frozenset(
+    {
+        "dependency_missing",
+        "auth_missing",
+        "auth_error",
+        "daemon_disconnected",
+        "timeout",
+        "rate_limit",
+        "schema_error",
+        "empty_result",
+    }
+)
+PROBE_LAYERS = frozenset({"static", "light", "live", "recovery"})
 TRUSTED_ADAPTER_LEVELS = {"builtin", "user", "entry_point"}
 
 
@@ -63,13 +79,17 @@ class HealthCheckResult:
     message: str
     target: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    layer: str | None = None
+    failure_category: str | None = None
+    cached: bool | None = None
+    remediation: str | None = None
 
     @property
     def ok(self) -> bool:
         return self.status in {"healthy", "degraded"}
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "type": self.type,
             "status": self.status,
             "required": self.required,
@@ -77,6 +97,15 @@ class HealthCheckResult:
             "target": self.target,
             "details": dict(self.details),
         }
+        if self.layer is not None:
+            payload["layer"] = self.layer
+        if self.failure_category is not None:
+            payload["failure_category"] = self.failure_category
+        if self.cached is not None:
+            payload["cached"] = self.cached
+        if self.remediation is not None:
+            payload["remediation"] = self.remediation
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "HealthCheckResult":
@@ -87,6 +116,18 @@ class HealthCheckResult:
             message=str(payload.get("message") or ""),
             target=str(payload["target"]) if payload.get("target") is not None else None,
             details=dict(payload.get("details") or {}),
+            layer=str(payload["layer"]) if payload.get("layer") is not None else None,
+            failure_category=(
+                str(payload["failure_category"])
+                if payload.get("failure_category") is not None
+                else None
+            ),
+            cached=bool(payload["cached"]) if payload.get("cached") is not None else None,
+            remediation=(
+                str(payload["remediation"])
+                if payload.get("remediation") is not None
+                else None
+            ),
         )
 
 
@@ -95,13 +136,23 @@ class EngineHealth:
     engine_id: str
     status: HealthStatus
     checks: tuple[HealthCheckResult, ...] = ()
+    reason: str | None = None
+    failure_category: str | None = None
+    breaker: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "engine_id": self.engine_id,
             "status": self.status,
             "checks": [check.to_dict() for check in self.checks],
         }
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.failure_category is not None:
+            payload["failure_category"] = self.failure_category
+        if self.breaker is not None:
+            payload["breaker"] = dict(self.breaker)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EngineHealth":
@@ -114,6 +165,13 @@ class EngineHealth:
                 for check in raw_checks
                 if isinstance(check, Mapping)
             ),
+            reason=str(payload["reason"]) if payload.get("reason") is not None else None,
+            failure_category=(
+                str(payload["failure_category"])
+                if payload.get("failure_category") is not None
+                else None
+            ),
+            breaker=dict(payload["breaker"]) if isinstance(payload.get("breaker"), Mapping) else None,
         )
 
 
@@ -363,6 +421,7 @@ class EngineRegistry:
     def _health_descriptor(self, descriptor: EngineDescriptor, *, mode: HealthMode) -> EngineHealth:
         breaker = circuit_status(descriptor.id, path=self.state_file)
         if breaker.open:
+            breaker_payload = breaker.to_dict()
             return EngineHealth(
                 descriptor.id,
                 "unhealthy",
@@ -372,9 +431,14 @@ class EngineRegistry:
                         status="unhealthy",
                         required=True,
                         message="circuit_open",
-                        details=breaker.to_dict(),
+                        details=breaker_payload,
+                        layer="light",
+                        failure_category="daemon_disconnected",
                     ),
                 ),
+                reason="circuit_open",
+                failure_category="daemon_disconnected",
+                breaker=breaker_payload,
             )
 
         health_mode = _normalize_health_mode(mode)
@@ -399,7 +463,7 @@ class EngineRegistry:
         checks = tuple(
             [*manifest_checks, *self._requirement_health_checks(descriptor.manifest)]
         )
-        health = EngineHealth(descriptor.id, _combine_health(checks), checks)
+        health = _engine_health(descriptor.id, checks)
         if health_mode == "live":
             set_cached_health(
                 descriptor.id,
@@ -415,6 +479,7 @@ class EngineRegistry:
         manifest: EnginePluginManifest,
         check: Mapping[str, Any],
     ) -> HealthCheckResult:
+        check = {**check, "_default_layer": "light"}
         check_type = str(check.get("type", "unknown"))
         required = bool(check.get("required", True))
         if check_type == "env_present":
@@ -437,6 +502,8 @@ class EngineRegistry:
             status="degraded" if not required else "unhealthy",
             required=required,
             message="unsupported_health_check",
+            layer=_check_layer(check),
+            failure_category="schema_error",
         )
 
     def _requirement_health_checks(
@@ -507,6 +574,8 @@ class EngineRegistry:
                         required=True,
                         target=container,
                         message="docker_check_not_configured",
+                        layer="static",
+                        failure_category="dependency_missing",
                     )
                 )
         return tuple(checks)
@@ -551,6 +620,7 @@ def _hermes_tool_present_check(
             required=required,
             target=tool,
             message="hermes_tool_present",
+            layer=_check_layer(item, default="static"),
         )
     return HealthCheckResult(
         type="hermes_tool_present",
@@ -559,6 +629,8 @@ def _hermes_tool_present_check(
         target=tool,
         message="missing_required_hermes_tool" if required else "missing_optional_hermes_tool",
         details={"runtime": runtime.name},
+        layer=_check_layer(item, default="static"),
+        failure_category="dependency_missing",
     )
 
 
@@ -573,6 +645,7 @@ def _python_package_present_check(item: Mapping[str, Any]) -> HealthCheckResult:
             required=required,
             target=package,
             message="python_package_present",
+            layer=_check_layer(item, default="static"),
         )
     return HealthCheckResult(
         type="python_package_present",
@@ -580,6 +653,8 @@ def _python_package_present_check(item: Mapping[str, Any]) -> HealthCheckResult:
         required=required,
         target=package,
         message="missing_required_python_package" if required else "missing_optional_python_package",
+        layer=_check_layer(item, default="static"),
+        failure_category="dependency_missing",
     )
 
 
@@ -624,6 +699,7 @@ def _env_present_check(
             required=required,
             target=present,
             message="env_present",
+            layer=_check_layer(check, default="static"),
         )
     return HealthCheckResult(
         type="env_present",
@@ -632,6 +708,8 @@ def _env_present_check(
         target=names[0] if names else None,
         message="missing_required_env" if required else "missing_optional_env",
         details={"aliases": names[1:]},
+        layer=_check_layer(check, default="static"),
+        failure_category=_env_failure_category(check, names),
     )
 
 
@@ -650,6 +728,7 @@ def _binary_present_check(
             target=binary,
             message="binary_present",
             details={"path": resolved},
+            layer=_check_layer(check, default="static"),
         )
     return HealthCheckResult(
         type="binary_present",
@@ -657,6 +736,8 @@ def _binary_present_check(
         required=required,
         target=binary or None,
         message="missing_required_binary" if required else "missing_optional_binary",
+        layer=_check_layer(check, default="static"),
+        failure_category="dependency_missing",
     )
 
 
@@ -671,6 +752,7 @@ def _path_present_check(check: Mapping[str, Any], required: bool) -> HealthCheck
             required=required,
             target=str(path),
             message="path_present",
+            layer=_check_layer(check, default="static"),
         )
     return HealthCheckResult(
         type="path_present",
@@ -678,6 +760,8 @@ def _path_present_check(check: Mapping[str, Any], required: bool) -> HealthCheck
         required=required,
         target=str(path) if path else None,
         message="missing_required_path" if required else "missing_optional_path",
+        layer=_check_layer(check, default="static"),
+        failure_category="dependency_missing",
     )
 
 
@@ -701,6 +785,8 @@ def _repo_revision_check(
             required=check_required,
             target=None,
             message="repo_requirement_missing",
+            layer=_check_layer(check, default="static"),
+            failure_category="dependency_missing",
         )
 
     pin_status = verify_repo_pin(path, expected_pin, revision_resolver=revision_resolver)
@@ -712,6 +798,8 @@ def _repo_revision_check(
             target=str(path),
             message=pin_status.message,
             details=_repo_details(requirement, pin_status),
+            layer=_check_layer(check, default="static"),
+            failure_category="dependency_missing",
         )
 
     if pin_status.status == "mismatch":
@@ -722,6 +810,8 @@ def _repo_revision_check(
             target=str(path),
             message="repo_pin_mismatch",
             details=_repo_details(requirement, pin_status),
+            layer=_check_layer(check, default="static"),
+            failure_category="schema_error",
         )
 
     return HealthCheckResult(
@@ -731,6 +821,7 @@ def _repo_revision_check(
         target=str(path),
         message="repo_revision",
         details=_repo_details(requirement, pin_status),
+        layer=_check_layer(check, default="static"),
     )
 
 
@@ -788,6 +879,8 @@ def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckRe
             status="unhealthy" if required else "degraded",
             required=required,
             message="invalid_live_probe",
+            layer=_check_layer(check, default="live"),
+            failure_category="schema_error",
         )
     try:
         completed = subprocess.run(
@@ -805,6 +898,12 @@ def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckRe
             required=required,
             message="live_probe_failed",
             details={"error": type(exc).__name__},
+            layer=_check_layer(check, default="live"),
+            failure_category=(
+                "timeout"
+                if isinstance(exc, subprocess.TimeoutExpired)
+                else _manifest_failure_category(check, "daemon_disconnected")
+            ),
         )
     if completed.returncode == 0:
         return HealthCheckResult(
@@ -812,6 +911,7 @@ def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckRe
             status="healthy",
             required=required,
             message="live_probe_ok",
+            layer=_check_layer(check, default="live"),
         )
     return HealthCheckResult(
         type="live_probe",
@@ -819,6 +919,8 @@ def _live_probe_check(check: Mapping[str, Any], required: bool) -> HealthCheckRe
         required=required,
         message="live_probe_failed",
         details={"returncode": completed.returncode},
+        layer=_check_layer(check, default="live"),
+        failure_category=_manifest_failure_category(check, "daemon_disconnected"),
     )
 
 
@@ -830,17 +932,57 @@ def _combine_health(checks: tuple[HealthCheckResult, ...]) -> HealthStatus:
     return "healthy"
 
 
+def _engine_health(engine_id: str, checks: tuple[HealthCheckResult, ...]) -> EngineHealth:
+    status = _combine_health(checks)
+    failing = next((check for check in checks if check.status != "healthy"), None)
+    return EngineHealth(
+        engine_id,
+        status,
+        checks,
+        reason=failing.message if failing is not None else "all_checks_healthy",
+        failure_category=failing.failure_category if failing is not None else None,
+    )
+
+
 def _normalize_health_mode(mode: HealthMode) -> str:
     if mode in {"light", "live", "auto"}:
         return mode
     return "light"
 
 
+def _check_layer(check: Mapping[str, Any], default: str = "light") -> str:
+    raw = check.get("layer") or check.get("level") or check.get("_default_layer") or default
+    layer = str(raw)
+    return layer if layer in PROBE_LAYERS else default
+
+
+def _manifest_failure_category(check: Mapping[str, Any], default: str) -> str:
+    value = check.get("failure_category")
+    if value is not None and str(value) in FAILURE_CATEGORIES:
+        return str(value)
+    return default
+
+
+def _env_failure_category(check: Mapping[str, Any], names: list[str]) -> str:
+    category = check.get("failure_category")
+    if category is not None and str(category) in FAILURE_CATEGORIES:
+        return str(category)
+    return "auth_missing" if any(_env_name_implies_auth(name) for name in names) else "dependency_missing"
+
+
+def _env_name_implies_auth(name: str) -> bool:
+    upper = name.upper()
+    return any(
+        marker in upper
+        for marker in ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASS", "CREDENTIAL", "AUTH")
+    )
+
+
 def _check_applies(check: Mapping[str, Any], mode: str) -> bool:
-    level = str(check.get("level") or "light")
+    layer = str(check.get("layer") or check.get("level") or "light")
     if mode == "live":
-        return level in {"light", "live"}
-    return level == "light"
+        return layer in {"static", "light", "live"}
+    return layer in {"static", "light"}
 
 
 def _routability(
