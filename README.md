@@ -98,6 +98,34 @@ announced.
 ./wrr-cli.py update --dry-run --json
 ```
 
+### v6.1 Engine Health Policy
+
+v6.1 splits engine health checks into two tiers so the search hot path stays fast
+and side-effect free:
+
+- **Light health (default).** `doctor --v6`, `routable()`, `auto` routing, and
+  every `search` call read only static / light / cached-live health. They never
+  run a live network probe and never restart a daemon. If a cached live result is
+  absent, the engine is treated by policy, not re-probed on the hot path.
+- **Deep health (`--deep`).** `doctor --v6 --deep` opts into live probes. When a
+  manifest declares `health.recovery`, deep doctor may perform a **bounded**
+  recovery (status → restart once → status). A failed recovery opens the circuit /
+  cooldown; there is no unbounded restart loop. Recovery is *not* general
+  auto-healing — it happens only under `--deep` / an explicit `live_recovery` mode.
+
+**OpenCLI disconnected remediation.** A community OpenCLI engine reporting
+`rc=0 + Extension: disconnected` maps to `daemon_disconnected` and is **not**
+routable — search will not try to repair it. To recover, connect the Chrome /
+OpenCLI extension, then re-run deep doctor to re-probe and (if configured) restart:
+
+```bash
+# Light health snapshot — no live probes, safe on the hot path
+./wrr-cli.py doctor --v6 --json --runtime standalone
+
+# Deep health — live probes + bounded recovery for engines that declare it
+./wrr-cli.py doctor --v6 --deep --json --runtime standalone
+```
+
 ## Dependencies (13 total)
 
 Run `wrr-cli.py doctor` for self-check.
