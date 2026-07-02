@@ -24,10 +24,12 @@ from wrr.engines.loader import (
 from wrr.runtime.detect import RuntimeInfo
 from wrr.runtime.env import EnvSnapshot
 from wrr.runtime.state import (
+    DEFAULT_BREAKER_COOLDOWN_SEC,
     DEFAULT_HEALTH_TTL_SEC,
     circuit_status,
     get_cached_health,
     record_engine_failure,
+    reset_circuit,
     set_cached_health,
     state_path,
 )
@@ -455,15 +457,12 @@ class EngineRegistry:
         if health_mode == "auto":
             health_mode = "light"
 
-        manifest_checks = [
-            self._run_check(descriptor.manifest, check)
-            for check in descriptor.manifest.health.get("checks", [])
-            if isinstance(check, Mapping) and _check_applies(check, health_mode)
-        ]
-        checks = tuple(
-            [*manifest_checks, *self._requirement_health_checks(descriptor.manifest)]
-        )
-        health = _engine_health(descriptor.id, checks)
+        # Deep-only recovery: run live checks, and only on a manifest-declared
+        # ``daemon_disconnected`` failure attempt one bounded recovery command.
+        if health_mode == "live_recovery":
+            return self._health_with_recovery(descriptor)
+
+        health = self._manifest_health(descriptor, health_mode)
         if health_mode == "live":
             set_cached_health(
                 descriptor.id,
@@ -473,6 +472,162 @@ class EngineRegistry:
                 path=self.state_file,
             )
         return health
+
+    def _manifest_health(
+        self,
+        descriptor: EngineDescriptor,
+        probe_mode: str,
+    ) -> EngineHealth:
+        """Run the manifest health checks that apply to ``probe_mode``.
+
+        ``probe_mode`` is one of ``static``/``light``/``live`` and gates which
+        check layers execute via :func:`_check_applies`. This never touches the
+        cache or the circuit breaker; callers own persistence.
+        """
+
+        manifest_checks = [
+            self._run_check(descriptor.manifest, check)
+            for check in descriptor.manifest.health.get("checks", [])
+            if isinstance(check, Mapping) and _check_applies(check, probe_mode)
+        ]
+        checks = tuple(
+            [*manifest_checks, *self._requirement_health_checks(descriptor.manifest)]
+        )
+        return _engine_health(descriptor.id, checks)
+
+    def _health_with_recovery(self, descriptor: EngineDescriptor) -> EngineHealth:
+        """Deep-only ``live_recovery`` path for a single descriptor.
+
+        Runs the live checks once. If the result is not a manifest-declared
+        ``daemon_disconnected`` failure, it behaves exactly like live mode and
+        caches the result. On ``daemon_disconnected`` with a bounded recovery
+        config it runs the recovery command at most once and probes live again.
+        """
+
+        initial = self._manifest_health(descriptor, "live")
+        config = _recovery_config(descriptor.manifest)
+        if not _is_daemon_disconnected(initial) or config is None:
+            set_cached_health(
+                descriptor.id,
+                "live",
+                initial.to_dict(),
+                self.health_ttl_sec,
+                path=self.state_file,
+            )
+            return initial
+
+        recovery_check = self._run_recovery_command(config)
+        if not recovery_check.ok:
+            return self._record_recovery_failure(
+                descriptor,
+                config,
+                initial,
+                recovery_check,
+                reason="recovery_command_failed",
+            )
+
+        # Recovery command succeeded: probe live exactly once more.
+        second = self._manifest_health(descriptor, "live")
+        if _is_daemon_disconnected(second) or second.status == "unhealthy":
+            return self._record_recovery_failure(
+                descriptor,
+                config,
+                second,
+                recovery_check,
+                reason="daemon_disconnected_after_recovery",
+            )
+
+        reset_circuit(descriptor.id, path=self.state_file)
+        final = _append_check(second, recovery_check)
+        set_cached_health(
+            descriptor.id,
+            "live",
+            final.to_dict(),
+            self.health_ttl_sec,
+            path=self.state_file,
+        )
+        return final
+
+    def _run_recovery_command(self, config: Mapping[str, Any]) -> HealthCheckResult:
+        command = config.get("command")
+        if not isinstance(command, list) or not command:
+            return HealthCheckResult(
+                type="recovery",
+                status="unhealthy",
+                required=True,
+                message="invalid_recovery_command",
+                layer="recovery",
+                failure_category="daemon_disconnected",
+            )
+        argv = [str(part) for part in command]
+        try:
+            completed = subprocess.run(
+                argv,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=float(config.get("timeout_sec") or 5),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return HealthCheckResult(
+                type="recovery",
+                status="unhealthy",
+                required=True,
+                message="recovery_command_failed",
+                details={"error": type(exc).__name__, "command": argv},
+                layer="recovery",
+                failure_category=(
+                    "timeout"
+                    if isinstance(exc, subprocess.TimeoutExpired)
+                    else "daemon_disconnected"
+                ),
+            )
+        if completed.returncode == 0:
+            return HealthCheckResult(
+                type="recovery",
+                status="healthy",
+                required=True,
+                message="recovery_command_ok",
+                details={"command": argv},
+                layer="recovery",
+            )
+        return HealthCheckResult(
+            type="recovery",
+            status="unhealthy",
+            required=True,
+            message="recovery_command_failed",
+            details={"returncode": completed.returncode, "command": argv},
+            layer="recovery",
+            failure_category="daemon_disconnected",
+        )
+
+    def _record_recovery_failure(
+        self,
+        descriptor: EngineDescriptor,
+        config: Mapping[str, Any],
+        live_health: EngineHealth,
+        recovery_check: HealthCheckResult,
+        *,
+        reason: str,
+    ) -> EngineHealth:
+        cooldown = config.get("cooldown_sec")
+        breaker = record_engine_failure(
+            descriptor.id,
+            "daemon_disconnected",
+            path=self.state_file,
+            failure_threshold=1,
+            cooldown_sec=float(cooldown) if cooldown is not None else DEFAULT_BREAKER_COOLDOWN_SEC,
+        )
+        checks = tuple([*live_health.checks, recovery_check])
+        return EngineHealth(
+            descriptor.id,
+            "unhealthy",
+            checks,
+            reason=reason,
+            failure_category="daemon_disconnected",
+            breaker=breaker.to_dict(),
+        )
 
     def _run_check(
         self,
@@ -989,9 +1144,59 @@ def _engine_health(engine_id: str, checks: tuple[HealthCheckResult, ...]) -> Eng
 
 
 def _normalize_health_mode(mode: HealthMode) -> str:
-    if mode in {"light", "live", "auto"}:
+    if mode in {"light", "live", "auto", "live_recovery"}:
         return mode
     return "light"
+
+
+def _is_daemon_disconnected(health: EngineHealth) -> bool:
+    """True when ``health`` failed with a manifest ``daemon_disconnected`` check."""
+    if health.status != "unhealthy":
+        return False
+    return any(
+        (not check.ok) and check.failure_category == "daemon_disconnected"
+        for check in health.checks
+    )
+
+
+def _recovery_config(manifest: EnginePluginManifest) -> dict[str, Any] | None:
+    """Return the bounded ``daemon_disconnected`` command recovery config, if any.
+
+    Only a manifest-declared ``type: command`` entry scoped to the
+    ``daemon_disconnected`` failure category is honored. Accepts either a single
+    mapping or a list of mappings under ``health.recovery``.
+    """
+    recovery = manifest.health.get("recovery")
+    if isinstance(recovery, Mapping):
+        candidates: list[Mapping[str, Any]] = [recovery]
+    elif isinstance(recovery, list):
+        candidates = [item for item in recovery if isinstance(item, Mapping)]
+    else:
+        return None
+    for cfg in candidates:
+        if str(cfg.get("type") or "command") != "command":
+            continue
+        when = cfg.get("when_failure_category")
+        if when is not None and str(when) != "daemon_disconnected":
+            continue
+        command = cfg.get("command")
+        if not isinstance(command, list) or not command:
+            continue
+        return dict(cfg)
+    return None
+
+
+def _append_check(health: EngineHealth, extra: HealthCheckResult) -> EngineHealth:
+    """Return ``health`` with ``extra`` appended and status recombined."""
+    checks = tuple([*health.checks, extra])
+    return EngineHealth(
+        health.engine_id,
+        _combine_health(checks),
+        checks,
+        reason=health.reason,
+        failure_category=health.failure_category,
+        breaker=health.breaker,
+    )
 
 
 def _check_layer(check: Mapping[str, Any], default: str = "light") -> str:

@@ -299,6 +299,211 @@ def test_circuit_breaker_state_survives_registry_instances(tmp_path):
     assert descriptor.routable is False
 
 
+def _recovery_manifest(engine_id: str):
+    manifest = _matcher_manifest(engine_id)
+    manifest["health"]["recovery"] = {
+        "when_failure_category": "daemon_disconnected",
+        "type": "command",
+        "command": ["opencli", "daemon", "restart"],
+        "timeout_sec": 5,
+        "max_attempts": 1,
+        "cooldown_sec": 60,
+    }
+    return manifest
+
+
+def _recovery_plugin(tmp_path, engine_id="community"):
+    plugin_dir = tmp_path / "plugins" / "engines" / engine_id
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "engine.yaml").write_text(
+        json.dumps(_recovery_manifest(engine_id)), encoding="utf-8"
+    )
+    return tmp_path / "plugins" / "engines"
+
+
+class _SequencedSubprocess:
+    """Return queued fake completions and record each argv the registry runs."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, *args, **kwargs):
+        self.calls.append(list(argv))
+        if not self._responses:
+            raise AssertionError(f"unexpected extra subprocess call: {argv}")
+        returncode, stdout = self._responses.pop(0)
+        return _FakeCompleted(returncode, stdout)
+
+
+_STATUS = ["opencli", "daemon", "status"]
+_RESTART = ["opencli", "daemon", "restart"]
+
+
+def test_doctor_v6_deep_recovers_opencli_disconnected_once_and_caches_healthy(
+    tmp_path, monkeypatch
+):
+    plugin_paths = _recovery_plugin(tmp_path, engine_id="recoverable")
+    state_file = tmp_path / "doctor-state.json"
+
+    fake = _SequencedSubprocess(
+        [
+            (0, _DAEMON_DISCONNECTED),  # status: disconnected
+            (0, ""),                    # restart: ok
+            (0, _DAEMON_CONNECTED),     # status: connected
+        ]
+    )
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", fake)
+
+    health = _registry(tmp_path, state_file, plugin_paths).health(mode="live_recovery")[0]
+
+    assert fake.calls == [_STATUS, _RESTART, _STATUS]
+    assert health.status != "unhealthy"
+
+    cached = load_state(state_file).health_cache.get("recoverable:live")
+    assert cached is not None
+    assert cached["health"]["status"] != "unhealthy"
+
+
+def test_deep_recovery_failure_opens_circuit_and_auto_is_not_routable_without_probe(
+    tmp_path, monkeypatch
+):
+    plugin_paths = _recovery_plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    fake = _SequencedSubprocess(
+        [
+            (0, _DAEMON_DISCONNECTED),  # status: disconnected
+            (1, ""),                    # restart: fails
+        ]
+    )
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", fake)
+
+    health = _registry(tmp_path, state_file, plugin_paths).health(
+        mode="live_recovery"
+    )[0]
+
+    assert fake.calls == [_STATUS, _RESTART]
+    assert health.status == "unhealthy"
+    assert health.failure_category == "daemon_disconnected"
+
+    breaker = load_state(state_file).circuit_breakers["community"]
+    assert breaker["state"] == "open"
+    assert breaker["last_failure_reason"] == "daemon_disconnected"
+
+    # Hot path must reuse the open circuit and never probe/restart.
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("subprocess must not run on routable hot path")
+        ),
+    )
+    routable = _registry(tmp_path, state_file, plugin_paths).routable()
+    assert [descriptor.id for descriptor in routable] == []
+
+
+def test_deep_recovery_still_disconnected_restarts_at_most_once(tmp_path, monkeypatch):
+    plugin_paths = _recovery_plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    fake = _SequencedSubprocess(
+        [
+            (0, _DAEMON_DISCONNECTED),  # status: disconnected
+            (0, ""),                    # restart: ok
+            (0, _DAEMON_DISCONNECTED),  # status: still disconnected
+        ]
+    )
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", fake)
+
+    health = _registry(tmp_path, state_file, plugin_paths).health(
+        mode="live_recovery"
+    )[0]
+
+    assert fake.calls == [_STATUS, _RESTART, _STATUS]
+    assert fake.calls.count(_RESTART) == 1
+    assert health.status == "unhealthy"
+
+    breaker = load_state(state_file).circuit_breakers["community"]
+    assert breaker["state"] == "open"
+
+
+def test_live_recovery_bypasses_stale_unhealthy_cache_but_auto_reuses(
+    tmp_path, monkeypatch
+):
+    plugin_paths = _recovery_plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    # Seed a stale unhealthy live cache for the disconnected daemon.
+    seed = _SequencedSubprocess([(0, _DAEMON_DISCONNECTED)])
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", seed)
+    stale = _registry(tmp_path, state_file, plugin_paths).health(mode="live")[0]
+    assert stale.status == "unhealthy"
+    assert load_state(state_file).health_cache.get("community:live") is not None
+
+    # Deep recovery must ignore the cache and run status/restart/status.
+    fake = _SequencedSubprocess(
+        [
+            (0, _DAEMON_DISCONNECTED),
+            (0, ""),
+            (0, _DAEMON_CONNECTED),
+        ]
+    )
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", fake)
+    recovered = _registry(tmp_path, state_file, plugin_paths).health(
+        mode="live_recovery"
+    )[0]
+    assert fake.calls == [_STATUS, _RESTART, _STATUS]
+    assert recovered.status != "unhealthy"
+
+    # auto must reuse the refreshed cache without probing.
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("subprocess must not run on auto hot path")
+        ),
+    )
+    auto = _registry(tmp_path, state_file, plugin_paths).health(mode="auto")[0]
+    assert auto.status != "unhealthy"
+
+
+def test_live_mode_does_not_run_recovery(tmp_path, monkeypatch):
+    plugin_paths = _recovery_plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    fake = _SequencedSubprocess([(0, _DAEMON_DISCONNECTED)])
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", fake)
+
+    health = _registry(tmp_path, state_file, plugin_paths).health(mode="live")[0]
+
+    assert fake.calls == [_STATUS]
+    assert _RESTART not in fake.calls
+    assert health.status == "unhealthy"
+    cached = load_state(state_file).health_cache.get("community:live")
+    assert cached is not None
+    assert cached["health"]["status"] == "unhealthy"
+
+
+def test_auto_and_routable_never_run_recovery_or_live_probe(tmp_path, monkeypatch):
+    plugin_paths = _recovery_plugin(tmp_path)
+    state_file = tmp_path / "state.json"
+    registry = _registry(tmp_path, state_file, plugin_paths)
+
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+    monkeypatch.setattr(
+        "wrr.engines.registry.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("recovery/live probe must not run on hot path")
+        ),
+    )
+
+    registry.report(health_mode="auto")
+    registry.routable()
+
+    assert load_state(state_file).health_cache == {}
+
+
 def test_doctor_v6_deep_runs_live_health(tmp_path, monkeypatch):
     plugin_paths, marker = _plugin(tmp_path)
     monkeypatch.setenv("WRR_STATE_PATH", str(tmp_path / "doctor-state.json"))

@@ -138,9 +138,17 @@
         "stdout_contains": ["Extension: connected"],
         "stdout_not_contains": ["Extension: disconnected"],
         "failure_category": "daemon_disconnected",
-        "remediation": "Open Chrome with the OpenCLI extension connected, then run `wrr doctor --deep` to refresh live health. Restart/recovery is deferred to H4."
+        "remediation": "Open Chrome with the OpenCLI extension connected, then run `wrr doctor --deep` to refresh live health. Deep doctor attempts one bounded `opencli daemon restart` before failing."
       }
-    ]
+    ],
+    "recovery": {
+      "when_failure_category": "daemon_disconnected",
+      "type": "command",
+      "command": ["opencli", "daemon", "restart"],
+      "timeout_sec": 5,
+      "max_attempts": 1,
+      "cooldown_sec": 60
+    }
   },
   "requires_capabilities": {}
 }

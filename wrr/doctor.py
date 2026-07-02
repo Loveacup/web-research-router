@@ -245,7 +245,7 @@ def doctor_v6(
         include_builtin=True,
         trust_project=trust_project,
     )
-    report = registry.report(health_mode="live" if deep else "light")
+    report = registry.report(health_mode="live_recovery" if deep else "light")
     findings = _trust_findings(env_snapshot, report.resolved, trust_project=trust_project)
     summary = _summarize_v6(report)
     summary["findings"] = len(findings)
