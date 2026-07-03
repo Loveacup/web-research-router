@@ -40,6 +40,8 @@ _L30_EN = os.environ.get("WRR_LAST30DAYS_EN") or os.path.expanduser(
     "~/code/last30days-skill/skills/last30days/scripts/last30days.py")
 _L30_CN = os.environ.get("WRR_LAST30DAYS_CN") or os.path.expanduser(
     "~/code/last30days-skill-cn/skills/last30days/scripts/last30days.py")
+_L30_EN_PYTHON = os.environ.get("WRR_LAST30DAYS_EN_PYTHON") or shutil.which("python3.12") or "python3"
+_L30_CN_PYTHON = os.environ.get("WRR_LAST30DAYS_CN_PYTHON") or "python3"
 
 # 源定义（字段名对齐各 CLI 实测 Output columns）。
 COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
@@ -64,11 +66,11 @@ COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
         "title": "title", "url": "url", "snippet": "content", "eng_max": 1000,
     },
     "last30days_en": {
-        "kind": "last30days", "cli": ["python3", _L30_EN],
+        "kind": "last30days", "cli": [_L30_EN_PYTHON, _L30_EN],
         "engagement": "score", "comments": None, "time": None, "eng_max": 100,
     },
     "last30days_cn": {
-        "kind": "last30days", "cli": ["python3", _L30_CN],
+        "kind": "last30days", "cli": [_L30_CN_PYTHON, _L30_CN],
         "engagement": "score", "comments": None, "time": None, "eng_max": 100,
     },
 }
