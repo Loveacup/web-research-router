@@ -6,4 +6,4 @@ Independent package migrated from Hermes plugin; installed at ~/.hermes/plugins/
 v5.5 deps control plane | v5.4 community weighting | v5.3 freshness awareness | v5.2 local layer | v5.1 doctor
 """
 
-__version__ = "5.5.0"
+__version__ = "6.1.0"

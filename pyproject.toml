@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-research-router"
-version = "6.0.0"
+version = "6.1.0"
 description = "Semantic search router with 11 engines, mode-based routing, and RRF fusion"
 readme = "README.md"
 requires-python = ">=3.10"
