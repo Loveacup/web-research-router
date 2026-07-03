@@ -137,3 +137,19 @@ def test_env_example_no_real_secrets():
             f".env.example 中 {key}={value} 疑似包含真实密钥，"
             f"应使用占位符（如 'your_{key.lower()}_here'）"
         )
+
+
+def test_community_agent_reach_is_reference_only():
+    """Agent-Reach 在 requirements 中应标记为参考，不是运行时必需。
+
+    community 运行时依赖 opencli，Agent-Reach 仓库只是来源/诊断参考。
+    """
+    req = ENGINE_REQUIREMENTS.get("community")
+    assert req is not None, "community 应在 requirements 中"
+    desc = req.get("description", "")
+    assert "参考" in desc or "reference" in desc, (
+        f"community description 应明确 Agent-Reach 为参考: {desc}"
+    )
+    assert "仅参考" in desc or "诊断" in desc, (
+        f"community description 应强调仅参考/诊断: {desc}"
+    )

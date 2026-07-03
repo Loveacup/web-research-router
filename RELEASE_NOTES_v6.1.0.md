@@ -81,6 +81,11 @@ OpenCLI browser-harness fallback is intentionally **not** part of v6.1. It is a
 v6.x candidate for cases where OpenCLI site adapters are unavailable or have
 capability gaps, and should get its own L1/L2 design gate.
 
+A preliminary design gate spec defining the adapter seam (Interface / Adapter /
+Seam), hot-path side-effect-free policy, and test plan exists at
+`references/browser-harness-fallback-design.md`. The spec is a **design
+contract** only; no implementation code references it at runtime.
+
 ## Non-goals
 
 - No legacy registry / deps / runtime state migration.

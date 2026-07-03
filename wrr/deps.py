@@ -564,12 +564,13 @@ DEPENDENCY_MANIFEST: List[BaseDep] = [
     ),
     GitRepoDep(
         dep_id="agent_reach",
-        capability="internet_access",
+        capability="provenance",
         source_url="https://github.com/Panniantong/Agent-Reach",
-        description="Agent-Reach 互联网接入（OpenCLI 底层渠道）",
+        description="Agent-Reach 来源/诊断参考（社区搜索运行时依赖 opencli，不依赖 Agent-Reach 仓库）",
+        required=False,
         install_guide=[
             "git clone https://github.com/Panniantong/Agent-Reach",
-            "cd Agent-Reach && pip install -e .",
+            "cd Agent-Reach && pip install -e .  # 仅诊断/文档用途",
         ],
     ),
 

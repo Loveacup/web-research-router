@@ -78,7 +78,7 @@ ENGINE_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
         "env": [],
         "commands": ["opencli"],
         "endpoints": [],
-        "description": "社区搜索（OpenCLI/Agent-Reach + last30days）",
+        "description": "社区搜索（OpenCLI 运行时 + last30days；Agent-Reach 仅参考/诊断）",
         "optional_commands": ["python3"],
         "optional_paths": [
             "~/code/last30days-skill/skills/last30days/scripts/last30days.py",

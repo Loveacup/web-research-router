@@ -118,11 +118,11 @@
       {
         "dep_id": "agent_reach",
         "name": "agent_reach",
-        "capability": "internet_access",
+        "capability": "provenance",
         "remote": "https://github.com/Panniantong/Agent-Reach",
         "default_path": "~/code/Agent-Reach",
-        "required": true,
-        "description": "Agent-Reach 互联网接入（OpenCLI 底层渠道）"
+        "required": false,
+        "description": "Agent-Reach 来源/诊断参考（社区搜索运行时依赖 opencli，不依赖 Agent-Reach 仓库）"
       }
     ]
   },

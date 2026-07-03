@@ -108,3 +108,22 @@ def test_unknown_manifest_calling_pattern_does_not_crash_bridge():
     )
 
     assert [dep.id for dep in deps] == ["sample"]
+
+
+def test_manifest_bridge_agent_reach_optional():
+    """Manifest bridge 应将 agent_reach 识别为 optional。
+
+    community/engine.yaml 中 agent_reach.required=false。
+    """
+    report = compare_manifest_bridge_to_legacy()
+    # agent_reach 不应在 required_missing_ids 中
+    assert "agent_reach" not in set(report.required_missing_ids), (
+        "agent_reach 是参考/诊断 repo，不应被视为必需缺失"
+    )
+
+
+def test_agent_reach_in_legacy_manifest_is_optional():
+    """Legacy dep manifest 中的 agent_reach 应为 optional。"""
+    commits = [d for d in DEPENDENCY_MANIFEST if d.id == "agent_reach"]
+    assert len(commits) == 1
+    assert commits[0].required is False

@@ -38,11 +38,11 @@ class TestDepManifest:
 
     def test_required_deps_count(self):
         required = [d for d in DEPENDENCY_MANIFEST if d.required]
-        assert len(required) == 10  # 13 total, 3 optional
+        assert len(required) == 9  # 13 total, 4 optional (agent_reach now provenance/reference only)
 
     def test_optional_deps(self):
         optional = {d.id for d in DEPENDENCY_MANIFEST if not d.required}
-        assert optional == {"searxng_url", "paper_search_mcp", "searxng"}
+        assert optional == {"searxng_url", "paper_search_mcp", "searxng", "agent_reach"}
 
 
 class TestDepRegistry:
@@ -207,3 +207,14 @@ class TestDepTypeEnum:
             "env_var", "git_repo", "cli_tool", "docker",
             "python_pkg", "hermes_tool",
         }
+
+
+class TestAgentReachSemantics:
+    """Agent-Reach 语义：provenance/reference，不是运行时必需。"""
+
+    def test_agent_reach_is_optional(self):
+        commits = [c for c in DEPENDENCY_MANIFEST if c.id == "agent_reach"]
+        assert len(commits) == 1, "agent_reach 应在依赖列表中"
+        dep = commits[0]
+        assert dep.required is False, "agent_reach 应为非必需（参考/诊断用途）"
+        assert dep.capability == "provenance", "agent_reach 应为 provenance 能力"
