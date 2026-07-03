@@ -119,3 +119,43 @@ def test_default_registry_behavior_is_unchanged():
 
     assert set(registry.names()) == V5_PROVIDER_IDS
     assert {engine.name for engine in registry.all()} == V5_PROVIDER_IDS
+
+
+def test_default_registry_v6_shadow_uses_filtered_process_env_overrides(tmp_path, monkeypatch):
+    """Shadow bridge mirrors doctor_v6/install: process_env overrides are filtered and loaded.
+
+    When env= is omitted, the shadow bridge should discover manifests, compute required
+    env names, filter process_env to those names, and pass the filtered overrides to
+    load_env(). This ensures API keys supplied via process environment (e.g., EXA_API_KEY)
+    are visible to the v6 registry without leaking unrelated env vars.
+    """
+    import importlib
+    install_mod = importlib.import_module("wrr.cli.install")
+    original_filtered_env = install_mod._filtered_env
+
+    runtime = _runtime(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    captured_filtered = {}
+
+    def capturing_filtered_env(env, names):
+        result = original_filtered_env(env, names)
+        captured_filtered.update(result)
+        return result
+
+    monkeypatch.setattr(install_mod, "_filtered_env", capturing_filtered_env)
+
+    report = default_registry_v6_shadow(
+        runtime=runtime,
+        process_env={
+            "EXA_API_KEY": "fake-exa-key-for-test",
+            "UNRELATED_SECRET_TOKEN": "should-not-leak",
+        },
+        env_files=[],
+        state_file=state_file,
+    )
+
+    assert "exa" in report.bridged_provider_ids
+    assert "exa" not in report.missing_provider_ids
+    assert "EXA_API_KEY" in captured_filtered
+    assert "UNRELATED_SECRET_TOKEN" not in captured_filtered

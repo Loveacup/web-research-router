@@ -4,13 +4,27 @@ Semantic search router with mode-based routing, 11 engines, and Reciprocal Rank 
 
 ## Architecture
 
-Hermes `web_search` / runtime tool entrypoint uses the v5 mode/RRF route:
+### Runtime modes
+
+**Hermes plugin `web_search`** uses the v5 mode/RRF route:
 
 ```
 query → classify_intent(mode) → parallel engines → RRF fusion → ranked results
 ```
 
-The standalone legacy-compatible `wrr-cli.py search` command still uses the serial fallback route for compatibility unless a future migration step changes it.
+**Standalone legacy-compatible `wrr-cli.py search/fetch/similar`** uses serial fallback for
+compatibility. A future migration step may switch these to v6 routing.
+
+### v6 descriptor bridge (opt-in shadow mode)
+
+The v6 descriptor bridge (`default_registry_v6_shadow()`) is opt-in shadow/parity testing only.
+It does **not** power CLI search or Hermes `web_search`; those remain on v5 mode/RRF.
+
+### Agent-Reach provenance
+
+Agent-Reach is the provenance and diagnostic reference for the OpenCLI daemon/extension stack.
+Runtime community search depends on the **opencli binary + daemon + browser extension bridge**,
+not on importing Agent-Reach code.
 
 ### 8 routing modes
 
@@ -49,7 +63,7 @@ wrr search "your query"      # Hermes runtime tool entrypoint
 
 ## Packaging & install
 
-Three interchangeable entrypoints share one codebase at package version `6.0.0`:
+Three interchangeable entrypoints share one codebase at package version `6.1.0`:
 
 ```bash
 # 1) pip install — exposes the `wrr` console script ([project.scripts] wrr = wrr._cli:main).
@@ -62,7 +76,7 @@ wrr doctor --v6 --json --runtime standalone
 ./wrr-cli.py search "your query" --provider exa --count 5
 
 # 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
-#    plugin.yaml `version` is kept aligned with the package version (6.0.0).
+#    plugin.yaml `version` is kept aligned with the package version (6.1.0).
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ```
 

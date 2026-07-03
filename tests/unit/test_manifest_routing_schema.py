@@ -280,3 +280,16 @@ def test_registry_resolve_filters_only_by_actions_and_domains_without_adapter_im
     assert [item.id for item in extract_web] == ["web_search"]
     assert [item.id for item in search_code] == ["code_search"]
     assert all(item.adapter_imported is False for item in extract_web + search_code)
+
+
+def test_community_manifest_does_not_trigger_on_v2ex():
+    """V2EX full-text search is not implemented; the trigger should not exist."""
+    manifests = _builtin_by_id()
+    community = manifests["community"]
+    triggers = community.routing.get("triggers", [])
+    platform_trigger = next(
+        (t for t in triggers if t.get("name") == "community_platform_names"), None
+    )
+    assert platform_trigger is not None, "community_platform_names trigger missing"
+    keywords = platform_trigger.get("match", {}).get("keywords", [])
+    assert "v2ex" not in keywords, "v2ex should not be a community trigger keyword"
