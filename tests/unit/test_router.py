@@ -76,6 +76,26 @@ def test_explicit_provider_disables_fallback():
         pass
 
 
+def test_community_trigger_gets_community_budget():
+    import wrr.router as router
+
+    captured = []
+    orig_wait_for = router.asyncio.wait_for
+
+    async def fake_wait_for(awaitable, timeout):
+        captured.append(timeout)
+        return await awaitable
+
+    router.asyncio.wait_for = fake_wait_for
+    try:
+        reg = _reg(FakeEngine("community", search_results=mk_results(1), timeout=20.0))
+        rr = run(route("search", SearchOptions("site:reddit.com q"), reg))
+    finally:
+        router.asyncio.wait_for = orig_wait_for
+    assert rr.actual_provider == "community"
+    assert captured[0] >= 19.9
+
+
 # ── extract fallback ─────────────────────────────────────────────────
 def test_extract_empty_text_falls_back():
     reg = _reg(FakeEngine("exa", extract_text=""),

@@ -17,7 +17,7 @@ ENGINE_TIMEOUT = {
     "brave": 10.0,
     "searxng": 10.0,
     "github": 15.0,
-    "community": 15.0,
+    "community": 20.0,
 }
 DEFAULT_ENGINE_TIMEOUT = 15.0
 
@@ -89,15 +89,15 @@ def github_triggered(query: str) -> bool:
 
 # ── 社区聚合引擎（Phase 1：OpenCLI 渠道 + last30days）─────────────────
 COMMUNITY_SCORE_WEIGHTS = (0.40, 0.35, 0.25)   # (engagement, recency, quality)
-COMMUNITY_SOURCE_TIMEOUT = 10.0                # 每源超时（秒）
+COMMUNITY_SOURCE_TIMEOUT = 20.0                # 每源超时（秒）；OpenCLI/browser-backed sources can exceed 15s
 COMMUNITY_TOTAL_TIMEOUT = 15.0                 # 总超时（秒）
-COMMUNITY_DEFAULT_SOURCES = ("reddit", "twitter", "xiaohongshu", "v2ex")
+COMMUNITY_DEFAULT_SOURCES = ("reddit", "twitter", "xiaohongshu")
 COMMUNITY_INCLUDE_LAST30DAYS = False           # 重型源；默认仅 site:hn/zhihu/weibo 或研究关键词时启用
 COMMUNITY_DEDUP_THRESHOLD = 0.80               # 标题相似度去重阈值
 COMMUNITY_TRIGGER_SITES = ("reddit.com", "news.ycombinator.com", "twitter.com",
                            "x.com", "zhihu.com", "weibo.com")
 COMMUNITY_PLATFORM_NAMES = ("reddit", "hacker news", "hackernews", "hn",
-                            "twitter", "v2ex", "zhihu", "微博", "weibo",
+                            "twitter", "zhihu", "微博", "weibo",
                             "小红书", "xiaohongshu")
 
 

@@ -3,7 +3,7 @@
 整合 OpenCLI 社区渠道 + last30days 技能，多源并行搜索 → 统一评分 → 去重 → 排序。
 
 源家族：
-  - OpenCLI 渠道（agent-reach 复用浏览器登录态）：reddit / twitter / xiaohongshu / v2ex
+  - OpenCLI 渠道（agent-reach 复用浏览器登录态）：reddit / twitter / xiaohongshu
     调用 `opencli <chan> search <query> -f json --limit N`，返回结构化 JSON 数组。
   - last30days（重型研究 CLI，按需启用）：last30days_en / last30days_cn
     调用 `python3 <last30days.py> --emit json --quick <query>`，解析其 clusters。
@@ -158,6 +158,24 @@ def _similarity(a: str, b: str) -> float:
     return len(a_set & b_set) / len(a_set | b_set)
 
 
+def _json_object_from_stdout(out: str) -> Any:
+    """Parse JSON payload from agent-facing CLIs that also print progress.
+
+    last30days variants may write human logs to stdout before the final JSON
+    object. Search paths should consume the structured payload instead of
+    treating mixed stdout as a hard failure.
+    """
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        pass
+    start = out.find("{")
+    end = out.rfind("}")
+    if start < 0 or end <= start:
+        raise json.JSONDecodeError("no JSON object found", out, 0)
+    return json.loads(out[start:end + 1])
+
+
 def deduplicate(results: List[SearchResult]) -> List[SearchResult]:
     """去重：URL 规范化相等 或 标题相似度 > 阈值。保留先到者（已按分降序）。"""
     unique: List[SearchResult] = []
@@ -259,6 +277,12 @@ class CommunityEngine(SearchEngine):
         # H3 (v6.1): 搜索热路径不再预检/重启 OpenCLI daemon。daemon/extension
         # 连接性由 v6 registry 的 live_probe 健康检查负责（离线缓存 → routable）。
         sources = self._detect_sources(options.query)
+        if not sources:
+            raise EngineError(
+                "community: no supported source for query; "
+                "V2EX full-text search is not available via community/OpenCLI — "
+                "use auto routing or an external web engine with site:v2ex.com"
+            )
         now = datetime.now(timezone.utc)
         gathered = await asyncio.gather(
             *[self._fetch_source(s, options, now) for s in sources],
@@ -284,6 +308,12 @@ class CommunityEngine(SearchEngine):
         """
         # H3 (v6.1): 同 search()，热路径不做 daemon 预检/重启。
         sources = self._detect_sources(options.query)
+        if not sources:
+            raise EngineError(
+                "community: no supported source for query; "
+                "V2EX full-text search is not available via community/OpenCLI — "
+                "use auto routing or an external web engine with site:v2ex.com"
+            )
         now = datetime.now(timezone.utc)
         gathered = await asyncio.gather(
             *[self._fetch_source(s, options, now) for s in sources],
@@ -323,8 +353,12 @@ class CommunityEngine(SearchEngine):
         # 平台关键词
         if any(k in q for k in ("小红书", "xiaohongshu", "xhs")):
             add("xiaohongshu")
+
+        # V2EX has hot/latest/node APIs but no full-text search endpoint.
+        # Let auto routing fall through to web engines for site:v2ex.com instead
+        # of pretending `opencli v2ex hot/latest` is query search.
         if "v2ex" in q:
-            add("v2ex")
+            return []
 
         if not picked:
             picked = list(config.COMMUNITY_DEFAULT_SOURCES)
@@ -377,7 +411,7 @@ class CommunityEngine(SearchEngine):
         if rc != 0 or not out.strip():
             return []
         try:
-            data = json.loads(out)
+            data = _json_object_from_stdout(out)
         except json.JSONDecodeError:
             return []
         items: List[Dict[str, Any]] = []
@@ -392,6 +426,22 @@ class CommunityEngine(SearchEngine):
                 "snippet": "sources: " + ", ".join(c.get("sources") or []),
                 "score": c.get("score") or 0,
             })
+        if items:
+            return items
+        for platform in ("weibo", "xiaohongshu", "bilibili", "zhihu", "wechat",
+                         "baidu", "douyin", "toutiao"):
+            for row in (data.get(platform) or []):
+                title = row.get("title") or row.get("text") or row.get("why_relevant") or ""
+                url = row.get("url") or row.get("link") or ""
+                if not (title and url):
+                    continue
+                snippet = row.get("snippet") or row.get("description") or row.get("why_relevant") or ""
+                items.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                    "score": row.get("score") or row.get("relevance") or 0,
+                })
         return items
 
     def _item_to_result(self, item, source, cfg, now) -> Optional[_Scored]:

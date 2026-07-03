@@ -72,6 +72,8 @@ async def route(operation: str, options, registry: SearchRegistry,
                 explicit_provider: Optional[str] = None) -> RouterResult:
     chain = build_chain(operation, explicit_provider, getattr(options, "query", None))
     budget = config.budget_for(operation)
+    if operation == "search" and chain and chain[0] == "community":
+        budget = max(budget, config.ENGINE_TIMEOUT.get("community", config.DEFAULT_ENGINE_TIMEOUT))
     steps: List[FallbackStep] = []
     start = time.monotonic()
     actual: Optional[str] = None

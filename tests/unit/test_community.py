@@ -91,6 +91,7 @@ def test_detect_sources_default_and_triggers():
     assert eng._detect_sources("y site:x.com") == ["twitter"]
     assert eng._detect_sources("z site:news.ycombinator.com") == ["last30days_en"]
     assert eng._detect_sources("w site:zhihu.com") == ["last30days_cn"]
+    assert eng._detect_sources("site:v2ex.com python") == []
     assert "xiaohongshu" in eng._detect_sources("小红书 美食")
 
 
@@ -111,6 +112,7 @@ def test_detect_sources_last30days_gated():
 def test_community_triggered():
     assert config.community_triggered("foo site:reddit.com")
     assert config.community_triggered("X SITE:X.COM")
+    assert not config.community_triggered("site:v2ex.com python")
     assert not config.community_triggered("plain query")
 
 
@@ -133,6 +135,15 @@ _L30 = {"clusters": [
     {"title": "cluster py", "score": 42.0, "sources": ["x", "reddit"],
      "representative_ids": ["https://di.gg/ai/m1"]},
 ]}
+_L30_CN = {
+    "topic": "zhihu topic",
+    "bilibili": [
+        {"title": "中文视频", "url": "https://www.bilibili.com/video/BV1", "description": "desc", "score": 25}
+    ],
+    "zhihu": [
+        {"title": "知乎回答", "url": "https://www.zhihu.com/question/1", "snippet": "answer", "relevance": 0.8}
+    ],
+}
 
 
 def _fake_run_factory(mapping, fail=()):
@@ -188,6 +199,17 @@ def test_search_all_empty_raises():
         cm._run_cmd = orig
 
 
+def test_search_unsupported_v2ex_points_to_web_engine():
+    try:
+        run(cm.CommunityEngine().search(SearchOptions("site:v2ex.com python")))
+        assert False, "unsupported v2ex search should raise"
+    except EngineError as e:
+        msg = str(e).lower()
+        assert "v2ex" in msg
+        assert "site:v2ex.com" in msg
+        assert "external web engine" in msg
+
+
 def test_search_last30days_clusters_mapped():
     orig = cm._run_cmd
     cm._run_cmd = _fake_run_factory({"last30days": _L30})
@@ -203,6 +225,23 @@ def test_search_last30days_clusters_mapped():
     assert out[0].title == "cluster py"
     assert out[0].url == "https://di.gg/ai/m1"
     assert out[0].source_tag == "last30days_en"
+
+
+def test_search_last30days_mixed_stdout_and_cn_platform_arrays_mapped():
+    orig = cm._run_cmd
+
+    async def fake_run(cli, timeout):
+        return (0, "正在搜索...\n" + json.dumps(_L30_CN, ensure_ascii=False))
+
+    cm._run_cmd = fake_run
+    try:
+        out = run(cm.CommunityEngine().search(
+            SearchOptions("ai site:zhihu.com", count=5)))
+    finally:
+        cm._run_cmd = orig
+    assert len(out) == 2
+    assert {r.title for r in out} == {"中文视频", "知乎回答"}
+    assert {r.source_tag for r in out} == {"last30days_cn"}
 
 
 def test_item_to_result_drops_incomplete():
