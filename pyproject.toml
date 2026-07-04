@@ -30,6 +30,10 @@ dev = ["pytest", "pytest-asyncio", "httpx"]
 [project.scripts]
 wrr = "wrr._cli:main"
 
+[tool.setuptools.packages.find]
+include = ["wrr*"]
+exclude = ["references*", "tests*"]
+
 [tool.setuptools.package-data]
 wrr = ["engines/builtin/*/engine.yaml"]
 
