@@ -20,7 +20,6 @@
 默认仅在 site:news.ycombinator.com|zhihu.com|weibo.com 触发或研究意图关键词时启用。
 """
 import asyncio
-import json
 import math
 import os
 import re
@@ -30,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .base import SearchEngine
 from . import _fusion
+from .community_sources import SOURCE_ADAPTERS as _SOURCE_ADAPTERS
 from .. import config
 from ..errors import EngineError
 from ..schemas import SearchOptions, SearchResult, EngineCheckResult
@@ -156,24 +156,6 @@ def _similarity(a: str, b: str) -> float:
     if not a_set or not b_set:
         return 0.0
     return len(a_set & b_set) / len(a_set | b_set)
-
-
-def _json_object_from_stdout(out: str) -> Any:
-    """Parse JSON payload from agent-facing CLIs that also print progress.
-
-    last30days variants may write human logs to stdout before the final JSON
-    object. Search paths should consume the structured payload instead of
-    treating mixed stdout as a hard failure.
-    """
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        pass
-    start = out.find("{")
-    end = out.rfind("}")
-    if start < 0 or end <= start:
-        raise json.JSONDecodeError("no JSON object found", out, 0)
-    return json.loads(out[start:end + 1])
 
 
 def deduplicate(results: List[SearchResult]) -> List[SearchResult]:
@@ -370,16 +352,18 @@ class CommunityEngine(SearchEngine):
             add("last30days_cn")
         return picked
 
-    # ── 单源抓取（超时 + 异常隔离）───────────────────────────────────
+    # ── 单源抓取（适配器分派 + 超时 + 异常隔离）─────────────────────
     async def _fetch_source(self, source: str, options, now) -> List[_Scored]:
         cfg = COMMUNITY_SOURCES.get(source)
         if not cfg:
             return []
+        adapter = _SOURCE_ADAPTERS.get(cfg["kind"])
+        if adapter is None:
+            return []
         try:
-            if cfg["kind"] == "opencli":
-                items = await self._fetch_opencli(cfg, options)
-            else:
-                items = await self._fetch_last30days(cfg, options)
+            # 在调用点解析模块级 _run_cmd，保留单测 monkeypatch 语义。
+            items = await adapter.fetch(
+                cfg, options, _run_cmd, config.COMMUNITY_SOURCE_TIMEOUT)
         except Exception:
             return []
         out: List[_Scored] = []
@@ -388,61 +372,6 @@ class CommunityEngine(SearchEngine):
             if scored:
                 out.append(scored)
         return out
-
-    async def _fetch_opencli(self, cfg, options) -> List[Dict[str, Any]]:
-        cli = cfg["cli"] + [options.query, "-f", "json",
-                            "--limit", str(min(options.count, 20))]
-        rc, out = await _run_cmd(cli, config.COMMUNITY_SOURCE_TIMEOUT)
-        if rc != 0 or not out.strip():
-            return []
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("results") or data.get("items") or []
-        return []
-
-    async def _fetch_last30days(self, cfg, options) -> List[Dict[str, Any]]:
-        cli = cfg["cli"] + ["--emit", "json", "--quick", options.query]
-        rc, out = await _run_cmd(cli, config.COMMUNITY_SOURCE_TIMEOUT)
-        if rc != 0 or not out.strip():
-            return []
-        try:
-            data = _json_object_from_stdout(out)
-        except json.JSONDecodeError:
-            return []
-        items: List[Dict[str, Any]] = []
-        for c in (data.get("clusters") or []):
-            ids = c.get("representative_ids") or c.get("candidate_ids") or []
-            url = ids[0] if ids else ""
-            title = c.get("title") or ""
-            if not (title and url):
-                continue
-            items.append({
-                "title": title, "url": url,
-                "snippet": "sources: " + ", ".join(c.get("sources") or []),
-                "score": c.get("score") or 0,
-            })
-        if items:
-            return items
-        for platform in ("weibo", "xiaohongshu", "bilibili", "zhihu", "wechat",
-                         "baidu", "douyin", "toutiao"):
-            for row in (data.get(platform) or []):
-                title = row.get("title") or row.get("text") or row.get("why_relevant") or ""
-                url = row.get("url") or row.get("link") or ""
-                if not (title and url):
-                    continue
-                snippet = row.get("snippet") or row.get("description") or row.get("why_relevant") or ""
-                items.append({
-                    "title": title,
-                    "url": url,
-                    "snippet": snippet,
-                    "score": row.get("score") or row.get("relevance") or 0,
-                })
-        return items
 
     def _item_to_result(self, item, source, cfg, now) -> Optional[_Scored]:
         title = str(item.get(cfg.get("title", "title")) or item.get("title")

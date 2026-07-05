@@ -66,3 +66,37 @@ def test_no_browser_harness_in_manifest():
     assert "browser_harness" not in content, (
         "community manifest 不应包含 browser_harness"
     )
+
+
+# ── Slice 1: adapter seam + disabled policy scaffold ─────────────────
+def test_community_policy_disabled_by_default():
+    """community_policy 的浏览器兜底策略默认禁用。"""
+    from wrr.engines import community_policy as cp
+    assert cp.is_browser_harness_enabled() is False
+    assert cp.DEFAULT_BROWSER_HARNESS_POLICY.enabled is False
+
+
+def test_community_policy_has_no_browser_automation_imports():
+    """community_policy.py 不得引入浏览器自动化依赖。"""
+    content = _read_or_empty("wrr/engines/community_policy.py")
+    assert content, "community_policy.py 必须存在"
+    lowered = content.lower()
+    for banned in ("playwright", "puppeteer", "selenium"):
+        assert banned not in lowered, f"community_policy.py 不应引用 {banned}"
+
+
+def test_community_sources_has_no_browser_automation():
+    """community_sources.py 仅是 CLI 适配器接缝，不得含浏览器自动化。"""
+    content = _read_or_empty("wrr/engines/community_sources.py")
+    assert content, "community_sources.py 必须存在"
+    lowered = content.lower()
+    for banned in ("playwright", "puppeteer", "selenium"):
+        assert banned not in lowered, f"community_sources.py 不应引用 {banned}"
+
+
+def test_community_engine_does_not_import_policy():
+    """search 热路径（community.py）不得引用禁用策略脚手架。"""
+    content = _read_or_empty("wrr/engines/community.py")
+    assert "community_policy" not in content, (
+        "community.py 不应导入 community_policy（Slice 1 无热路径接线）"
+    )

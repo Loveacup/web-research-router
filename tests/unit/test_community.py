@@ -282,6 +282,67 @@ def test_search_does_not_probe_or_restart_opencli_daemon():
     assert all(cli[:3] != ["opencli", "daemon", "restart"] for cli in recorded)
 
 
+# ── 源适配器 seam（Slice 1）─────────────────────────────────────────
+def test_community_sources_module_exposes_adapters():
+    from wrr.engines import community_sources as cs
+    assert hasattr(cs, "CommunitySourceAdapter")
+    assert hasattr(cs, "OpenCliSourceAdapter")
+    assert hasattr(cs, "Last30DaysSourceAdapter")
+
+
+def test_opencli_adapter_preserves_command_and_parsing():
+    from wrr.engines import community_sources as cs
+    captured = {}
+
+    async def fake_run(cli, timeout):
+        captured["cli"] = cli
+        captured["timeout"] = timeout
+        return (0, json.dumps(_REDDIT))
+
+    items = run(cs.OpenCliSourceAdapter().fetch(
+        cm.COMMUNITY_SOURCES["reddit"], SearchOptions("python", count=5),
+        fake_run, 9.9))
+    assert captured["cli"] == [
+        "opencli", "reddit", "search", "python", "-f", "json", "--limit", "5"]
+    assert captured["timeout"] == 9.9
+    assert items == _REDDIT
+
+
+def test_opencli_adapter_caps_limit_at_20():
+    from wrr.engines import community_sources as cs
+    captured = {}
+
+    async def fake_run(cli, timeout):
+        captured["cli"] = cli
+        return (0, json.dumps({"results": _REDDIT}))
+
+    items = run(cs.OpenCliSourceAdapter().fetch(
+        cm.COMMUNITY_SOURCES["reddit"], SearchOptions("python", count=100),
+        fake_run, 1.0))
+    assert captured["cli"][-1] == "20"
+    assert items == _REDDIT               # dict {"results": [...]} 解包
+
+
+def test_last30days_adapter_parses_mixed_stdout():
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        return (0, "正在搜索...\n" + json.dumps(_L30))
+
+    items = run(cs.Last30DaysSourceAdapter().fetch(
+        cm.COMMUNITY_SOURCES["last30days_en"], SearchOptions("ai", count=5),
+        fake_run, 1.0))
+    assert items and items[0]["title"] == "cluster py"
+    assert items[0]["url"] == "https://di.gg/ai/m1"
+
+
+def test_fetch_source_wired_to_adapter_registry():
+    assert set(cm._SOURCE_ADAPTERS) >= {"opencli", "last30days"}
+    from wrr.engines import community_sources as cs
+    assert isinstance(cm._SOURCE_ADAPTERS["opencli"], cs.OpenCliSourceAdapter)
+    assert isinstance(cm._SOURCE_ADAPTERS["last30days"], cs.Last30DaysSourceAdapter)
+
+
 # ── 自动触发链 ───────────────────────────────────────────────────────
 def test_build_chain_promotes_community():
     assert build_chain("search", None, "x site:reddit.com") == \
