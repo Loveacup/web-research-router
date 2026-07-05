@@ -54,13 +54,6 @@ class OpenCliSourceAdapter:
       `<cli...> <query> -f json --limit <min(count,20)>`，严格 json.loads。
     """
 
-    _BROWSER_CONNECT_MARKERS = (
-        "BROWSER_CONNECT",
-        "Browser Bridge extension not connected",
-        "extension not connected",
-        "extension: disconnected",
-    )
-
     async def fetch(self, cfg: Dict[str, Any], options: Any,
                     run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
         cli = cfg["cli"] + [options.query, "-f", "json",

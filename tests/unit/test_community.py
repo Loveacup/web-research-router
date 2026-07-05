@@ -7,6 +7,8 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from wrr.engines import community as cm
 from wrr.schemas import SearchOptions
 from wrr.errors import EngineError
@@ -353,3 +355,53 @@ def test_build_chain_promotes_community():
         ["community", "exa", "brave", "github", "searxng"]
     assert build_chain("search", None, "plain") == \
         ["exa", "brave", "github", "community", "searxng"]
+
+
+# ── OpenCLI 断开快速失败（端到端时延）───────────────────────────────────
+def test_opencli_disconnect_fails_fast_in_search():
+    """当 OpenCLI extension 断开时，_fetch_source 应在 1s probe 内快速失败，
+    而不是等待 20s 的 opencli search 超时。"""
+    eng = cm.CommunityEngine()
+    start = time.monotonic()
+
+    async def fake_probe(timeout):
+        return (False, "OpenCLI browser extension not connected")
+
+    async def fake_run(cli, timeout):
+        # 如果走到这里，说明没有快速失败，测试会等待 20s（实际不应发生）
+        return (0, json.dumps(_REDDIT), "")
+
+    orig_probe = cm._probe_opencli_status
+    cm._probe_opencli_status = fake_probe
+    try:
+        # _fetch_source 应 raise EngineError 并在 1s 内返回
+        with pytest.raises(EngineError, match="OpenCLI browser extension not connected"):
+            run(eng._fetch_source("reddit", SearchOptions("python", count=5), datetime.now(timezone.utc)))
+    finally:
+        cm._probe_opencli_status = orig_probe
+
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"expected fast fail within 2s, took {elapsed:.2f}s"
+
+
+def test_opencli_probe_fast_pass_when_connected():
+    """当 OpenCLI extension 连接时，probe 快速通过后继续正常抓取。"""
+    eng = cm.CommunityEngine()
+
+    async def fake_probe(timeout):
+        return (True, "opencli ready")
+
+    async def fake_run(cli, timeout):
+        return (0, json.dumps(_REDDIT), "")
+
+    orig_probe = cm._probe_opencli_status
+    orig_run = cm._run_cmd
+    cm._probe_opencli_status = fake_probe
+    cm._run_cmd = fake_run
+    try:
+        res = run(eng._fetch_source("reddit", SearchOptions("python", count=5), datetime.now(timezone.utc)))
+    finally:
+        cm._probe_opencli_status = orig_probe
+        cm._run_cmd = orig_run
+
+    assert len(res) == len(_REDDIT)

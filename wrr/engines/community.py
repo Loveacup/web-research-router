@@ -175,51 +175,6 @@ def deduplicate(results: List[SearchResult]) -> List[SearchResult]:
     return unique
 
 
-async def _check_opencli_ready(*, timeout: float = 5.0) -> Tuple[bool, str]:
-    """检查 OpenCLI daemon + Chrome extension 是否可用，不可用时尝试自动恢复。
-
-    返回 (ready, detail)：
-      - ready=True：可以安全调用 opencli 搜索
-      - ready=False：尝试恢复失败，detail 包含可操作错误信息
-
-    恢复策略：
-      1. 快速检查 daemon 状态（`opencli daemon status`）
-      2. extension 断连 → 重启 daemon → 等待重连 → 再次检查
-      3. daemon 不运行/无法恢复 → 直接返回失败
-    """
-    rc, out, _err = await _run_cmd(["opencli", "daemon", "status"], timeout=timeout)
-    if rc != 0 or not out.strip():
-        return (False, "opencli daemon not running — try: opencli daemon start")
-    out_lower = out.lower()
-
-    if "not running" in out_lower:
-        # daemon 没跑 → 尝试启动（opencli daemon 只有 restart，没有 start）
-        rc2, _, _err2 = await _run_cmd(["opencli", "daemon", "restart"], timeout=timeout)
-        if rc2 != 0:
-            return (False, "opencli daemon not running and restart failed — try: opencli daemon restart")
-        await asyncio.sleep(2.0)
-        rc3, out3, _err3 = await _run_cmd(["opencli", "daemon", "status"], timeout=timeout)
-        if rc3 == 0 and "connected" in out3.lower():
-            return (True, "opencli reconnected after daemon restart")
-        return (False, "opencli daemon restarted but extension not connected — is Chrome running?")
-
-    if "connected" in out_lower and "extension" in out_lower:
-        return (True, "opencli ready")
-
-    # Extension disconnected → 尝试重启 daemon 让 extension 重连
-    if "disconnected" in out_lower or "not connected" in out_lower:
-        rc2, _, _err2b = await _run_cmd(["opencli", "daemon", "restart"], timeout=timeout)
-        if rc2 != 0:
-            return (False, "opencli extension disconnected; daemon restart failed")
-        await asyncio.sleep(2.5)
-        rc3, out3, _err3b = await _run_cmd(["opencli", "daemon", "status"], timeout=timeout)
-        if rc3 == 0 and "connected" in out3.lower():
-            return (True, "opencli reconnected after daemon restart")
-        return (False, "opencli extension still disconnected after restart — try: opencli daemon restart")
-
-    return (False, f"opencli status unknown: {out[:200]}")
-
-
 # ── 子进程（集中一处，便于单测 monkeypatch）──────────────────────────
 async def _run_cmd(cli: List[str], timeout: float) -> Tuple[Optional[int], str, str]:
     """运行命令，返回 (returncode, stdout, stderr)；超时/异常返回 (None, '', '').
