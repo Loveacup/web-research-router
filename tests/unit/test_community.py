@@ -149,12 +149,14 @@ _L30_CN = {
 def _fake_run_factory(mapping, fail=()):
     async def fake_run(cli, timeout):
         joined = " ".join(cli).lower()
+        if cli[:3] == ["opencli", "daemon", "status"]:
+            return (0, "Daemon: running on port 19825\nExtension: connected", "")
         for key, payload in mapping.items():
             if key in joined:
                 if key in fail:
-                    return (None, "")           # 模拟该源失败
-                return (0, json.dumps(payload))
-        return (0, "[]")
+                    return (None, "", "")           # 模拟该源失败
+                return (0, json.dumps(payload), "")
+        return (0, "[]", "")
     return fake_run
 
 
@@ -231,7 +233,9 @@ def test_search_last30days_mixed_stdout_and_cn_platform_arrays_mapped():
     orig = cm._run_cmd
 
     async def fake_run(cli, timeout):
-        return (0, "正在搜索...\n" + json.dumps(_L30_CN, ensure_ascii=False))
+        if cli[:3] == ["opencli", "daemon", "status"]:
+            return (0, "Daemon: running on port 19825\nExtension: connected", "")
+        return (0, "正在搜索...\n" + json.dumps(_L30_CN, ensure_ascii=False), "")
 
     cm._run_cmd = fake_run
     try:
@@ -256,20 +260,20 @@ def test_item_to_result_drops_incomplete():
 
 
 def test_search_does_not_probe_or_restart_opencli_daemon():
-    """H3 (v6.1): search 热路径不得执行 opencli daemon status/restart。"""
+    """H3 (v6.1): search 热路径只运行 1s read-only daemon status probe，不重启 daemon。"""
     recorded: list = []
     orig = cm._run_cmd
 
     async def guard(cli, timeout):
-        if cli[:3] == ["opencli", "daemon", "status"]:
-            raise AssertionError("search hot path must not run opencli daemon status")
         if cli[:3] == ["opencli", "daemon", "restart"]:
             raise AssertionError("search hot path must not run opencli daemon restart")
         recorded.append(cli)
+        if cli[:3] == ["opencli", "daemon", "status"]:
+            return (0, "Daemon: running on port 19825\nExtension: connected", "")
         joined = " ".join(cli).lower()
         if "reddit" in joined:
-            return (0, json.dumps(_REDDIT[:1]))
-        return (0, "[]")
+            return (0, json.dumps(_REDDIT[:1]), "")
+        return (0, "[]", "")
 
     cm._run_cmd = guard
     try:
@@ -278,7 +282,7 @@ def test_search_does_not_probe_or_restart_opencli_daemon():
     finally:
         cm._run_cmd = orig
     assert len(out) == 1
-    assert all(cli[:3] != ["opencli", "daemon", "status"] for cli in recorded)
+    assert any(cli[:3] == ["opencli", "daemon", "status"] for cli in recorded)
     assert all(cli[:3] != ["opencli", "daemon", "restart"] for cli in recorded)
 
 
@@ -297,7 +301,7 @@ def test_opencli_adapter_preserves_command_and_parsing():
     async def fake_run(cli, timeout):
         captured["cli"] = cli
         captured["timeout"] = timeout
-        return (0, json.dumps(_REDDIT))
+        return (0, json.dumps(_REDDIT), "")
 
     items = run(cs.OpenCliSourceAdapter().fetch(
         cm.COMMUNITY_SOURCES["reddit"], SearchOptions("python", count=5),
@@ -314,7 +318,7 @@ def test_opencli_adapter_caps_limit_at_20():
 
     async def fake_run(cli, timeout):
         captured["cli"] = cli
-        return (0, json.dumps({"results": _REDDIT}))
+        return (0, json.dumps({"results": _REDDIT}), "")
 
     items = run(cs.OpenCliSourceAdapter().fetch(
         cm.COMMUNITY_SOURCES["reddit"], SearchOptions("python", count=100),
@@ -327,7 +331,7 @@ def test_last30days_adapter_parses_mixed_stdout():
     from wrr.engines import community_sources as cs
 
     async def fake_run(cli, timeout):
-        return (0, "正在搜索...\n" + json.dumps(_L30))
+        return (0, "正在搜索...\n" + json.dumps(_L30), "")
 
     items = run(cs.Last30DaysSourceAdapter().fetch(
         cm.COMMUNITY_SOURCES["last30days_en"], SearchOptions("ai", count=5),

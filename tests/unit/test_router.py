@@ -76,6 +76,27 @@ def test_explicit_provider_disables_fallback():
         pass
 
 
+def test_explicit_provider_gets_full_engine_timeout():
+    """显式 --provider 时不受 10s 总预算限制，应使用 engine.timeout。"""
+    import wrr.router as router
+
+    captured = []
+    orig_wait_for = router.asyncio.wait_for
+
+    async def fake_wait_for(awaitable, timeout):
+        captured.append(timeout)
+        return await awaitable
+
+    router.asyncio.wait_for = fake_wait_for
+    try:
+        reg = _reg(FakeEngine("github", search_results=mk_results(1), timeout=20.0))
+        rr = run(route("search", SearchOptions("q", provider="github"), reg, explicit_provider="github"))
+    finally:
+        router.asyncio.wait_for = orig_wait_for
+    assert rr.actual_provider == "github"
+    assert captured[0] >= 19.9
+
+
 def test_community_trigger_gets_community_budget():
     import wrr.router as router
 

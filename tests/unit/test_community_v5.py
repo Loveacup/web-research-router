@@ -33,12 +33,14 @@ _TWITTER = [
 def _fake_run_factory(mapping, fail=()):
     async def fake_run(cli, timeout):
         joined = " ".join(cli).lower()
+        if cli[:3] == ["opencli", "daemon", "status"]:
+            return (0, "Daemon: running on port 19825\nExtension: connected", "")
         for key, payload in mapping.items():
             if key in joined:
                 if key in fail:
-                    return (None, "")
-                return (0, json.dumps(payload))
-        return (0, "[]")
+                    return (None, "", "")
+                return (0, json.dumps(payload), "")
+        return (0, "[]", "")
     return fake_run
 
 
@@ -59,20 +61,20 @@ def test_search_rrf_aggregates_multi_source():
 
 
 def test_search_rrf_does_not_probe_or_restart_opencli_daemon():
-    """H3 (v6.1): search_rrf 热路径不得执行 opencli daemon status/restart。"""
+    """H3 (v6.1): search_rrf 热路径只运行 1s read-only daemon status probe，不重启 daemon。"""
     recorded: list = []
     orig = cm._run_cmd
 
     async def guard(cli, timeout):
-        if cli[:3] == ["opencli", "daemon", "status"]:
-            raise AssertionError("search_rrf hot path must not run opencli daemon status")
         if cli[:3] == ["opencli", "daemon", "restart"]:
             raise AssertionError("search_rrf hot path must not run opencli daemon restart")
         recorded.append(cli)
+        if cli[:3] == ["opencli", "daemon", "status"]:
+            return (0, "Daemon: running on port 19825\nExtension: connected", "")
         joined = " ".join(cli).lower()
         if "reddit" in joined:
-            return (0, json.dumps(_REDDIT[:1]))
-        return (0, "[]")
+            return (0, json.dumps(_REDDIT[:1]), "")
+        return (0, "[]", "")
 
     cm._run_cmd = guard
     try:
@@ -81,7 +83,7 @@ def test_search_rrf_does_not_probe_or_restart_opencli_daemon():
     finally:
         cm._run_cmd = orig
     assert len(out) == 1
-    assert all(cli[:3] != ["opencli", "daemon", "status"] for cli in recorded)
+    assert any(cli[:3] == ["opencli", "daemon", "status"] for cli in recorded)
     assert all(cli[:3] != ["opencli", "daemon", "restart"] for cli in recorded)
 
 

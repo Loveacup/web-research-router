@@ -301,6 +301,10 @@ def cmd_update(ns) -> int:
 
 def cmd_doctor(ns) -> int:
     """Doctor: 检查引擎健康状况和本地依赖。"""
+    # --env-report is a separate diagnostic that does not run doctor checks.
+    if getattr(ns, "env_report", False):
+        return _cmd_env_report(ns)
+
     if getattr(ns, "v6", False):
         from wrr.doctor import doctor_v6
 
@@ -392,6 +396,55 @@ def cmd_doctor(ns) -> int:
 
     # 返回退出码
     return doctor_exit_code(results, strict=ns.strict)
+
+
+def _cmd_env_report(ns) -> int:
+    """Print a profile-aware environment report for the current WRR runtime."""
+    import os
+    from wrr import config
+
+    rows = [
+        ("EXA_API_KEY", "exa, brave fallback", "web search"),
+        ("BRAVE_API_KEY", "brave", "web search"),
+        ("GITHUB_TOKEN", "github", "GitHub repo/issue search"),
+        ("SEARXNG_URL", "searxng", "SearXNG self-hosted / recovery"),
+        ("WRR_V6_ROUTER", "v6 router", "v6 descriptor-backed registry (1=enabled)"),
+        ("OPENROUTER_API_KEY", "(not directly used by WRR)", "Hermes/OpenRouter only"),
+    ]
+    report = []
+    for env_name, engines, impact in rows:
+        value = os.environ.get(env_name)
+        present = value is not None and value != ""
+        status = "ok" if present else "missing"
+        report.append({
+            "env": env_name,
+            "loaded": present,
+            "engines": engines,
+            "impact": impact,
+            "status": status,
+        })
+
+    if ns.json:
+        _emit_json({
+            "profile": "current shell",
+            "loaded_env": config.get_env.__module__,
+            "variables": report,
+        })
+        return 0
+
+    print("WRR environment report")
+    print(f"{'Variable':<20} {'Status':<8} {'Engines':<22} {'Impact'}")
+    print("-" * 70)
+    mark = {"ok": "✅", "missing": "❌"}
+    for r in report:
+        print(f"{r['env']:<20} {mark.get(r['status'], r['status']):<8} {r['engines']:<22} {r['impact']}")
+    print()
+    print("Notes:")
+    print("  • WRR_V6_ROUTER=1 enables the v6 descriptor router; unset falls back to v5 mode/RRF.")
+    print("  • GITHUB_TOKEN absence makes github engine unavailable.")
+    print("  • SEARXNG_URL absence uses built-in defaults or disables recovery mode.")
+    print("  • OPENROUTER_API_KEY is not consumed by WRR itself; use it in Hermes/OpenRouter.")
+    return 0
 
 
 # ── argparse 组装 ────────────────────────────────────────────────────
@@ -505,6 +558,11 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     dp.add_argument("--strict", action="store_true", help="严格模式：warn 也视为失败（退出码 1）")
     dp.add_argument("--deep", action="store_true", help="深度探测：执行命令/API 实际验证（较慢）")
+    dp.add_argument(
+        "--env-report",
+        action="store_true",
+        help="仅输出环境变量与引擎可用性报告，不运行 doctor 检查",
+    )
     dp.add_argument(
         "--v6",
         action="store_true",

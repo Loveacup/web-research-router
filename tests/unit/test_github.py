@@ -158,7 +158,7 @@ def test_fetch_activity_concurrent_parse_and_degrade():
             return self._b
 
     class _Client:
-        async def get(self, url, params=None, headers=None):
+        async def get(self, url, params=None, headers=None, **kwargs):
             if "good" in url:
                 link = '<...&page=42>; rel="last"'
                 return _Resp({"Link": link}, [{}])

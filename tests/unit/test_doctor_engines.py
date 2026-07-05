@@ -241,11 +241,16 @@ def test_community_opencli_missing():
     assert result.evidence.get("command.opencli") == "missing"
 
 
+async def _mock_probe_ok(timeout=1.0):
+    return (True, "opencli ready")
+
+
 def test_community_opencli_present():
-    """Community: opencli 可用 → ok。"""
+    """Community: opencli + extension 可用 → ok。"""
     with patch("shutil.which", return_value="/usr/local/bin/opencli"):
-        with patch.dict(os.environ, {"COMMUNITY_INCLUDE_LAST30DAYS": "False"}):
-            result = run(CommunityEngine().health_check())
+        with patch("wrr.engines.community._probe_opencli_status", side_effect=_mock_probe_ok):
+            with patch.dict(os.environ, {"COMMUNITY_INCLUDE_LAST30DAYS": "False"}):
+                result = run(CommunityEngine().health_check())
     assert result.status == "ok"
     assert "opencli available" in result.summary
     assert result.active_backend == "opencli"
@@ -255,16 +260,17 @@ def test_community_opencli_present():
 def test_community_last30days_missing_warn():
     """Community: opencli OK，但 last30days 脚本缺失（启用时）→ warn。"""
     with patch("shutil.which", return_value="/usr/local/bin/opencli"):
-        with patch("os.path.exists", return_value=False):
-            with patch.dict(os.environ, {"COMMUNITY_INCLUDE_LAST30DAYS": "True"}):
-                # 需要导入 config 后设置
-                from wrr import config
-                original = config.COMMUNITY_INCLUDE_LAST30DAYS
-                try:
-                    config.COMMUNITY_INCLUDE_LAST30DAYS = True
-                    result = run(CommunityEngine().health_check())
-                finally:
-                    config.COMMUNITY_INCLUDE_LAST30DAYS = original
+        with patch("wrr.engines.community._probe_opencli_status", side_effect=_mock_probe_ok):
+            with patch("os.path.exists", return_value=False):
+                with patch.dict(os.environ, {"COMMUNITY_INCLUDE_LAST30DAYS": "True"}):
+                    # 需要导入 config 后设置
+                    from wrr import config
+                    original = config.COMMUNITY_INCLUDE_LAST30DAYS
+                    try:
+                        config.COMMUNITY_INCLUDE_LAST30DAYS = True
+                        result = run(CommunityEngine().health_check())
+                    finally:
+                        config.COMMUNITY_INCLUDE_LAST30DAYS = original
 
     assert result.status == "warn"
     assert "last30days" in result.summary.lower()
@@ -284,12 +290,9 @@ def test_community_deep_probe_ok():
             stdout="opencli version 1.0.0\n",
         )
 
-    async def mock_check_ready(*, timeout):
-        return (True, "opencli ready")
-
     with patch("shutil.which", return_value="/usr/local/bin/opencli"):
         with patch("wrr.engines._probe.probe_command", side_effect=mock_probe_command):
-            with patch("wrr.engines.community._check_opencli_ready", side_effect=mock_check_ready):
+            with patch("wrr.engines.community._probe_opencli_status", side_effect=_mock_probe_ok):
                 result = run(CommunityEngine().health_check(deep=True))
 
     assert result.status == "ok"
@@ -310,7 +313,8 @@ def test_community_deep_probe_timeout():
 
     with patch("shutil.which", return_value="/usr/local/bin/opencli"):
         with patch("wrr.engines._probe.probe_command", side_effect=mock_probe_command):
-            result = run(CommunityEngine().health_check(deep=True))
+            with patch("wrr.engines.community._probe_opencli_status", side_effect=_mock_probe_ok):
+                result = run(CommunityEngine().health_check(deep=True))
 
     assert result.status == "fail"
     assert "timeout" in result.summary.lower()
@@ -332,7 +336,8 @@ def test_community_deep_probe_broken():
 
     with patch("shutil.which", return_value="/usr/local/bin/opencli"):
         with patch("wrr.engines._probe.probe_command", side_effect=mock_probe_command):
-            result = run(CommunityEngine().health_check(deep=True))
+            with patch("wrr.engines.community._probe_opencli_status", side_effect=_mock_probe_ok):
+                result = run(CommunityEngine().health_check(deep=True))
 
     assert result.status == "fail"
     assert "broken" in result.summary.lower()

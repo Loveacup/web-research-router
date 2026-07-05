@@ -197,7 +197,7 @@ class GitHubEngine(SearchEngine):
 
     async def _fetch_activity(self, client, headers, items) -> List[Optional[int]]:
         """并发取每个仓库最近 30 天 commit 数；关闭或失败时返回 None（降级代理）。"""
-        if not config.GITHUB_ACTIVITY_LOOKUP or not items:
+        if config.GITHUB_FAST_MODE or not config.GITHUB_ACTIVITY_LOOKUP or not items:
             return [None] * len(items)
         since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
@@ -211,6 +211,7 @@ class GitHubEngine(SearchEngine):
                     f"{GITHUB_REPO_URL}/{full}/commits",
                     params={"since": since, "per_page": 1},
                     headers=headers,
+                    timeout=config.GITHUB_ACTIVITY_LOOKUP_TIMEOUT,
                 )
                 r.raise_for_status()
                 return _parse_commit_count(r)

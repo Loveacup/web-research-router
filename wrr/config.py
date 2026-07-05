@@ -16,10 +16,14 @@ ENGINE_TIMEOUT = {
     "exa": 30.0,
     "brave": 10.0,
     "searxng": 10.0,
-    "github": 15.0,
+    "github": 20.0,
     "community": 20.0,
 }
 DEFAULT_ENGINE_TIMEOUT = 15.0
+
+# ── GitHub：并发 commit 探测单仓短超时 + fast mode 环境开关 ─────────────
+GITHUB_ACTIVITY_LOOKUP_TIMEOUT = 3.0
+GITHUB_FAST_MODE = bool(os.environ.get("GITHUB_FAST_MODE"))
 
 # ── 预算：fallback 链总响应上限（秒）──────────────────────────────────
 TOTAL_BUDGET_SECONDS = 10.0          # search / similar：交互式，求快

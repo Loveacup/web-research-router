@@ -11,10 +11,10 @@
   - 禁止在本模块引入任何浏览器自动化框架或浏览器启动逻辑。
 """
 import json
-from typing import Any, Awaitable, Callable, Dict, List, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, List, Protocol, Tuple, runtime_checkable
 
-# run_cmd 注入契约：(cli, timeout) -> (returncode|None, stdout)
-RunCmd = Callable[[List[str], float], Awaitable[Any]]
+# run_cmd 注入契约：(cli, timeout) -> (returncode, stdout, stderr)
+RunCmd = Callable[[List[str], float], Awaitable[Tuple[Any, str, str]]]
 
 
 def _json_object_from_stdout(out: str) -> Any:
@@ -54,11 +54,18 @@ class OpenCliSourceAdapter:
       `<cli...> <query> -f json --limit <min(count,20)>`，严格 json.loads。
     """
 
+    _BROWSER_CONNECT_MARKERS = (
+        "BROWSER_CONNECT",
+        "Browser Bridge extension not connected",
+        "extension not connected",
+        "extension: disconnected",
+    )
+
     async def fetch(self, cfg: Dict[str, Any], options: Any,
                     run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
         cli = cfg["cli"] + [options.query, "-f", "json",
                             "--limit", str(min(options.count, 20))]
-        rc, out = await run_cmd(cli, timeout)
+        rc, out, err = await run_cmd(cli, timeout)
         if rc != 0 or not out.strip():
             return []
         try:
@@ -82,7 +89,7 @@ class Last30DaysSourceAdapter:
     async def fetch(self, cfg: Dict[str, Any], options: Any,
                     run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
         cli = cfg["cli"] + ["--emit", "json", "--quick", options.query]
-        rc, out = await run_cmd(cli, timeout)
+        rc, out, _err = await run_cmd(cli, timeout)
         if rc != 0 or not out.strip():
             return []
         try:
