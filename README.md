@@ -2,23 +2,20 @@
 
 Semantic search router with mode-based routing, 11 engines, and Reciprocal Rank Fusion.
 
+**Current version:** 6.1.0 — v6.1 Engine Health Policy is released and the v6 descriptor-backed router is the default path (`WRR_V6_ROUTER=1`).
+
 ## Architecture
 
 ### Runtime modes
 
-**Hermes plugin `web_search`** uses the v5 mode/RRF route:
+**Hermes plugin `web_search`** uses the v6 descriptor-backed registry when
+`WRR_V6_ROUTER=1`, falling back to the v5 mode/RRF route when the variable is unset.
 
-```
-query → classify_intent(mode) → parallel engines → RRF fusion → ranked results
-```
+### v6 descriptor bridge (default as of v6.1)
 
-**Standalone legacy-compatible `wrr-cli.py search/fetch/similar`** uses serial fallback for
-compatibility. A future migration step may switch these to v6 routing.
-
-### v6 descriptor bridge (opt-in shadow mode)
-
-The v6 descriptor bridge (`default_registry_v6_shadow()`) is opt-in shadow/parity testing only.
-It does **not** power CLI search or Hermes `web_search`; those remain on v5 mode/RRF.
+v6.1 completed the S3 default switch: the descriptor-backed registry is the live
+default path when `WRR_V6_ROUTER=1` (set in the launch environment). The legacy
+v5 mode/RRF route remains available by unsetting `WRR_V6_ROUTER`.
 
 ### Agent-Reach provenance
 
@@ -92,27 +89,19 @@ Notes:
 
 ## v6 CLI migration gate
 
-v6 control-plane CLI is opt-in during the compatibility window. Old `doctor`
-behavior and old JSON consumers remain supported until the default switch is
-announced.
+v6.0 introduced the control-plane CLI; v6.1 completed the S3 default switch and the
+Engine Health Policy. Legacy `doctor` behavior and old JSON consumers still work
+when `WRR_V6_ROUTER` is unset.
 
 ```bash
 # v6 doctor JSON: new shape with runtime/env/discovered/resolved/health/summary/trust
 ./wrr-cli.py doctor --v6 --json
 
-# Trust project-level plugins and project env files only when explicitly needed
-./wrr-cli.py doctor --v6 --trust-project --json
-
-# v6 install planning is report-only; --dry-run is currently required
-# (non-dry-run install exits 2 until a future migration step enables writes)
-./wrr-cli.py install --dry-run --runtime codex --json
-./wrr-cli.py install --dry-run --runtime hermes --refresh-deps --json
-
-# v6 dependency update defaults to dry-run; --apply is explicit
-./wrr-cli.py update --dry-run --json
+# Deep health — live probes + bounded recovery for engines that declare it
+./wrr-cli.py doctor --v6 --deep --json --runtime standalone
 ```
 
-### v6.1 Engine Health Policy
+### v6.1 Engine Health Policy (released)
 
 v6.1 splits engine health checks into two tiers so the search hot path stays fast
 and side-effect free:
@@ -139,6 +128,13 @@ OpenCLI extension, then re-run deep doctor to re-probe and (if configured) resta
 # Deep health — live probes + bounded recovery for engines that declare it
 ./wrr-cli.py doctor --v6 --deep --json --runtime standalone
 ```
+
+### v6.x OpenCLI browser-harness fallback (Slice 1 implemented, not wired)
+
+A future browser-harness fallback may fill community gaps when OpenCLI is unavailable.
+Slice 1 (committed) introduces the source adapter seam (`wrr/engines/community_sources.py`)
+and a disabled policy scaffold (`wrr/engines/community_policy.py`). No real browser
+automation is wired into the search hot path; the fallback remains a v6.x candidate.
 
 ## Dependencies (13 total)
 
@@ -185,8 +181,16 @@ Run `wrr-cli.py doctor` for self-check.
 ## Testing
 
 ```bash
-PYTHONPATH=. pytest -q
+# Default environment uses v6 descriptor router.
+# Use WRR_V6_ROUTER=0 for legacy registry tests with FakeEngine.
+WRR_V6_ROUTER=0 PYTHONPATH=. pytest tests/unit -q
 ```
+
+| Gate | Command |
+|---|---|
+| Unit tests | `WRR_V6_ROUTER=0 pytest tests/unit -k 'not openalex_live_single_source' -q` |
+| Installed CLI smoke | `wrr doctor --v6 --json --runtime standalone` |
+| Deep health | `wrr doctor --v6 --deep --json --runtime standalone` |
 
 ## License
 

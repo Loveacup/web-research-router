@@ -1,6 +1,6 @@
 # Browser-Harness Fallback Design Gate (v6.x)
 
-> **Status**: Roadmap / design-only. v6.1 不包含实现。仅有设计 contract + 测试门禁。
+> **Status**: Slice 1 implemented. Adapter seam and disabled policy scaffold are committed; no real browser automation or fallback wiring.
 > **Owner**: WRR Architecture Review
 > **Seam placement**: CommunityEngine sub-source adapter, not `_fetch_opencli()` fallback.
 
@@ -33,11 +33,11 @@ class CommunitySourceAdapter(Protocol):
     async def health(self, deep: bool = False) -> EngineCheckResult: ...
 ```
 
-| Adapter | Source | Transport |
-|---|---|---|
-| `OpenCliSourceAdapter` | opencli | subprocess `opencli <source> search` |
-| `Last30DaysSourceAdapter` | last30days | subprocess `python last30days.py --emit json` |
-| `BrowserHarnessSourceAdapter` | browser_harness | browser-automation (future) |
+| Adapter | Source | Transport | Status |
+|---|---|---|---|
+| `OpenCliSourceAdapter` | opencli | subprocess `opencli <source> search` | implemented |
+| `Last30DaysSourceAdapter` | last30days | subprocess `python last30days.py --emit json` | implemented |
+| `BrowserHarnessSourceAdapter` | browser_harness | browser-automation (future) | design-only / not implemented |
 
 ## 4. Routing and Fallback Chain
 
