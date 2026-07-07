@@ -97,6 +97,8 @@ def _to_int(v) -> int:
 
 def _parse_time(time_val) -> Optional[datetime]:
     """解析 Unix 秒/毫秒 或 ISO 8601。"""
+    if isinstance(time_val, datetime):
+        return time_val if time_val.tzinfo else time_val.replace(tzinfo=timezone.utc)
     if isinstance(time_val, (int, float)) and time_val > 0:
         ts = time_val / 1000 if time_val > 1e11 else time_val
         try:
@@ -105,7 +107,8 @@ def _parse_time(time_val) -> Optional[datetime]:
             return None
     if isinstance(time_val, str) and time_val:
         try:
-            return datetime.fromisoformat(time_val.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except ValueError:
             return None
     return None
@@ -116,6 +119,10 @@ def _recency_score(created: Optional[datetime], now: Optional[datetime] = None) 
     if not created:
         return 0.5
     now = now or datetime.now(timezone.utc)
+    if isinstance(now, (int, float)):
+        now = datetime.fromtimestamp(now, tz=timezone.utc)
+    elif isinstance(now, datetime) and now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     age_hours = (now - created).total_seconds() / 3600
     if age_hours <= 24:
         return 1.0

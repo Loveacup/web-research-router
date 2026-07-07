@@ -53,7 +53,12 @@ def test_quality_ratio():
 def test_parse_time_epoch_and_iso():
     assert cm._parse_time(1778165271).year >= 2026          # epoch 秒
     assert cm._parse_time(1778165271000).year >= 2026       # epoch 毫秒
-    assert cm._parse_time("2026-06-01T00:00:00Z") is not None
+    dt = cm._parse_time("2026-06-01T00:00:00Z")
+    assert dt is not None
+    assert dt.tzinfo is not None
+    # naive / aware subtract must not raise (P3 RSS regression)
+    now = datetime(2026, 7, 7, 12, 0, tzinfo=timezone.utc)
+    assert cm._recency_score(dt, now) >= 0.0
     assert cm._parse_time("garbage") is None
     assert cm._parse_time(None) is None
 
@@ -347,6 +352,38 @@ def test_fetch_source_wired_to_adapter_registry():
     from wrr.engines import community_sources as cs
     assert isinstance(cm._SOURCE_ADAPTERS["opencli"], cs.OpenCliSourceAdapter)
     assert isinstance(cm._SOURCE_ADAPTERS["last30days"], cs.Last30DaysSourceAdapter)
+
+
+def test_fetch_source_rss_accepts_float_now_and_datetime_published_at():
+    """P3 RSS regression: epoch float `now` must not break datetime RSS items."""
+    eng = cm.CommunityEngine()
+    fixed_now = datetime(2026, 7, 7, 12, 0, tzinfo=timezone.utc)
+
+    class FakeRssAdapter:
+        async def fetch(self, cfg, options, run_cmd, timeout):
+            return [{
+                "title": "AI 热点",
+                "url": "https://example.com/ai-hot",
+                "snippet": "rss item",
+                "published_at": fixed_now - timedelta(hours=2),
+            }]
+
+    orig_adapter = cm._SOURCE_ADAPTERS["rss"]
+    cm._SOURCE_ADAPTERS["rss"] = FakeRssAdapter()
+    try:
+        out = run(eng._fetch_source(
+            "aihot_rss",
+            SearchOptions("AI 热点", count=5),
+            fixed_now.timestamp(),
+        ))
+    finally:
+        cm._SOURCE_ADAPTERS["rss"] = orig_adapter
+
+    assert len(out) == 1
+    score, result = out[0]
+    assert score > 0
+    assert result.title == "AI 热点"
+    assert result.source_tag == "aihot_rss"
 
 
 # ── 自动触发链 ───────────────────────────────────────────────────────
