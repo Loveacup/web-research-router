@@ -6,22 +6,22 @@ aliases: [WRR P3 Early News Capture, WRR-P3-early-news, WRR早期新闻捕获]
 tags: [type/规划, status/树苗, src/原创, topic/工程, ai/web-research-router]
 related: "[[WRR]]"
 created: 2026-07-07 22:40
-modified: 2026-07-07 22:40
+modified: 2026-07-07 23:10
 ---
 
 # WRR P3 早期新闻捕获（Early News Capture）
 
-当前状态：[[web-research-router]] v6.1.1 已发布（P0/P1/P2 全部完成，已提交并 tag）。本规划作为 P3 阶段的 STDD/控制面文档，用于确认设计、记录调研、作为后续执行的母文。
+当前状态：[[web-research-router]] v6.1.1 已发布（P0/P1/P2 全部完成，已提交并 tag）。**P3-1 已实现并提交**。本规划作为 P3 阶段的 STDD/控制面文档，用于确认设计、记录调研、作为后续执行的母文。
 
 ## 一、Plan（计划）
 
 P3 目标：为 WRR 增加**早期新闻 / 热点捕获**能力，分三路推进。
 
-| 路线 | 目标 | 预期收益 | 优先级 |
-|---|---|---|---|
-| P3-1 AI HOT 源适配器 | 接入 aihot.virxact.com 的中文 AI 资讯（无需 API Key） | 补强社区引擎对中文 AI 圈动态的覆盖 | 高 |
-| P3-2 WeChat RSS 源 | 不直接爬取微信，而是通过 RSSHub / WeRSS / wewe-rss 生成的 RSS 接入公众号内容 | 获取中文高质量长文源，避开反爬 | 中 |
-| P3-3 early-news 路由模式 | 新增聚合模式，把 AI HOT + WeChat + HN / Twitter / Reddit 等作为 early-signal 源 | 支持"今天 AI 圈发生了什么"类查询 | 中 |
+| 路线 | 目标 | 预期收益 | 优先级 | 状态 |
+|---|---|---|---|---|
+| P3-1 AI HOT 源适配器 | 接入 aihot.virxact.com 的中文 AI 资讯（无需 API Key） | 补强社区引擎对中文 AI 圈动态的覆盖 | 高 | ✅ 已提交 |
+| P3-2 WeChat RSS 源 | 不直接爬取微信，而是通过 RSSHub / WeRSS / wewe-rss 生成的 RSS 接入公众号内容 | 获取中文高质量长文源，避开反爬 | 中 | 🔄 规划中 |
+| P3-3 early-news 路由模式 | 新增聚合模式，把 AI HOT + WeChat + HN / Twitter / Reddit 等作为 early-signal 源 | 支持"今天 AI 圈发生了什么"类查询 | 中 | 🔄 规划中 |
 
 范围边界：
 - **纯加法**：不动 `router.py` 分发核心、`registry.py` 默认注册表、`deps.py`。
@@ -32,7 +32,7 @@ P3 目标：为 WRR 增加**早期新闻 / 热点捕获**能力，分三路推�
 
 ## 二、Process（过程/调研）
 
-### 2.1 AI HOT
+### 2.1 AI HOT 接口调研（已验证）
 
 - 官网：aihot.virxact.com
 - 提供 Skill / RSS / REST API / OpenAPI 3.1 接入，**无需 API Key**。
@@ -40,7 +40,15 @@ P3 目标：为 WRR 增加**早期新闻 / 热点捕获**能力，分三路推�
   - khazix-skills/aihot（SKILL.md）
   - jing7ao/aihot-mcp（npm，TypeScript）
   - aihotradar-mcp（PyPI，Python MCP）
-- 内容：每日 AI 热点、精选、模型发布、行业动态（中文为主）。
+- **已实测 RSS 端点**（P3-1 实现）：
+  - 精选：`https://aihot.virxact.com/feed.xml`
+  - 全部动态：`https://aihot.virxact.com/feed/all.xml`
+  - 日报：`https://aihot.virxact.com/feed/daily.xml`
+  - 论文：`https://aihot.virxact.com/feed/category/paper.xml`
+- 公开 API：
+  - `https://aihot.virxact.com/api/public/items?mode=selected|all&since=...&category=...&q=...`
+  - `https://aihot.virxact.com/api/public/daily`
+  - `https://aihot.virxact.com/api/public/dailies`
 
 ### 2.2 WeChat
 
@@ -52,63 +60,56 @@ P3 目标：为 WRR 增加**早期新闻 / 热点捕获**能力，分三路推�
 
 - `wrr/engines/community_sources.py` 已定义 `CommunitySourceAdapter` seam，支持 `opencli` 和 `last30days` 两种 adapter。
 - 新增 adapter 只需实现 `fetch(cfg, options, run_cmd, timeout)`，并在 `SOURCE_ADAPTERS` 注册。
-- community engine 通过 builtin `engine.yaml` manifest 声明 source 配置。
+- community engine 通过 `COMMUNITY_SOURCES` 字典声明 source 配置。
 - routing 侧可在 `config.py` 增加触发词，或在 `resolve_mode` 中新增 `early-news` 分支。
 
-## 三、Result（设计草案）
+## 三、Result（设计草案 + 已落地）
 
-### 3.1 P3-1 AI HOT 源适配器
+### 3.1 P3-1 AI HOT 源适配器 ✅ 已提交
 
-1. 在 `wrr/engines/community_sources.py` 中新增 `AihotSourceAdapter`：
-   - 调用 `aihot.virxact.com` 的公开 RSS / API 端点（如 `/feed` 或 `/api/daily`）。
-   - 解析为 `List[Dict[str, Any]]`，字段：`title`, `url`, `snippet`, `score`, `published_at`, `sources`。
-   - 使用 `httpx.AsyncClient` 而不是 `run_cmd`，但保持 `run_cmd` 参数签名兼容。
+实现摘要：
+- 在 `wrr/engines/community_sources.py` 中新增 `RssSourceAdapter`（通用 RSS 适配器）。
+- 通过 `cfg["feed_url"]` 获取 RSS XML，解析 `<item>` 为 `title`, `url`, `snippet`, `published_at`, `category`, `sources`。
+- 注入 `cfg["client"]` 支持测试；生产环境使用 `httpx.AsyncClient`。
+- 注册 `SOURCE_ADAPTERS["rss"] = RssSourceAdapter()`。
+- 在 `wrr/engines/community.py` 新增 `aihot_rss` 源配置，默认 feed 为 `https://aihot.virxact.com/feed.xml`。
+- 在 `wrr/config.py` 新增 `AIHOT_RSS_FEED` 与 `AIHOT_KEYWORDS` 触发词。
+- `_detect_sources` 在命中 AI HOT 关键词时启用 `aihot_rss`。
+- 新增测试 `tests/unit/test_rss_source_adapter.py`（5 个测试全部通过）。
 
-2. 注册：
-   ```python
-   SOURCE_ADAPTERS: Dict[str, CommunitySourceAdapter] = {
-       "opencli": OpenCliSourceAdapter(),
-       "last30days": Last30DaysSourceAdapter(),
-       "aihot": AihotSourceAdapter(),
-   }
-   ```
+关键字段映射：
 
-3. 在 community builtin engine manifest 中新增 `aihot` source 配置（默认禁用，仅在 `early-news` 模式或用户显式开启时启用）。
+| RSS 字段 | item 字段 | 说明 |
+|---|---|---|
+| `title` | `title` | 标题（CDATA 已解析） |
+| `link` | `url` | 链接 |
+| `description` | `snippet` | 摘要；AI HOT 的 `via AI HOT` 尾巴被截断 |
+| `pubDate` | `published_at` | 解析为 ISO 8601 |
+| `category` | `category` | 分类 |
+| `author` | `sources` | 作为单元素列表 |
 
-4. 测试：`tests/unit/test_aihot_source.py` 使用 `FakeAsyncClient` 模拟响应，断言解析字段和失败回退。
+### 3.2 P3-2 WeChat RSS 源（框架已落地）
 
-### 3.2 P3-2 WeChat RSS 源
+- 同 `RssSourceAdapter` 复用，新增 `wechat_rss` source。
+- 用户通过 `WRR_WECHAT_RSS_FEEDS` 环境变量提供逗号分隔 feed URL 列表。
+- 未配置时 `wechat_rss` 源 feed_url 为空，adapter 返回空列表，不阻塞其他源。
+- 触发条件：查询含 `wechat`/`微信`/`公众号`/`weixin`/`we-mp-rss` **或** 用户已配置 feed。
+- 测试已覆盖 WeChat RSS 解析（同 `test_rss_source_adapter.py`）。
 
-1. 新增 `WechatRssSourceAdapter`：
-   - 接受 `cfg["feed_url"]`，请求 RSS XML。
-   - 解析 `<item>` 为 `title`, `url`, `snippet`（description 截断），`published_at`。
-   - 失败时返回空列表，不阻塞其他源。
+### 3.3 P3-3 early-news 路由模式（待规划）
 
-2. 配置：用户通过环境变量 `WRR_WECHAT_RSS_FEEDS` 提供 feed_url 列表；不提供时 adapter 为空操作。
-
-3. 测试：`tests/unit/test_wechat_rss_source.py` 用 RSS XML 字符串 mock 响应。
-
-### 3.3 P3-3 early-news 路由模式
-
-1. 在 `wrr/config.py` 中：
-   - 新增 `COMMUNITY_EARLY_NEWS_SOURCES = ("aihot", "wechat_rss", "hackernews", "twitter", "reddit")`。
-   - 新增 `EARLY_NEWS_KEYWORDS` 触发词："今天 AI 圈"、"AI 日报"、"AI 热点"、"early news"、"发生了什么"、"今日热点"等。
-
-2. 在 `resolve_mode` / `classify_intent` 中增加 `early-news` 分支：
-   - 命中关键词 → 模式 `early-news`。
-   - 该模式使用社区引擎，但只启用 `aihot`, `wechat_rss`, `last30days` 等 early-signal 源。
-
-3. 保持 `community` 模式不变；`early-news` 是其子集/特化。
+当前方案：
+- 在 `wrr/config.py` 中新增 `EARLY_NEWS_KEYWORDS` 触发词（"今天 AI 圈"、"AI 日报"、"AI 热点"、"early news"、"发生了什么"、"今日热点"等）。
+- 在 `classify_intent` / `resolve_mode` 中增加 `early-news` 分支：命中关键词 → 模式 `early-news`。
+- 该模式使用社区引擎，但只启用 `aihot_rss`、`wechat_rss`、`last30days` 等 early-signal 源。
+- 保持 `community` 模式不变；`early-news` 是其子集/特化。
 
 ### 3.4 关键接口/数据契约
 
 ```python
-class AihotSourceAdapter:
-    async def fetch(self, cfg, options, run_cmd, timeout) -> List[Dict[str, Any]]:
-        ...
-
-class WechatRssSourceAdapter:
-    async def fetch(self, cfg, options, run_cmd, timeout) -> List[Dict[str, Any]]:
+class RssSourceAdapter:
+    async def fetch(self, cfg: Dict[str, Any], options: Any,
+                    run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
         ...
 ```
 
@@ -130,25 +131,28 @@ class WechatRssSourceAdapter:
 | aihot.virxact.com API 未稳定/变更 | 使用 RSS 优先；API 调用做失败回退；字段缺失时容错 |
 | WeChat RSS 源失效/反爬升级 | 用户自行维护 feed；adapter 失败不阻塞其他源 |
 | early-news 模式与 community 模式重叠 | 用关键词和触发词区分；默认 community 模式不动 |
-| 测试依赖外部网络 | 所有 adapter 使用可注入的 HTTP client / run_cmd |
+| 测试依赖外部网络 | 所有 adapter 使用可注入的 HTTP client |
+| RSS 结果不相关于查询 | 社区引擎已有按源聚合；后续可加入 query-filter 后处理 |
 
-### 3.6 预计改动文件
+### 3.6 改动文件（P3-1 已提交）
 
-- `wrr/engines/community_sources.py`（新增两个 adapter）
-- `wrr/engines/community.py`（注册 source、处理 adapter 返回字段）
-- `wrr/engines/builtin/community/engine.yaml`（新增 source 配置）
-- `wrr/config.py`（新增触发词、early-news 配置）
-- `wrr/router.py`（可选：仅在 `resolve_mode` 中增加 early-news 分支；纯加法）
-- `tests/unit/test_aihot_source.py`（新增）
-- `tests/unit/test_wechat_rss_source.py`（新增）
-- `tests/unit/test_router_modes.py`（可能补充 early-news 模式断言）
-- `RELEASE_NOTES_v6.1.1.md` 或 `RELEASE_NOTES_v6.2.0.md`（后续更新）
+- `wrr/engines/community_sources.py`（+95 行：RssSourceAdapter）
+- `wrr/engines/community.py`（+19 行：aihot_rss / wechat_rss 源 + 触发逻辑）
+- `wrr/config.py`（+11 行：配置与触发词）
+- `tests/unit/test_rss_source_adapter.py`（新增，5 测试）
 
-## 四、Next step（下一步）
+## 四、验证
 
-1. 用户确认本规划后，启动 **P3-1 AI HOT 源适配器**实现。
-2. 执行路径：Codex 规划（可选）→ CC 小粒度执行 → OMP 审计 → 测试验证。
-3. 非大节点不中断用户，但 WeChat RSS 和 early-news 模式涉及设计取舍，需要在本规划确认后再动手。
+- `pytest tests/unit/test_rss_source_adapter.py` → **5 passed**
+- `WRR_V6_ROUTER=0 pytest tests/unit -q` → **696 passed, 1 failed**
+  - 失败项：`test_openalex_live_single_source`（外部 OpenAlex 429/timeout，与 P3-1 无关）
+- 红线检查：`wrr/router.py`、`wrr/registry.py`、`wrr/deps.py` 未改动
+
+## 五、Next step（下一步）
+
+1. **OMP 审计 P3-1**：按 agent-team-engineering 工作流，派出单方 OMP 审计。
+2. 审计通过后启动 **P3-3 early-news 路由模式**（P3-2 框架已随 P3-1 一起落地）。
+3. 非大节点不中断用户，但 P3-3 涉及 `classify_intent` 修改，需先确认本规划后再动手。
 
 ---
 

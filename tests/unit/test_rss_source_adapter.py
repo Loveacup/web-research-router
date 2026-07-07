@@ -137,3 +137,30 @@ def test_rss_adapter_malformed_xml_isolated():
     cfg = {"feed_url": "https://example.com/bad", "client": _FakeAsyncClient(_FakeAsyncResponse("not xml"))}
     items = asyncio.run(adapter.fetch(cfg, _Options(), noop_run_cmd, 5.0))
     assert items == []
+
+
+def test_detect_sources_wechat_requires_both_keyword_and_feeds(monkeypatch):
+    """OMP P3-1 blocker (2026-07-07): wechat_rss must require both keyword and feeds.
+
+    Without this guard, an empty WECHAT_RSS_FEEDS + a WeChat keyword query would
+    add wechat_rss as the only source, fetch returns [], and search() raises
+    EngineError("community: all sources failed or returned no results").
+    """
+    import wrr.engines.community as community_mod
+    from wrr.engines.community import CommunityEngine
+    eng = CommunityEngine.__new__(CommunityEngine)
+
+    # Case 1: feeds empty + keyword present → wechat_rss must NOT be added
+    monkeypatch.setattr(community_mod.config, "WECHAT_RSS_FEEDS", ())
+    sources = eng._detect_sources("请帮我搜公众号文章")
+    assert "wechat_rss" not in sources
+
+    # Case 2: feeds set + no keyword → wechat_rss must NOT be added
+    monkeypatch.setattr(community_mod.config, "WECHAT_RSS_FEEDS",
+                        ("https://rss.example.com/feed.xml",))
+    sources = eng._detect_sources("just some random query")
+    assert "wechat_rss" not in sources
+
+    # Case 3: feeds set + keyword present → wechat_rss IS added
+    sources = eng._detect_sources("微信公众号推荐")
+    assert "wechat_rss" in sources

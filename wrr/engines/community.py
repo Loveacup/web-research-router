@@ -325,8 +325,10 @@ class CommunityEngine(SearchEngine):
         if any(k in q for k in config.AIHOT_KEYWORDS):
             add("aihot_rss")
 
-        # P3: WeChat RSS（用户已配置 feed 或查询显式提及）
-        if any(k in q for k in config.WECHAT_KEYWORDS) or config.WECHAT_RSS_FEEDS:
+        # P3: WeChat RSS（用户已配置 feed 且查询显式提及）。
+        # H3 blocker (OMP 2026-07-07): 必须同时有 feed 配置 + 关键词触发，
+        # 否则空 source 会让唯一源调用走 EngineError("all sources failed") 误报。
+        if config.WECHAT_RSS_FEEDS and any(k in q for k in config.WECHAT_KEYWORDS):
             add("wechat_rss")
 
         # V2EX has hot/latest/node APIs but no full-text search endpoint.
