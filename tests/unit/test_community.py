@@ -43,6 +43,22 @@ def test_recency_steps():
     assert cm._recency_score(None, now) == 0.5              # 未知→中等
 
 
+def test_recency_score_created_defensive():
+    """_recency_score() 对 created 参数做防御归一化（float/int/naive datetime）。"""
+    now = datetime(2026, 7, 7, 12, 0, tzinfo=timezone.utc)
+    # float epoch (2h ago)
+    created_float = (now - timedelta(hours=2)).timestamp()
+    assert cm._recency_score(created_float, now) == 1.0
+    # int epoch millis (1h ago)
+    created_int = int((now - timedelta(hours=1)).timestamp() * 1000)
+    assert cm._recency_score(created_int, now) == 1.0
+    # naive datetime (3h ago)
+    created_naive = now.replace(tzinfo=None) - timedelta(hours=3)
+    assert cm._recency_score(created_naive, now) == 1.0
+    # overflow epoch → 0.5
+    assert cm._recency_score(1e20, now) == 0.5
+
+
 def test_quality_ratio():
     assert cm._quality_score(0, 100) == 0.0
     assert cm._quality_score(10, 0) == 0.0                  # 无互动→0

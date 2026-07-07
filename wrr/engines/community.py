@@ -123,6 +123,15 @@ def _recency_score(created: Optional[datetime], now: Optional[datetime] = None) 
         now = datetime.fromtimestamp(now, tz=timezone.utc)
     elif isinstance(now, datetime) and now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    # 防御性归一化 created（不依赖上游 _parse_time）
+    if isinstance(created, (int, float)):
+        try:
+            ts = created / 1000 if created > 1e11 else created
+            created = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return 0.5
+    elif isinstance(created, datetime) and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
     age_hours = (now - created).total_seconds() / 3600
     if age_hours <= 24:
         return 1.0
