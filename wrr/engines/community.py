@@ -331,6 +331,13 @@ class CommunityEngine(SearchEngine):
         if config.WECHAT_RSS_FEEDS and any(k in q for k in config.WECHAT_KEYWORDS):
             add("wechat_rss")
 
+        # P3-3: early-news 路由模式——命中宽泛新闻/早报意图时，主动拉取 RSS 源
+        # 以覆盖默认社区源（reddit/twitter/xiaohongshu）可能错过的早期中文资讯。
+        if config.early_news_triggered(q):
+            add("aihot_rss")
+            if config.WECHAT_RSS_FEEDS:
+                add("wechat_rss")
+
         # V2EX has hot/latest/node APIs but no full-text search endpoint.
         # Let auto routing fall through to web engines for site:v2ex.com instead
         # of pretending `opencli v2ex hot/latest` is query search.

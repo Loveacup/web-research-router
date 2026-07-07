@@ -181,6 +181,19 @@ AIHOT_KEYWORDS = ("aihot", "ai hot", "今天 ai", "ai 日报", "ai 热点", "ai 
                   "ai 动态", "ai 新闻", "ai 行业", "模型发布", "产品发布")
 WECHAT_KEYWORDS = ("wechat", "微信", "公众号", "weixin", "we-mp-rss")
 
+# P3-3: early-news 模式触发词（AI/热点/早报/新闻意图）。只保留与 AI 强相关的
+# 复合词，避免误伤 `site:news.ycombinator.com` 等社区过滤查询。
+EARLY_NEWS_KEYWORDS = (
+    "ai 早报", "ai 早報", "ai 热点", "ai hot", "aihot", "ai 圈", "ai 资讯",
+    "ai 新闻", "ai 动态", "ai 行业", "ai news", "latest ai", "最新 ai", "今天 ai",
+    "模型发布", "产品发布", "最新发布", "今日发布",
+)
+
+
+def early_news_triggered(query: str) -> bool:
+    """P3-3: 查询是否含早期新闻/AI热点/早报意图。"""
+    q = (query or "").lower()
+    return any(kw.lower() in q for kw in EARLY_NEWS_KEYWORDS)
 
 def community_triggered(query: str) -> bool:
     """查询是否含社区站点 site: 过滤、平台名称或实践意图（v5.4 自动触发 community）。"""

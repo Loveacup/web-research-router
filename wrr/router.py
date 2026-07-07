@@ -32,10 +32,13 @@ def build_chain(operation: str, explicit_provider: Optional[str],
     if operation == "search":
         chain = list(config.SEARCH_FALLBACK_ORDER)
         promote = []
+        # P3-3: explicit site:github.com wins over early-news community promotion.
         if query and config.github_triggered(query):
             promote.append("github")           # site:github.com
+        if query and config.early_news_triggered(query):
+            promote.append("community")      # P3-3: early-news → RSS/community first
         if query and config.community_triggered(query):
-            promote.append("community")        # site:reddit/hn/twitter/zhihu/weibo
+            promote.append("community")      # site:reddit/hn/twitter/zhihu/weibo
         if promote:
             chain = promote + [p for p in chain if p not in promote]
         return chain
