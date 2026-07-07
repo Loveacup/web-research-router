@@ -54,3 +54,27 @@ def test_exa_similar_uses_findsimilar_endpoint():
     assert sent["json"]["url"] == "https://x"
     assert sent["json"]["numResults"] == 3
     assert len(out) == 1
+
+
+def test_exa_search_uses_mode_timeout():
+    _patch({"results": [{"title": "T", "url": "U", "text": "body", "highlights": []}]}, "k")
+    eng = exa_mod.ExaEngine()
+    run(eng.search(SearchOptions("hello", mode="deep")))
+    # 从 captured 中找到 INIT 记录
+    init_record = [r for r in FakeAsyncClient.captured if r.get("method") == "INIT"][0]
+    assert init_record["kwargs"]["timeout"] == config.EXA_MODE_TIMEOUT["deep"]
+
+
+def test_exa_extract_and_similar_use_engine_timeout():
+    _patch({"results": [{"url": "U", "text": "long", "highlights": []}]}, "k")
+    eng = exa_mod.ExaEngine()
+    run(eng.extract(ExtractOptions("https://x", max_characters=100)))
+    init_record = [r for r in FakeAsyncClient.captured if r.get("method") == "INIT"][0]
+    assert init_record["kwargs"]["timeout"] == eng.timeout
+
+    # 清空并测试 similar
+    FakeAsyncClient.captured = []
+    _patch({"results": [{"title": "T", "url": "U", "text": "t", "highlights": []}]}, "k")
+    run(eng.similar(SimilarOptions("https://x", count=3)))
+    init_record = [r for r in FakeAsyncClient.captured if r.get("method") == "INIT"][0]
+    assert init_record["kwargs"]["timeout"] == eng.timeout

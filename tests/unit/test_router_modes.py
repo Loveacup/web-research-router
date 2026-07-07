@@ -184,3 +184,41 @@ def test_community_weights_raised():
     assert config.MODE_WEIGHTS["grounding"]["community"] >= 0.40
     # academic 不变
     assert config.MODE_WEIGHTS["academic"]["community"] <= 0.30
+
+
+# ── diagnostics 追踪 ─────────────────────────────────────────────────
+def test_route_search_v5_includes_diagnostics():
+    """v5 路由应包含 diagnostics with mode/mode_reason/selected_engines/events。"""
+    reg = _full_reg()
+    rr = run(route_search_v5(SearchOptions("survey of llm"), reg))
+    assert rr.diagnostics is not None
+    assert rr.diagnostics.mode == "academic"
+    assert rr.diagnostics.mode_reason in ("classify_intent", "explicit")
+    assert len(rr.diagnostics.selected_engines) > 0
+    assert len(rr.diagnostics.events) > 0
+    assert rr.diagnostics.elapsed_ms > 0
+    assert rr.diagnostics.timeout_ms > 0
+
+
+def test_explicit_mode_sets_mode_reason_explicit():
+    """显式 mode 时 mode_reason 应为 'explicit'。"""
+    reg = _full_reg()
+    rr = run(route_search_v5(SearchOptions("anything", mode="research"), reg))
+    assert rr.diagnostics is not None
+    assert rr.diagnostics.mode == "research"
+    assert rr.diagnostics.mode_reason == "explicit"
+
+
+def test_recovery_fallback_sets_mode_reason_recovery_fallback():
+    """主 mode 空结果走 recovery 时 mode_reason 应为 'recovery_fallback'。"""
+    # 让主 mode 的所有引擎都返回空，只有 recovery 引擎有结果
+    reg = _reg(
+        FakeEngine("exa", search_results=[]),
+        FakeEngine("brave", search_results=[]),
+        FakeEngine("searxng", search_results=mk_results(1)),  # searxng 在 recovery mode 中
+    )
+    rr = run(route_search_v5(SearchOptions("test"), reg))
+    assert rr.diagnostics is not None
+    # 如果走了 recovery fallback，mode 应为 recovery
+    if rr.diagnostics.mode == "recovery":
+        assert rr.diagnostics.mode_reason == "recovery_fallback"

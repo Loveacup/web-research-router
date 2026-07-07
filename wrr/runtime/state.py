@@ -251,3 +251,31 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def get_cached_health_meta(
+    engine_id: str,
+    capability: str,
+    *,
+    path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """只读获取缓存的健康元数据（不触发 live probe）。
+
+    返回: {"recorded_at": float, "expires_at": float, "age_ms": float, "expired": bool}
+    若无缓存，返回 None。
+    """
+    state = load_state(path)
+    raw = state.health_cache.get(_cache_key(engine_id, capability))
+    if not isinstance(raw, Mapping):
+        return None
+    recorded_at = float(raw.get("recorded_at") or 0)
+    expires_at = float(raw.get("expires_at") or 0)
+    now = time.time()
+    age_ms = (now - recorded_at) * 1000.0
+    expired = now >= expires_at
+    return {
+        "recorded_at": recorded_at,
+        "expires_at": expires_at,
+        "age_ms": age_ms,
+        "expired": expired,
+    }

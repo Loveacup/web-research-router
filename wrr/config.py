@@ -4,7 +4,45 @@
 """
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
+
+
+def _env_float(key: str, default: float, *, minimum: float = 0.1) -> float:
+    raw = os.environ.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_int(key: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    raw = os.environ.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _env_bool_from_resolver(key: str, env_resolver: Callable[[str], Optional[str]], default: bool = False) -> bool:
+    """从自定义 env_resolver 解析布尔环境变量（用于测试 monkeypatch）。"""
+    raw = env_resolver(key)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
 
 # ── Fallback 顺序（与历史 extension.ts / v3 __init__.py 一致）─────────────
 SEARCH_FALLBACK_ORDER = ("exa", "brave", "github", "community", "searxng")
@@ -12,18 +50,22 @@ EXTRACT_FALLBACK_ORDER = ("exa", "brave")   # web_fetch：exa 干净正文 → b
 SIMILAR_PROVIDERS = ("exa",)                 # findSimilar 仅 Exa 支持
 
 # ── 单引擎超时（秒）──────────────────────────────────────────────────
+GITHUB_TIMEOUT = _env_float("WRR_GITHUB_TIMEOUT", 20.0)
+GITHUB_CLIENT_TIMEOUT = _env_float("WRR_GITHUB_CLIENT_TIMEOUT", GITHUB_TIMEOUT)
+GITHUB_ACTIVITY_LOOKUP_TIMEOUT = _env_float("WRR_GITHUB_ACTIVITY_TIMEOUT", 3.0)
+GITHUB_ACTIVITY_CONCURRENCY = _env_int("WRR_GITHUB_ACTIVITY_CONCURRENCY", 5)
+GITHUB_ACTIVITY_LOOKUP = _env_bool("WRR_GITHUB_ACTIVITY_LOOKUP", True)
+
+EXA_TIMEOUT = _env_float("WRR_EXA_TIMEOUT", 30.0)
+
 ENGINE_TIMEOUT = {
-    "exa": 30.0,
+    "exa": EXA_TIMEOUT,
     "brave": 10.0,
     "searxng": 10.0,
-    "github": 20.0,
+    "github": GITHUB_TIMEOUT,
     "community": 20.0,
 }
 DEFAULT_ENGINE_TIMEOUT = 15.0
-
-# ── GitHub：并发 commit 探测单仓短超时 + fast mode 环境开关 ─────────────
-GITHUB_ACTIVITY_LOOKUP_TIMEOUT = 3.0
-GITHUB_FAST_MODE = bool(os.environ.get("GITHUB_FAST_MODE"))
 
 # ── 预算：fallback 链总响应上限（秒）──────────────────────────────────
 TOTAL_BUDGET_SECONDS = 10.0          # search / similar：交互式，求快
@@ -74,21 +116,47 @@ EXA_FACTUAL_KEYWORDS = ["什么时候", "多少", "是谁", "日期", "版本", 
 
 # 各模式超时（秒）
 EXA_MODE_TIMEOUT = {
-    "fast": 3.0,
-    "auto": 5.0,
-    "deep-lite": 8.0,
-    "deep": 10.0,
+    "fast": _env_float("WRR_EXA_MODE_FAST_TIMEOUT", 3.0),
+    "auto": _env_float("WRR_EXA_MODE_AUTO_TIMEOUT", 5.0),
+    "deep-lite": _env_float("WRR_EXA_MODE_DEEPLITE_TIMEOUT", 8.0),
+    "deep": _env_float("WRR_EXA_MODE_DEEP_TIMEOUT", max(15.0, EXA_TIMEOUT / 2)),
 }
 
 # ── GitHub 引擎（P1 轻量版：activity + popularity + freshness）─────────
 GITHUB_TRIGGER = "site:github.com"            # 查询命中 → 把 github 提到链首
-GITHUB_ACTIVITY_LOOKUP = True                 # True: 并发实测 30 天 commit 速度，失败降级
 GITHUB_SCORE_WEIGHTS = (0.40, 0.35, 0.25)     # (activity, popularity, freshness)
 
 
 def github_triggered(query: str) -> bool:
     """查询是否含 site:github.com（自动触发 github 引擎）。"""
     return GITHUB_TRIGGER in (query or "").lower()
+
+
+def github_fast_mode(env_resolver: Optional[Callable[[str], Optional[str]]] = None) -> bool:
+    """查询 GITHUB_FAST_MODE 环境变量（跳过 activity lookup）。
+
+    支持运行时可测试的 env_resolver 注入（用于 monkeypatch）。
+    """
+    if env_resolver is None:
+        env_resolver = os.environ.get
+    return (_env_bool_from_resolver("GITHUB_FAST_MODE", env_resolver)
+            or _env_bool_from_resolver("WRR_GITHUB_FAST_MODE", env_resolver))
+
+
+# ── Recovery 兜底策略：按 runtime 决定是否允许自动 fallback ───────────
+RECOVERY_ALLOWED_RUNTIMES = {"hermes", "claude_code", "codex", "omp"}
+
+
+def recovery_allowed(runtime_name: Optional[str] = None) -> bool:
+    """当前 runtime 是否允许 search 主 mode 失败后自动 recovery 兜底。"""
+    if runtime_name is None:
+        from wrr.runtime.detect import detect_runtime
+        runtime_name = detect_runtime().name
+    allowed_env = os.environ.get("WRR_RECOVERY_ALLOWED_RUNTIMES")
+    if allowed_env:
+        allowed = {x.strip() for x in allowed_env.split(",") if x.strip()}
+        return runtime_name in allowed
+    return runtime_name in RECOVERY_ALLOWED_RUNTIMES
 
 
 # ── 社区聚合引擎（Phase 1：OpenCLI 渠道 + last30days）─────────────────

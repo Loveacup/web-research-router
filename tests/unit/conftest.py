@@ -50,9 +50,10 @@ def mk_results(n=1):
 
 
 class FakeResponse:
-    def __init__(self, data, text=""):
+    def __init__(self, data, text="", headers=None):
         self._data = data
         self.text = text
+        self.headers = headers or {}
 
     def raise_for_status(self):
         return None
@@ -66,9 +67,12 @@ class FakeAsyncClient:
     captured = []
     response_data = {}
     response_text = ""
+    response_headers = {}
 
     def __init__(self, *a, **kw):
-        pass
+        self.args = a
+        self.kwargs = kw
+        FakeAsyncClient.captured.append({"method": "INIT", "args": a, "kwargs": kw})
 
     async def __aenter__(self):
         return self
@@ -76,10 +80,12 @@ class FakeAsyncClient:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, headers=None, json=None):
+    async def post(self, url, headers=None, json=None, timeout=None):
         FakeAsyncClient.captured.append({"method": "POST", "url": url, "json": json})
-        return FakeResponse(FakeAsyncClient.response_data, FakeAsyncClient.response_text)
+        return FakeResponse(FakeAsyncClient.response_data, FakeAsyncClient.response_text,
+                           FakeAsyncClient.response_headers)
 
-    async def get(self, url, params=None, headers=None):
+    async def get(self, url, params=None, headers=None, timeout=None):
         FakeAsyncClient.captured.append({"method": "GET", "url": url, "params": params})
-        return FakeResponse(FakeAsyncClient.response_data, FakeAsyncClient.response_text)
+        return FakeResponse(FakeAsyncClient.response_data, FakeAsyncClient.response_text,
+                           FakeAsyncClient.response_headers)

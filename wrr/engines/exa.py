@@ -75,7 +75,7 @@ def get_search_mode(options: SearchOptions) -> str:
 
 def get_timeout_for_mode(mode: str) -> float:
     """根据模式返回超时时间。"""
-    return config.EXA_MODE_TIMEOUT.get(mode, 5.0)
+    return config.EXA_MODE_TIMEOUT.get(mode, config.EXA_MODE_TIMEOUT["auto"])
 
 
 def _contents_block() -> dict:

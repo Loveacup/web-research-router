@@ -42,9 +42,9 @@ def parse_link_last(resp) -> int:
 class GitHubClient:
     """共享 GitHub REST/GraphQL 客户端。需 GITHUB_TOKEN（code search 强制认证）。"""
 
-    def __init__(self, token: Optional[str] = None, timeout: float = 15.0):
+    def __init__(self, token: Optional[str] = None, timeout: Optional[float] = None):
         self._token = token
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else config.GITHUB_CLIENT_TIMEOUT
         self._repo_cache: Dict[str, Dict[str, Any]] = {}   # repo 元数据缓存（按 full_name）
 
     def _key(self) -> str:

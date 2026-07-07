@@ -15,7 +15,7 @@ from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
 from .errors import EngineError, AllEnginesFailedError
-from .schemas import FallbackStep, RouterResult, SearchResult
+from .schemas import DiagnosticEvent, FallbackStep, RouteTrace, RouterResult, SearchResult
 
 
 class SearchRegistry(Protocol):
@@ -78,41 +78,103 @@ async def route(operation: str, options, registry: SearchRegistry,
     if operation == "search" and chain and chain[0] == "community":
         budget = max(budget, config.ENGINE_TIMEOUT.get("community", config.DEFAULT_ENGINE_TIMEOUT))
     steps: List[FallbackStep] = []
+    events: List[DiagnosticEvent] = []
     start = time.monotonic()
     actual: Optional[str] = None
     payload: Any = None
 
     for provider in chain:
-        elapsed = time.monotonic() - start
+        step_start = time.monotonic()
+        elapsed = step_start - start
         if elapsed > budget:
-            steps.append(FallbackStep(provider, False, 0, "budget exceeded (skipped)"))
+            step = FallbackStep(provider, False, 0, "budget exceeded (skipped)")
+            steps.append(step)
+            event = DiagnosticEvent(
+                engine=provider, ok=False, category=operation,
+                elapsed_ms=0.0, count=0, message=step.error
+            )
+            events.append(event)
             continue
         engine = registry.get(provider)
         if engine is None:
-            steps.append(FallbackStep(provider, False, 0, f"unknown provider: {provider}"))
+            step = FallbackStep(provider, False, 0, f"unknown provider: {provider}")
+            steps.append(step)
+            event = DiagnosticEvent(
+                engine=provider, ok=False, category=operation,
+                elapsed_ms=_elapsed_ms(step_start), count=0, message=step.error
+            )
+            events.append(event)
             continue
         remaining = budget - elapsed
         per_engine = min(engine.timeout, max(0.1, remaining))
         try:
             result = await asyncio.wait_for(_invoke(engine, operation, options), timeout=per_engine)
+            step_elapsed = _elapsed_ms(step_start)
             if _is_empty(operation, result):
-                steps.append(FallbackStep(provider, False, 0, "empty result"))
+                step = FallbackStep(provider, False, 0, "empty result")
+                steps.append(step)
+                event = DiagnosticEvent(
+                    engine=provider, ok=False, category=operation,
+                    elapsed_ms=step_elapsed, timeout_ms=per_engine * 1000.0,
+                    count=0, message=step.error
+                )
+                events.append(event)
                 continue
-            steps.append(FallbackStep(provider, True, _count(operation, result)))
+            count = _count(operation, result)
+            step = FallbackStep(provider, True, count)
+            steps.append(step)
+            event = DiagnosticEvent(
+                engine=provider, ok=True, category=operation,
+                elapsed_ms=step_elapsed, timeout_ms=per_engine * 1000.0,
+                count=count
+            )
+            events.append(event)
             actual, payload = provider, result
             break
         except asyncio.TimeoutError:
-            steps.append(FallbackStep(provider, False, 0, f"timeout >{per_engine:.1f}s"))
+            step_elapsed = _elapsed_ms(step_start)
+            step = FallbackStep(provider, False, 0, f"timeout >{per_engine:.1f}s")
+            steps.append(step)
+            event = DiagnosticEvent(
+                engine=provider, ok=False, category=operation,
+                elapsed_ms=step_elapsed, timeout_ms=per_engine * 1000.0,
+                count=0, message="timeout"
+            )
+            events.append(event)
         except EngineError as e:
-            steps.append(FallbackStep(provider, False, 0, str(e) or type(e).__name__))
+            step_elapsed = _elapsed_ms(step_start)
+            step = FallbackStep(provider, False, 0, str(e) or type(e).__name__)
+            steps.append(step)
+            event = DiagnosticEvent(
+                engine=provider, ok=False, category=operation,
+                elapsed_ms=step_elapsed, count=0, message=step.error
+            )
+            events.append(event)
         except Exception as e:  # 引擎内部未归一的异常也不该让整链崩
-            steps.append(FallbackStep(provider, False, 0, str(e) or type(e).__name__))
+            step_elapsed = _elapsed_ms(step_start)
+            step = FallbackStep(provider, False, 0, str(e) or type(e).__name__)
+            steps.append(step)
+            event = DiagnosticEvent(
+                engine=provider, ok=False, category=operation,
+                elapsed_ms=step_elapsed, count=0, message=step.error
+            )
+            events.append(event)
 
     if actual is None:
         reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps)
         raise AllEnginesFailedError(f"All engines failed for {operation}:\n{reasons}")
 
-    return RouterResult(actual_provider=actual, payload=payload, fallback_chain=steps)
+    route_elapsed = _elapsed_ms(start)
+    trace = RouteTrace(
+        mode=None,
+        mode_reason="v4_fallback_chain",
+        selected_engines=chain,
+        events=events,
+        elapsed_ms=route_elapsed,
+        timeout_ms=budget * 1000.0,
+    )
+    return RouterResult(actual_provider=actual, payload=payload, fallback_chain=steps,
+                        diagnostics=trace)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -132,39 +194,88 @@ def resolve_mode(options) -> str:
     return config.classify_intent(getattr(options, "query", "") or "")
 
 
+def _elapsed_ms(start: float) -> float:
+    """计算从 start 到现在的毫秒数。"""
+    return (time.monotonic() - start) * 1000.0
+
+
+def _event_from_step(step: FallbackStep, elapsed_ms: float, timeout_ms: Optional[float]) -> DiagnosticEvent:
+    """从 FallbackStep 构造 DiagnosticEvent。"""
+    return DiagnosticEvent(
+        engine=step.provider,
+        ok=step.ok,
+        category="search",
+        elapsed_ms=elapsed_ms,
+        timeout_ms=timeout_ms,
+        count=step.count,
+        message=step.error,
+    )
+
+
 async def _run_engine(registry, name, options, budget):
-    """跑单引擎 search，超时/异常隔离，返回 (name, results_or_None, FallbackStep)。"""
+    """跑单引擎 search，超时/异常隔离，返回 (name, results_or_None, FallbackStep, DiagnosticEvent)。"""
+    start = time.monotonic()
     engine = registry.get(name)
     if engine is None:
-        return name, None, FallbackStep(name, False, 0, f"unknown provider: {name}")
+        step = FallbackStep(name, False, 0, f"unknown provider: {name}")
+        event = DiagnosticEvent(
+            engine=name, ok=False, category="search",
+            elapsed_ms=_elapsed_ms(start), count=0, message=step.error
+        )
+        return name, None, step, event
     try:
         per_engine = min(engine.timeout, max(0.1, budget))
         res = await asyncio.wait_for(engine.search(options), timeout=per_engine)
+        elapsed = _elapsed_ms(start)
         if not res:
-            return name, None, FallbackStep(name, False, 0, "empty result")
-        return name, res, FallbackStep(name, True, len(res))
+            step = FallbackStep(name, False, 0, "empty result")
+            event = DiagnosticEvent(
+                engine=name, ok=False, category="search",
+                elapsed_ms=elapsed, timeout_ms=per_engine * 1000.0, count=0, message=step.error
+            )
+            return name, None, step, event
+        step = FallbackStep(name, True, len(res))
+        event = DiagnosticEvent(
+            engine=name, ok=True, category="search",
+            elapsed_ms=elapsed, timeout_ms=per_engine * 1000.0, count=len(res)
+        )
+        return name, res, step, event
     except asyncio.TimeoutError:
-        return name, None, FallbackStep(name, False, 0, "timeout")
+        elapsed = _elapsed_ms(start)
+        step = FallbackStep(name, False, 0, "timeout")
+        event = DiagnosticEvent(
+            engine=name, ok=False, category="search",
+            elapsed_ms=elapsed, timeout_ms=engine.timeout * 1000.0, count=0, message="timeout"
+        )
+        return name, None, step, event
     except Exception as e:                       # 单引擎异常不拖垮整组
-        return name, None, FallbackStep(name, False, 0, str(e) or type(e).__name__)
+        elapsed = _elapsed_ms(start)
+        step = FallbackStep(name, False, 0, str(e) or type(e).__name__)
+        event = DiagnosticEvent(
+            engine=name, ok=False, category="search",
+            elapsed_ms=elapsed, count=0, message=step.error
+        )
+        return name, None, step, event
 
 
 async def _dispatch(registry, engine_names, options, weights, mode, budget):
-    """并行发射一组引擎 → 跨源 RRF 融合 → canonical 去重。返回 (payload, steps)。"""
+    """并行发射一组引擎 → 跨源 RRF 融合 → canonical 去重。返回 (payload, steps, events)。"""
     results = await asyncio.gather(
         *[_run_engine(registry, n, options, budget) for n in engine_names])
     per_source: Dict[str, List[SearchResult]] = {}
     steps: List[FallbackStep] = []
-    for name, res, step in results:
+    events: List[DiagnosticEvent] = []
+    for name, res, step, event in results:
         steps.append(step)
+        events.append(event)
         if res:
             per_source[name] = res
     if not per_source:
-        return None, steps
+        return None, steps, events
     fused = _fusion.rrf_fuse(per_source, k=config.RRF_K, weights=weights)
     deduped = _fusion.dedup_cluster([f["doc"] for f in fused],
                                     config.COMMUNITY_DEDUP_THRESHOLD)
-    return deduped[:options.count], steps
+    return deduped[:options.count], steps, events
 
 
 def _v6_router_enabled(env: Optional[Dict[str, str]] = None) -> bool:
@@ -210,6 +321,7 @@ async def route_search_v5(
 
     显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
     """
+    route_start = time.monotonic()
     registry = _route_registry(
         registry,
         descriptor_registry_factory=descriptor_registry_factory,
@@ -221,11 +333,12 @@ async def route_search_v5(
         return await route("search", options, registry, explicit_provider=explicit)
 
     mode = resolve_mode(options)
+    mode_reason = "explicit" if getattr(options, "mode", None) in _V5_MODES else "classify_intent"
     budget = config.budget_for("search")
     weights = config.MODE_WEIGHTS.get(mode, config.MODE_WEIGHTS["grounding"])
     engine_names = config.mode_engines(mode, getattr(options, "query", "") or "")
 
-    payload, steps = await _dispatch(registry, engine_names, options, weights, mode, budget)
+    payload, steps, events = await _dispatch(registry, engine_names, options, weights, mode, budget)
 
     # v5.3 全量陈旧门控：local mode 下所有结果 freshness < 0.8 → 追加外网交叉
     if mode == "local" and payload is not None:
@@ -235,31 +348,66 @@ async def route_search_v5(
                 web_mode = "discovery"
             web_engines = config.mode_engines(web_mode, getattr(options, "query", "") or "")
             web_weights = config.MODE_WEIGHTS.get(web_mode, config.MODE_WEIGHTS["grounding"])
-            wpayload, wsteps = await _dispatch(registry, web_engines, options, web_weights,
+            wpayload, wsteps, wevents = await _dispatch(registry, web_engines, options, web_weights,
                                                web_mode, budget)
             steps.extend(wsteps)
+            events.extend(wevents)
             if wpayload is not None:
                 # 合并：web 结果在前（更新），本地垫后
                 payload = wpayload + payload
 
     # 主 mode 空 → recovery 兜底（Brave + Exa + SearXNG）
     if payload is None and mode != "recovery":
+        if not config.recovery_allowed():
+            route_elapsed = _elapsed_ms(route_start)
+            trace = RouteTrace(
+                mode=mode,
+                mode_reason="recovery_blocked",
+                selected_engines=engine_names,
+                events=events,
+                elapsed_ms=route_elapsed,
+                timeout_ms=budget * 1000.0,
+            )
+            reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
+            raise AllEnginesFailedError(
+                f"All engines failed for search (mode={mode}) and recovery is blocked in this runtime:\n{reasons}"
+            )
         rec_weights = config.MODE_WEIGHTS["recovery"]
         rec_names = config.mode_engines("recovery", getattr(options, "query", "") or "")
-        rpayload, rsteps = await _dispatch(registry, rec_names, options, rec_weights,
+        rpayload, rsteps, revents = await _dispatch(registry, rec_names, options, rec_weights,
                                            "recovery", budget)
         steps.extend(rsteps)
+        events.extend(revents)
         if rpayload is not None:
+            route_elapsed = _elapsed_ms(route_start)
+            trace = RouteTrace(
+                mode="recovery",
+                mode_reason="recovery_fallback",
+                selected_engines=rec_names,
+                events=events,
+                elapsed_ms=route_elapsed,
+                timeout_ms=budget * 1000.0,
+            )
             return RouterResult(actual_provider=f"rrf:recovery", payload=rpayload,
                                 fallback_chain=steps, mode="recovery",
-                                fusion_method="rrf", weights=dict(rec_weights))
-        mode_for_err = mode
+                                fusion_method="rrf", weights=dict(rec_weights),
+                                diagnostics=trace)
 
     if payload is None:
         reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
         raise AllEnginesFailedError(f"All engines failed for search (mode={mode}):\n{reasons}")
 
+    route_elapsed = _elapsed_ms(route_start)
+    trace = RouteTrace(
+        mode=mode,
+        mode_reason=mode_reason,
+        selected_engines=engine_names,
+        events=events,
+        elapsed_ms=route_elapsed,
+        timeout_ms=budget * 1000.0,
+    )
     used = {n: weights.get(n, 1.0) for n in engine_names}
     return RouterResult(actual_provider=f"rrf:{mode}", payload=payload,
                         fallback_chain=steps, mode=mode,
-                        fusion_method="rrf", weights=used)
+                        fusion_method="rrf", weights=used,
+                        diagnostics=trace)

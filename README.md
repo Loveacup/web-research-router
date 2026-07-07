@@ -2,7 +2,7 @@
 
 Semantic search router with mode-based routing, 11 engines, and Reciprocal Rank Fusion.
 
-**Current version:** 6.1.0 — v6.1 Engine Health Policy is released and the v6 descriptor-backed router is the default path (`WRR_V6_ROUTER=1`).
+**Current version:** 6.1.1 — v6.1 Engine Health Policy is released and the v6 descriptor-backed router is the default path (`WRR_V6_ROUTER=1`). P1 control-plane hardening (profile matrix, diagnostics, recovery runtime gate, OpenCLI status strict matching, GitHub fast-mode dynamic switching, academic client reuse) is documented in `RELEASE_NOTES_v6.1.1.md`.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ wrr search "your query"      # Hermes runtime tool entrypoint
 
 ## Packaging & install
 
-Three interchangeable entrypoints share one codebase at package version `6.1.0`:
+Three interchangeable entrypoints share one codebase at package version `6.1.1`:
 
 ```bash
 # 1) pip install — exposes the `wrr` console script ([project.scripts] wrr = wrr._cli:main).
@@ -73,7 +73,7 @@ wrr doctor --v6 --json --runtime standalone
 ./wrr-cli.py search "your query" --provider exa --count 5
 
 # 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
-#    plugin.yaml `version` is kept aligned with the package version (6.1.0).
+#    plugin.yaml `version` is kept aligned with the package version (6.1.1).
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ```
 
@@ -135,6 +135,25 @@ A future browser-harness fallback may fill community gaps when OpenCLI is unavai
 Slice 1 (committed) introduces the source adapter seam (`wrr/engines/community_sources.py`)
 and a disabled policy scaffold (`wrr/engines/community_policy.py`). No real browser
 automation is wired into the search hot path; the fallback remains a v6.x candidate.
+
+### v6.1.1 — P1 control-plane hardening (released)
+
+- `wrr-cli.py doctor --v6 --profile-matrix --json` — per-profile readiness
+  across `hermes` / `claude_code` / `codex` / `omp`; control-plane only;
+  `--engine` / `--tier` / `--deep` rejected.
+- `RouterResult.diagnostics` carries `RouteTrace` (mode / mode_reason /
+  engines / events / timing) for every search call.
+- `config.recovery_allowed(runtime)` gates the search recovery fallback.
+  Default allowed: `hermes`, `claude_code`, `codex`, `omp`. Override with
+  `WRR_RECOVERY_ALLOWED_RUNTIMES=hermes,omp,...`.
+- `config.github_fast_mode(env_resolver=...)` — runtime-switchable fast-mode
+  decision (no module reload required).
+- OpenCLI daemon status now requires `daemon: running` + `extension: connected`;
+  `not running` / `disconnected` are explicit failure markers.
+- `AcademicEngine.search()` reuses one `httpx.AsyncClient` across OpenAlex /
+  Semantic Scholar / arXiv.
+
+See `RELEASE_NOTES_v6.1.1.md` for the full QA matrix.
 
 ## Dependencies (13 total)
 

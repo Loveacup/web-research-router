@@ -2,6 +2,7 @@
 
 验证文档记录的「Exa 四模式自动路由」特性确实按设计工作。
 """
+import importlib
 from wrr.engines import exa as exa_mod
 from wrr.schemas import SearchOptions
 from wrr import config
@@ -47,4 +48,57 @@ def test_get_search_mode_unknown_explicit_mode_falls_back_to_auto():
 
 def test_get_timeout_for_mode():
     assert exa_mod.get_timeout_for_mode("deep") == config.EXA_MODE_TIMEOUT["deep"]
-    assert exa_mod.get_timeout_for_mode("unknown-mode") == 5.0   # 兜底默认
+    assert exa_mod.get_timeout_for_mode("unknown-mode") == config.EXA_MODE_TIMEOUT["auto"]   # 兜底默认
+
+
+def test_exa_global_timeout_can_be_overridden_from_env(monkeypatch):
+    monkeypatch.setenv("WRR_EXA_TIMEOUT", "42")
+    importlib.reload(config)
+    import wrr.engines.exa as exa_mod_reloaded
+    importlib.reload(exa_mod_reloaded)
+
+    assert config.EXA_TIMEOUT == 42.0
+    assert config.ENGINE_TIMEOUT["exa"] == 42.0
+    assert exa_mod_reloaded.ExaEngine().timeout == 42.0
+
+    # 清理：恢复默认状态
+    monkeypatch.delenv("WRR_EXA_TIMEOUT", raising=False)
+    importlib.reload(config)
+
+
+def test_exa_mode_timeouts_can_be_overridden_from_env(monkeypatch):
+    monkeypatch.setenv("WRR_EXA_MODE_FAST_TIMEOUT", "4")
+    monkeypatch.setenv("WRR_EXA_MODE_AUTO_TIMEOUT", "6")
+    monkeypatch.setenv("WRR_EXA_MODE_DEEPLITE_TIMEOUT", "9")
+    monkeypatch.setenv("WRR_EXA_MODE_DEEP_TIMEOUT", "22")
+
+    importlib.reload(config)
+    import wrr.engines.exa as exa_mod_reloaded
+    importlib.reload(exa_mod_reloaded)
+
+    assert config.EXA_MODE_TIMEOUT["fast"] == 4.0
+    assert config.EXA_MODE_TIMEOUT["auto"] == 6.0
+    assert config.EXA_MODE_TIMEOUT["deep-lite"] == 9.0
+    assert config.EXA_MODE_TIMEOUT["deep"] == 22.0
+    assert exa_mod_reloaded.get_timeout_for_mode("deep") == 22.0
+    assert exa_mod_reloaded.get_timeout_for_mode("unknown-mode") == 6.0
+
+    # 清理
+    monkeypatch.delenv("WRR_EXA_MODE_FAST_TIMEOUT", raising=False)
+    monkeypatch.delenv("WRR_EXA_MODE_AUTO_TIMEOUT", raising=False)
+    monkeypatch.delenv("WRR_EXA_MODE_DEEPLITE_TIMEOUT", raising=False)
+    monkeypatch.delenv("WRR_EXA_MODE_DEEP_TIMEOUT", raising=False)
+    importlib.reload(config)
+
+
+def test_exa_deep_default_is_less_tight_than_previous_10s():
+    # 无 env 覆盖状态下 reload
+    importlib.reload(config)
+    import wrr.engines.exa as exa_mod_reloaded
+    importlib.reload(exa_mod_reloaded)
+
+    assert config.EXA_MODE_TIMEOUT["deep"] >= 15.0
+    # 严格递增验证
+    assert config.EXA_MODE_TIMEOUT["fast"] < config.EXA_MODE_TIMEOUT["auto"]
+    assert config.EXA_MODE_TIMEOUT["auto"] < config.EXA_MODE_TIMEOUT["deep-lite"]
+    assert config.EXA_MODE_TIMEOUT["deep-lite"] < config.EXA_MODE_TIMEOUT["deep"]

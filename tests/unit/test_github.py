@@ -109,9 +109,10 @@ def test_search_maps_ranks_and_cleans_query():
             SearchOptions("asyncio site:github.com", count=2)))
     finally:
         config.GITHUB_ACTIVITY_LOOKUP = True
-    # 触发词被剥离
-    assert FakeAsyncClient.captured[0]["params"]["q"] == "asyncio"
-    assert FakeAsyncClient.captured[0]["params"]["per_page"] == 2
+    # 触发词被剥离（跳过 INIT 记录，找到第一个 GET 请求）
+    get_requests = [r for r in FakeAsyncClient.captured if r.get("method") == "GET"]
+    assert get_requests[0]["params"]["q"] == "asyncio"
+    assert get_requests[0]["params"]["per_page"] == 2
     # 综合评分重排：hot 在前
     assert out[0].title == "org/hot"
     assert out[1].title == "org/cold"
@@ -188,3 +189,64 @@ def test_auto_trigger_promotes_github():
         ["github", "exa", "brave", "community", "searxng"]
     assert build_chain("search", None, "plain") == \
         ["exa", "brave", "github", "community", "searxng"]
+
+
+# ── 环境变量超时配置测试 ─────────────────────────────────────────────
+def test_github_timeout_can_be_overridden_from_env(monkeypatch):
+    import importlib
+    monkeypatch.setenv("WRR_GITHUB_TIMEOUT", "7.5")
+    importlib.reload(config)
+    assert config.ENGINE_TIMEOUT["github"] == 7.5
+    assert gh.GitHubEngine().timeout == 7.5
+    importlib.reload(config)
+
+
+def test_activity_timeout_and_lookup_env_overrides(monkeypatch):
+    import importlib
+    monkeypatch.setenv("WRR_GITHUB_ACTIVITY_TIMEOUT", "1.5")
+    monkeypatch.setenv("WRR_GITHUB_ACTIVITY_LOOKUP", "0")
+    importlib.reload(config)
+    assert config.GITHUB_ACTIVITY_LOOKUP_TIMEOUT == 1.5
+    assert config.GITHUB_ACTIVITY_LOOKUP is False
+    counts = run(gh.GitHubEngine()._fetch_activity(None, {}, [{"full_name": "a/b"}]))
+    assert counts == [None]
+    importlib.reload(config)
+
+
+def test_fetch_activity_limits_concurrency_and_timeout():
+    class _Resp:
+        def __init__(self, headers, body):
+            self.headers = headers
+            self._b = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._b
+
+    captured_timeouts = []
+    max_concurrent = [0]
+    current_concurrent = [0]
+
+    class _Client:
+        async def get(self, url, params=None, headers=None, timeout=None, **kwargs):
+            captured_timeouts.append(timeout)
+            current_concurrent[0] += 1
+            max_concurrent[0] = max(max_concurrent[0], current_concurrent[0])
+            await asyncio.sleep(0.01)
+            current_concurrent[0] -= 1
+            return _Resp({}, [])
+
+    import importlib
+    old_concurrency = config.GITHUB_ACTIVITY_CONCURRENCY
+    config.GITHUB_ACTIVITY_CONCURRENCY = 2
+    try:
+        items = [{"full_name": f"o/r{i}"} for i in range(5)]
+        eng = gh.GitHubEngine()
+        run(eng._fetch_activity(_Client(), {}, items))
+        assert max_concurrent[0] <= 2
+        assert all(t == config.GITHUB_ACTIVITY_LOOKUP_TIMEOUT for t in captured_timeouts)
+    finally:
+        config.GITHUB_ACTIVITY_CONCURRENCY = old_concurrency
+        importlib.reload(config)

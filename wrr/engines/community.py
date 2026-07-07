@@ -214,11 +214,13 @@ async def _probe_opencli_status(timeout: float = 2.0) -> Tuple[bool, str]:
     text = (out + err).lower()
     if rc != 0 or not text.strip():
         return (False, "opencli daemon not running")
+    if "daemon: not running" in text or "not running" in text:
+        return (False, "opencli daemon not running")
     disconnected_markers = ("disconnected", "not connected", "browser_connect",
                             "browser bridge extension not connected")
     if any(m in text for m in disconnected_markers):
         return (False, "OpenCLI browser extension not connected")
-    if "connected" in text and "extension" in text:
+    if "daemon: running" in text and "extension: connected" in text:
         return (True, "opencli ready")
     return (False, f"opencli status unknown: {(out + err)[:200]}")
 
@@ -332,14 +334,8 @@ class CommunityEngine(SearchEngine):
         adapter = _SOURCE_ADAPTERS.get(cfg["kind"])
         if adapter is None:
             return []
-        # 1s read-only preflight is required because opencli search hangs for
-        # tens of seconds when the browser extension is disconnected and does
-        # not emit BROWSER_CONNECT to stderr quickly enough for streaming
-        # abort. It only runs `opencli daemon status` and never restarts.
-        if cfg["kind"] == "opencli":
-            ok, reason = await _probe_opencli_status(timeout=1.0)
-            if not ok:
-                raise EngineError(f"community: {reason}")
+        # H3 refactor: opencli preflight removed from search hot path.
+        # Daemon/extension health is checked by health_check() only.
         try:
             # 在调用点解析模块级 _run_cmd，保留单测 monkeypatch 语义。
             items = await adapter.fetch(

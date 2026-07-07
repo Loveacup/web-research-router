@@ -48,3 +48,30 @@ def test_format_error_shape():
     out = json.loads(format_error("web_search", "q", ValueError("boom")))
     assert "web_search failed" in out["error"]
     assert out["details"]["identifier"] == "q"
+
+
+def test_format_search_includes_diagnostics():
+    """format_search 应在 details 中包含 diagnostics（如果存在）。"""
+    from wrr.schemas import RouteTrace, DiagnosticEvent
+    trace = RouteTrace(
+        mode="grounding",
+        mode_reason="classify_intent",
+        selected_engines=["exa", "brave"],
+        events=[
+            DiagnosticEvent(engine="exa", ok=True, category="search", elapsed_ms=100.5, count=2),
+            DiagnosticEvent(engine="brave", ok=False, category="search", elapsed_ms=50.2, count=0, message="timeout"),
+        ],
+        elapsed_ms=150.7,
+        timeout_ms=10000.0,
+    )
+    rr = RouterResult("exa", mk_results(2), [FallbackStep("exa", True, 2)], diagnostics=trace)
+    out = json.loads(format_search(rr, "q"))
+    assert "diagnostics" in out["details"]
+    d = out["details"]["diagnostics"]
+    assert d["mode"] == "grounding"
+    assert d["mode_reason"] == "classify_intent"
+    assert d["selected_engines"] == ["exa", "brave"]
+    assert len(d["events"]) == 2
+    assert d["events"][0]["engine"] == "exa"
+    assert d["events"][0]["ok"] is True
+    assert d["elapsed_ms"] == 150.7

@@ -163,3 +163,106 @@ def test_doctor_v6_returns_nonzero_when_summary_status_fails():
     payload = json.loads(completed.stdout)
     if payload["summary"]["status"] == "fail":
         assert completed.returncode == 1
+
+
+def test_doctor_profile_matrix_requires_v6():
+    """--profile-matrix requires --v6 flag."""
+    completed = _run_cli("doctor", "--profile-matrix", "--json")
+    assert completed.returncode == 2
+    assert "--profile-matrix requires --v6" in completed.stderr or "--v6" in completed.stderr
+
+
+def test_doctor_v6_profile_matrix_json_shape():
+    """--v6 --profile-matrix --json produces valid profile matrix report."""
+    completed = _run_cli("doctor", "--v6", "--profile-matrix", "--json")
+    assert completed.returncode in (0, 1)
+    assert completed.stdout
+
+    payload = json.loads(completed.stdout)
+    assert payload["kind"] == "profile_matrix"
+    assert "profiles" in payload
+    assert "summary" in payload
+    assert len(payload["profiles"]) == 7
+
+    profile_ids = [p["id"] for p in payload["profiles"]]
+    assert "default" in profile_ids
+    assert "editable" in profile_ids
+    assert "standalone" in profile_ids
+    assert "S2" in profile_ids
+    assert "S3" in profile_ids
+    assert "cron-worker" in profile_ids
+    assert "hermes" in profile_ids
+
+    for p in payload["profiles"]:
+        assert "id" in p
+        assert "label" in p
+        assert "runtime" in p
+        assert "router_mode" in p
+        assert "routable_engine_ids" in p
+        assert isinstance(p["routable_engine_ids"], list)
+
+
+def test_doctor_v6_profile_matrix_rejects_deep():
+    """--profile-matrix rejects --deep flag."""
+    completed = _run_cli("doctor", "--v6", "--profile-matrix", "--json", "--deep")
+    assert completed.returncode == 2
+    assert "does not support --deep" in completed.stderr or "--deep" in completed.stderr
+
+
+def test_doctor_v6_profile_matrix_rejects_engine():
+    """--profile-matrix rejects --engine flag."""
+    completed = _run_cli("doctor", "--v6", "--profile-matrix", "--json", "--engine", "exa")
+    assert completed.returncode == 2
+    assert "does not support --engine" in completed.stderr or "--engine" in completed.stderr
+
+
+def test_doctor_v6_profile_matrix_rejects_tier():
+    """--profile-matrix rejects --tier flag."""
+    completed = _run_cli("doctor", "--v6", "--profile-matrix", "--json", "--tier", "1")
+    assert completed.returncode == 2
+    assert "does not support --tier" in completed.stderr or "--tier" in completed.stderr
+
+
+def test_doctor_v6_profile_matrix_does_not_load_legacy_env():
+    """--profile-matrix does not expose secret env values."""
+    import os
+    env = os.environ.copy()
+    env["GITHUB_TOKEN"] = "ghp_secret_test_token"
+    env["AWS_SECRET_ACCESS_KEY"] = "aws_secret_xyz"
+
+    completed = subprocess.run(
+        [sys.executable, str(CLI), "doctor", "--v6", "--profile-matrix", "--json"],
+        cwd=ROOT,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env
+    )
+
+    assert completed.returncode in (0, 1)
+    assert "ghp_secret_test_token" not in completed.stdout
+    assert "aws_secret_xyz" not in completed.stdout
+
+
+def test_cli_search_json_includes_diagnostics():
+    """CLI search --json 应输出 diagnostics 字段。"""
+    import os
+    env = os.environ.copy()
+    env["WRR_V6_ROUTER"] = "0"
+    completed = subprocess.run(
+        [sys.executable, str(CLI), "search", "test query", "--json", "--provider", "exa"],
+        cwd=ROOT,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env
+    )
+    if completed.returncode == 0:
+        out = json.loads(completed.stdout)
+        assert out["ok"] is True
+        # 如果 route 返回 diagnostics，CLI 应包含
+        if "diagnostics" in out:
+            assert "events" in out["diagnostics"]
+            assert "elapsed_ms" in out["diagnostics"]

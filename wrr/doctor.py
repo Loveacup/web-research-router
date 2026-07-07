@@ -188,6 +188,7 @@ class DoctorReport:
     summary: dict[str, Any]
     trust_project: bool
     findings: tuple[dict[str, Any], ...] = ()
+    state_file: str | Path | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,7 +196,7 @@ class DoctorReport:
             "env": _env_report(self.env, self.resolved),
             "discovered": [item.to_dict() for item in self.discovered],
             "resolved": [item.to_dict() for item in self.resolved],
-            "health": [item.to_dict() for item in self.health],
+            "health": _health_with_cache_age(self.health, self.state_file),
             "findings": list(self.findings),
             "summary": dict(self.summary),
             "trust": {"project": self.trust_project},
@@ -215,28 +216,26 @@ def doctor_v6(
 ) -> DoctorReport:
     """Run the additive v6 doctor without changing legacy doctor behavior."""
 
-    from .cli.install import _filtered_env, _required_env
-    from .engines.loader import discover_engine_plugins
     from .engines.registry import EngineRegistry as V6EngineRegistry
-    from .runtime.detect import detect_runtime
-    from .runtime.env import load_env
+    from .runtime.control_plane import prepare_control_plane_env
 
     del json
 
     resolved_cwd = Path.cwd() if cwd is None else Path(cwd)
     process_env = os.environ if env is None else env
-    runtime = detect_runtime(explicit=runtime_hint, cwd=resolved_cwd, env=process_env)
-    paths = tuple(plugin_paths or (resolved_cwd / "plugins" / "engines",))
-    discoveries = tuple(
-        discover_engine_plugins(paths, include_builtin=True, trust_project=trust_project)
-    )
-    required_env = _required_env(discoveries)
-    env_snapshot = load_env(
-        runtime,
-        overrides=_filtered_env(process_env, required_env),
+    control = prepare_control_plane_env(
+        runtime_hint=runtime_hint,
+        cwd=resolved_cwd,
+        process_env=process_env,
         env_files=env_files,
+        plugin_paths=plugin_paths,
+        include_builtin=True,
         trust_project=trust_project,
     )
+    runtime = control.runtime
+    paths = control.plugin_paths
+    discoveries = control.discoveries
+    env_snapshot = control.env
     registry = V6EngineRegistry(
         runtime=runtime,
         env=env_snapshot,
@@ -295,6 +294,27 @@ def _summarize_v6(report: Any) -> dict[str, Any]:
         "cooldown": health_counts.get("cooldown", 0),
         "routable": len(report.routable),
     }
+
+
+def _health_with_cache_age(
+    health_items: Iterable[Any],
+    state_file: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """给每个 health item 附加 health_cache_age_ms 和 health_cache_expires_at（从 state 只读）。"""
+    from .runtime.state import get_cached_health_meta
+
+    result = []
+    for item in health_items:
+        item_dict = item.to_dict()
+        engine_id = item_dict.get("engine_id")
+        capability = item_dict.get("capability")
+        if engine_id and capability:
+            meta = get_cached_health_meta(engine_id, capability, path=state_file)
+            if meta:
+                item_dict["health_cache_age_ms"] = round(meta["age_ms"], 2)
+                item_dict["health_cache_expires_at"] = meta["expires_at"]
+        result.append(item_dict)
+    return result
 
 
 def _env_report(env: Any, resolved: Iterable[Any]) -> dict[str, Any]:
@@ -394,3 +414,193 @@ def _relevant_env_names(resolved: Iterable[Any]) -> set[str]:
             if isinstance(aliases, list):
                 names.update(str(alias) for alias in aliases if alias)
     return names
+
+
+# ── v6 profile matrix ──
+
+
+@dataclass(frozen=True)
+class DoctorProfile:
+    """Profile configuration for doctor matrix diagnostic."""
+    id: str
+    label: str
+    runtime_hint: str | None
+    trust_project: bool
+    env_files: Sequence[str | Path] | None
+
+
+def default_doctor_profiles(
+    *,
+    runtime_hint: str | None,
+    trust_project: bool,
+) -> tuple[DoctorProfile, ...]:
+    """Return default doctor profiles for profile matrix diagnostic."""
+    return (
+        DoctorProfile(
+            id="default",
+            label="Default (caller context)",
+            runtime_hint=runtime_hint,
+            trust_project=trust_project,
+            env_files=None,
+        ),
+        DoctorProfile(
+            id="editable",
+            label="Editable install (trusted)",
+            runtime_hint="editable",
+            trust_project=True,
+            env_files=None,
+        ),
+        DoctorProfile(
+            id="standalone",
+            label="Standalone (untrusted)",
+            runtime_hint="standalone",
+            trust_project=False,
+            env_files=None,
+        ),
+        DoctorProfile(
+            id="S2",
+            label="S2 codex (untrusted)",
+            runtime_hint="codex",
+            trust_project=False,
+            env_files=None,
+        ),
+        DoctorProfile(
+            id="S3",
+            label="S3 hermes (untrusted)",
+            runtime_hint="hermes",
+            trust_project=False,
+            env_files=None,
+        ),
+        DoctorProfile(
+            id="cron-worker",
+            label="Cron worker (standalone, untrusted)",
+            runtime_hint="standalone",
+            trust_project=False,
+            env_files=None,
+        ),
+        DoctorProfile(
+            id="hermes",
+            label="Hermes runtime (untrusted)",
+            runtime_hint="hermes",
+            trust_project=False,
+            env_files=None,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class ProfileMatrixReport:
+    """Profile matrix diagnostic report."""
+    kind: str = "profile_matrix"
+    profiles: list[dict[str, Any]] = None
+    summary: dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.profiles is None:
+            object.__setattr__(self, "profiles", [])
+        if self.summary is None:
+            object.__setattr__(self, "summary", {})
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "profiles": list(self.profiles),
+            "summary": dict(self.summary),
+        }
+
+
+def doctor_profile_matrix(
+    *,
+    json: bool = True,
+    deep: bool = False,
+    trust_project: bool = False,
+    runtime_hint: str | None = None,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    env_files: Sequence[str | Path] | None = None,
+    plugin_paths: Iterable[str | Path] | None = None,
+) -> ProfileMatrixReport:
+    """Run profile matrix diagnostic across multiple runtime/profile combinations."""
+
+    if deep:
+        raise ValueError("--profile-matrix does not support --deep")
+
+    profiles = default_doctor_profiles(
+        runtime_hint=runtime_hint,
+        trust_project=trust_project,
+    )
+
+    profile_results: list[dict[str, Any]] = []
+    status_counts = {"ok": 0, "warn": 0, "fail": 0}
+
+    for profile in profiles:
+        report = doctor_v6(
+            json=json,
+            deep=False,
+            trust_project=profile.trust_project,
+            runtime_hint=profile.runtime_hint,
+            cwd=cwd,
+            env=env,
+            env_files=env_files or profile.env_files,
+            plugin_paths=plugin_paths,
+        )
+
+        # Extract router mode from env or runtime
+        router_mode = "auto"
+        if hasattr(report.env, "values"):
+            v6_router_value = report.env.values.get("V6_ROUTER") or report.env.values.get("WRR_V6_ROUTER")
+            if v6_router_value and hasattr(v6_router_value, "value"):
+                router_mode = v6_router_value.value
+
+        # Get routable engine IDs
+        routable_engine_ids = [e.engine_id for e in getattr(report, "routable", []) if getattr(e, "engine_id", None)]
+
+        profile_entry = {
+            "id": profile.id,
+            "label": profile.label,
+            "runtime": {
+                "name": report.runtime.name if hasattr(report.runtime, "name") else "unknown",
+                "hint": profile.runtime_hint,
+            },
+            "env": {
+                "candidates": len(report.env.candidates) if hasattr(report.env, "candidates") else 0,
+                "conflicts": len(report.env.conflicts) if hasattr(report.env, "conflicts") else 0,
+            },
+            "router_mode": router_mode,
+            "routable_engine_ids": routable_engine_ids,
+            "discovered": len(report.discovered),
+            "resolved": len(report.resolved),
+            "health_summary": {
+                "healthy": report.summary.get("healthy", 0),
+                "degraded": report.summary.get("degraded", 0),
+                "unhealthy": report.summary.get("unhealthy", 0),
+            },
+            "status": report.summary.get("status", "unknown"),
+        }
+
+        profile_results.append(profile_entry)
+        status = profile_entry["status"]
+        if status in status_counts:
+            status_counts[status] += 1
+
+    # Determine overall status
+    if status_counts["fail"] > 0:
+        overall_status = "fail"
+    elif status_counts["warn"] > 0:
+        overall_status = "warn"
+    else:
+        overall_status = "ok"
+
+    summary = {
+        "status": overall_status,
+        "profiles_total": len(profile_results),
+        "profiles_ok": status_counts["ok"],
+        "profiles_warn": status_counts["warn"],
+        "profiles_fail": status_counts["fail"],
+    }
+
+    return ProfileMatrixReport(
+        kind="profile_matrix",
+        profiles=profile_results,
+        summary=summary,
+    )

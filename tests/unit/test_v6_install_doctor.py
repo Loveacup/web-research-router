@@ -89,3 +89,45 @@ def test_legacy_cli_doctor_json_keeps_old_top_level_shape():
     assert "discovered" not in payload
     assert "resolved" not in payload
     assert "health" not in payload
+
+
+def test_install_uses_filtered_process_env_for_required_alias(tmp_path, monkeypatch):
+    """install() filters process_env to required names (including aliases)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    process_env = {
+        "EXA_API_KEY": "exa_value",  # Required env
+        "GITHUB_TOKEN": "gh_value",  # Required env
+        "UNRELATED_SECRET": "should_not_leak",
+        "PATH": "/usr/bin",
+    }
+    report = install(dry_run=True, runtime_hint="standalone", cwd=tmp_path, env=process_env, trust_project=True)
+
+    # Required keys should be visible
+    assert "EXA_API_KEY" in report.env.values
+    assert "GITHUB_TOKEN" in report.env.values
+    # UNRELATED_SECRET should NOT leak
+    assert "UNRELATED_SECRET" not in report.env.values
+    # PATH should NOT leak either
+    assert "PATH" not in report.env.values
+
+
+def test_doctor_v6_uses_filtered_process_env_for_required_env(tmp_path):
+    """doctor_v6() only passes required env to load_env, not unrelated vars."""
+    process_env = {
+        "GITHUB_TOKEN": "gh_abc",
+        "EXA_API_KEY": "exa_xyz",
+        "UNRELATED_SECRET": "should_not_leak",
+        "PATH": "/usr/bin",
+    }
+    payload = doctor_v6(runtime_hint="standalone", cwd=tmp_path, env=process_env).to_dict()
+
+    # GITHUB_TOKEN and EXA_API_KEY should be present (they're required)
+    assert "GITHUB_TOKEN" in payload["env"]["values"]
+    assert "EXA_API_KEY" in payload["env"]["values"]
+    # UNRELATED_SECRET should NOT be in the env snapshot
+    assert "UNRELATED_SECRET" not in payload["env"]["values"]
+    # PATH should NOT leak either
+    assert "PATH" not in payload["env"]["values"]

@@ -318,23 +318,26 @@ def _per_page(count: int, cap: int) -> int:
     return min(max(count, 1), cap)
 
 
-async def _fetch_openalex(options: SearchOptions) -> List[Dict[str, Any]]:
+async def _fetch_openalex(options: SearchOptions, client: httpx.AsyncClient | None = None) -> List[Dict[str, Any]]:
     """OpenAlex works 检索 → paper_dict 列表。主力源。"""
     params = {
         "search": options.query,
         "mailto": config.OPENALEX_MAILTO,
         "per_page": _per_page(options.count, 25),
     }
-    async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+    if client is None:
+        async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+            r = await client.get(config.OPENALEX_API, params=params)
+    else:
         r = await client.get(config.OPENALEX_API, params=params)
-        r.raise_for_status()
-        data = r.json() or {}
+    r.raise_for_status()
+    data = r.json() or {}
     works = data.get("results") or []
     parsed = [_parse_openalex_work(w, i, len(works)) for i, w in enumerate(works)]
     return [p for p in parsed if p]
 
 
-async def _fetch_s2(options: SearchOptions) -> List[Dict[str, Any]]:
+async def _fetch_s2(options: SearchOptions, client: httpx.AsyncClient | None = None) -> List[Dict[str, Any]]:
     """Semantic Scholar paper search → paper_dict 列表。引用质量 + tldr 补充。"""
     params = {
         "query": options.query,
@@ -342,26 +345,32 @@ async def _fetch_s2(options: SearchOptions) -> List[Dict[str, Any]]:
                    "tldr,externalIds,year,venue,publicationDate"),
         "limit": _per_page(options.count, 25),
     }
-    async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+    if client is None:
+        async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+            r = await client.get(config.SEMANTIC_SCHOLAR_API, params=params)
+    else:
         r = await client.get(config.SEMANTIC_SCHOLAR_API, params=params)
-        r.raise_for_status()
-        data = r.json() or {}
+    r.raise_for_status()
+    data = r.json() or {}
     papers = data.get("data") or []
     parsed = [_parse_s2_paper(p, i, len(papers)) for i, p in enumerate(papers)]
     return [p for p in parsed if p]
 
 
-async def _fetch_arxiv(options: SearchOptions) -> List[Dict[str, Any]]:
+async def _fetch_arxiv(options: SearchOptions, client: httpx.AsyncClient | None = None) -> List[Dict[str, Any]]:
     """arXiv 预印本（Atom）→ paper_dict 列表。默认 lazy（P2，3s/req 慢）。"""
     params = {
         "search_query": f"all:{options.query}",
         "start": 0,
         "max_results": _per_page(options.count, 15),
     }
-    async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+    if client is None:
+        async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+            r = await client.get(config.ARXIV_API, params=params)
+    else:
         r = await client.get(config.ARXIV_API, params=params)
-        r.raise_for_status()
-        text = r.text
+    r.raise_for_status()
+    text = r.text
     return _parse_arxiv_atom(text, options.count)
 
 
@@ -396,11 +405,12 @@ class AcademicEngine(SearchEngine):
 
     async def search(self, options: SearchOptions) -> List[SearchResult]:
         now = datetime.now(timezone.utc)
-        # 主力 openalex + 补充 s2；arxiv 仅当显式开启（默认 lazy）
-        fetchers = [_fetch_openalex(options), _fetch_s2(options)]
-        if config.ACADEMIC_INCLUDE_ARXIV:
-            fetchers.append(_fetch_arxiv(options))
-        gathered = await asyncio.gather(*fetchers, return_exceptions=True)
+        async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
+            # 主力 openalex + 补充 s2；arxiv 仅当显式开启（默认 lazy）
+            fetchers = [_fetch_openalex(options, client), _fetch_s2(options, client)]
+            if config.ACADEMIC_INCLUDE_ARXIV:
+                fetchers.append(_fetch_arxiv(options, client))
+            gathered = await asyncio.gather(*fetchers, return_exceptions=True)
 
         papers: List[Dict[str, Any]] = []
         for res in gathered:

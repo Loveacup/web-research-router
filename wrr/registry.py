@@ -67,12 +67,10 @@ def default_registry_v6_shadow(**kwargs):
     import os
     from pathlib import Path
 
-    from .cli.install import _filtered_env, _required_env
     from .engines.adapter_bridge import compare_legacy_registry_bridge
-    from .engines.loader import discover_engine_plugins
     from .engines.registry import EngineRegistry as V6EngineRegistry
+    from .runtime.control_plane import prepare_control_plane_env
     from .runtime.detect import detect_runtime
-    from .runtime.env import load_env
 
     intentional_gaps = kwargs.pop("intentional_gaps", None)
     cwd = kwargs.pop("cwd", None)
@@ -84,20 +82,21 @@ def default_registry_v6_shadow(**kwargs):
     plugin_paths = kwargs.pop("plugin_paths", None)
 
     if env is None:
-        resolved_cwd = Path.cwd() if cwd is None else Path(cwd)
         if process_env is None:
             process_env = os.environ
-        paths = tuple(plugin_paths or (resolved_cwd / "plugins" / "engines",))
-        discoveries = tuple(
-            discover_engine_plugins(paths, include_builtin=True, trust_project=trust_project)
-        )
-        required_env = _required_env(discoveries)
-        env = load_env(
-            runtime,
-            overrides=_filtered_env(process_env, required_env),
+        control = prepare_control_plane_env(
+            runtime=runtime,
+            cwd=cwd,
+            process_env=process_env,
             env_files=env_files,
+            plugin_paths=plugin_paths,
+            include_builtin=True,
             trust_project=trust_project,
         )
+        runtime = control.runtime
+        env = control.env
+        if plugin_paths is None:
+            plugin_paths = control.plugin_paths
 
     registry_kwargs = dict(kwargs)
     if plugin_paths is not None:

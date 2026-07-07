@@ -117,13 +117,13 @@ def test_dedup_by_doi_arxiv_fallback_and_distinct():
 
 # ── search 聚合（monkeypatch 模块级 _fetch_*）───────────────────────
 def _fake_async(payload):
-    async def _f(options):
+    async def _f(options, client=None):
         return list(payload)
     return _f
 
 
 def _fake_raise(exc):
-    async def _f(options):
+    async def _f(options, client=None):
         raise exc
     return _f
 

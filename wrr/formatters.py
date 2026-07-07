@@ -44,6 +44,9 @@ def format_search(result: RouterResult, query: str) -> str:
         details["mode"] = result.mode
         details["fusion_method"] = result.fusion_method
         details["weights"] = result.weights
+    # v6.1：诊断追踪
+    if result.diagnostics is not None:
+        details["diagnostics"] = result.diagnostics.to_dict()
     banner = "" if result.mode is not None else _banner(result, primary)
     return json.dumps({
         "success": True,

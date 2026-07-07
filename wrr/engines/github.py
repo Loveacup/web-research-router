@@ -197,7 +197,7 @@ class GitHubEngine(SearchEngine):
 
     async def _fetch_activity(self, client, headers, items) -> List[Optional[int]]:
         """并发取每个仓库最近 30 天 commit 数；关闭或失败时返回 None（降级代理）。"""
-        if config.GITHUB_FAST_MODE or not config.GITHUB_ACTIVITY_LOOKUP or not items:
+        if config.github_fast_mode() or not config.GITHUB_ACTIVITY_LOOKUP or not items:
             return [None] * len(items)
         since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
@@ -218,7 +218,13 @@ class GitHubEngine(SearchEngine):
             except Exception:
                 return None       # 单仓活跃度失败不应拖垮整次搜索
 
-        return list(await asyncio.gather(*[one(r) for r in items]))
+        sem = asyncio.Semaphore(config.GITHUB_ACTIVITY_CONCURRENCY)
+
+        async def guarded(repo) -> Optional[int]:
+            async with sem:
+                return await one(repo)
+
+        return list(await asyncio.gather(*[guarded(r) for r in items]))
 
     # ── v5.0：issue 搜索（质量信号 qualifier）─────────────────────────
     async def issue_search(self, options: SearchOptions) -> List[SearchResult]:

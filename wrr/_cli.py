@@ -124,13 +124,16 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
         return 1
 
     if as_json:
-        _emit_json({
+        payload = {
             "operation": operation,
             "ok": True,
             "provider": result.actual_provider,
             "fallback_chain": _chain_to_list(result),
             "result": _result_to_payload(operation, result),
-        })
+        }
+        if hasattr(result, "diagnostics") and result.diagnostics is not None:
+            payload["diagnostics"] = result.diagnostics.to_dict()
+        _emit_json(payload)
     else:
         if not quiet:
             degraded = result.degraded_from if hasattr(result, "degraded_from") else None
@@ -305,7 +308,45 @@ def cmd_doctor(ns) -> int:
     if getattr(ns, "env_report", False):
         return _cmd_env_report(ns)
 
+    # Validate --profile-matrix constraints
+    if getattr(ns, "profile_matrix", False):
+        if not getattr(ns, "v6", False):
+            _eprint("✗ --profile-matrix requires --v6")
+            return 2
+        if ns.deep:
+            _eprint("✗ --profile-matrix does not support --deep")
+            return 2
+        if not ns.json:
+            _eprint("✗ --profile-matrix requires --json")
+            return 2
+        if ns.engine:
+            _eprint("✗ --profile-matrix does not support --engine")
+            return 2
+        if ns.tier is not None:
+            _eprint("✗ --profile-matrix does not support --tier")
+            return 2
+
     if getattr(ns, "v6", False):
+        # Handle --profile-matrix
+        if getattr(ns, "profile_matrix", False):
+            from wrr.doctor import doctor_profile_matrix
+
+            try:
+                report = doctor_profile_matrix(
+                    json=ns.json,
+                    deep=False,
+                    trust_project=ns.trust_project,
+                    runtime_hint=ns.runtime,
+                    env_files=[ns.env] if ns.env else None,
+                )
+            except Exception as e:
+                _eprint(f"✗ v6 Profile Matrix 失败: {type(e).__name__}: {e}")
+                return 1
+            _emit_json(report.to_dict())
+            status = report.summary.get("status")
+            return 1 if status == "fail" else 0
+
+        # Regular --v6 doctor
         from wrr.doctor import doctor_v6
 
         try:
@@ -574,6 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--trust-project",
         action="store_true",
         help="仅配合 --v6：显式信任项目级插件、adapter 和项目 .env secret",
+    )
+    dp.add_argument(
+        "--profile-matrix",
+        action="store_true",
+        help="仅配合 --v6：输出多 runtime/profile 的静态 light 诊断矩阵（需 --json）",
     )
     dp.set_defaults(func=cmd_doctor)
 

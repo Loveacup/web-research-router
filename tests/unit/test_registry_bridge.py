@@ -130,20 +130,20 @@ def test_default_registry_v6_shadow_uses_filtered_process_env_overrides(tmp_path
     are visible to the v6 registry without leaking unrelated env vars.
     """
     import importlib
-    install_mod = importlib.import_module("wrr.cli.install")
-    original_filtered_env = install_mod._filtered_env
+    control_plane_mod = importlib.import_module("wrr.runtime.control_plane")
+    original_filter_env = control_plane_mod.filter_env
 
     runtime = _runtime(tmp_path)
     state_file = tmp_path / "state.json"
 
     captured_filtered = {}
 
-    def capturing_filtered_env(env, names):
-        result = original_filtered_env(env, names)
+    def capturing_filter_env(env, names):
+        result = original_filter_env(env, names)
         captured_filtered.update(result)
         return result
 
-    monkeypatch.setattr(install_mod, "_filtered_env", capturing_filtered_env)
+    monkeypatch.setattr(control_plane_mod, "filter_env", capturing_filter_env)
 
     report = default_registry_v6_shadow(
         runtime=runtime,
@@ -159,3 +159,29 @@ def test_default_registry_v6_shadow_uses_filtered_process_env_overrides(tmp_path
     assert "exa" not in report.missing_provider_ids
     assert "EXA_API_KEY" in captured_filtered
     assert "UNRELATED_SECRET_TOKEN" not in captured_filtered
+
+
+def test_default_registry_v6_shadow_uses_control_plane_filtered_process_env(tmp_path):
+    """Shadow bridge uses prepare_control_plane_env for env filtering."""
+    runtime = _runtime(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    report = default_registry_v6_shadow(
+        runtime=runtime,
+        process_env={
+            "GITHUB_TOKEN": "gh_abc",
+            "EXA_API_KEY": "exa_xyz",
+            "UNRELATED_VAR": "should_not_leak",
+        },
+        env_files=[],
+        state_file=state_file,
+        trust_project=True,
+    )
+
+    # Both github and exa should be bridged (required env present)
+    assert "github" in report.bridged_provider_ids
+    assert "exa" in report.bridged_provider_ids
+    # Verify the bridge worked (legacy registry has both)
+    registry = report.registry
+    assert registry.get("github") is not None
+    assert registry.get("exa") is not None

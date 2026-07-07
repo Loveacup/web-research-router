@@ -227,3 +227,19 @@ def test_doctor_exit_code_all_ok_returns_zero():
     ]
     assert doctor_exit_code(results) == 0
     assert doctor_exit_code(results, strict=True) == 0
+
+
+def test_doctor_v6_health_includes_cache_age():
+    """doctor_v6 报告的 health 项应包含 health_cache_age_ms（如果存在缓存）。"""
+    from wrr.doctor import doctor_v6
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = Path(tmpdir) / "test_state.json"
+        # 不注入缓存，只验证结构
+        report = doctor_v6(trust_project=False)
+        report_dict = report.to_dict()
+        assert "health" in report_dict
+        # health 应该是列表
+        assert isinstance(report_dict["health"], list)

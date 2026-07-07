@@ -87,6 +87,64 @@ class FallbackStep:
 
 
 @dataclass
+class DiagnosticEvent:
+    """单个引擎执行的诊断事件。"""
+    engine: str
+    ok: bool
+    category: str  # "search" | "extract" | "similar" | "probe"
+    elapsed_ms: float
+    timeout_ms: Optional[float] = None
+    count: int = 0
+    message: Optional[str] = None
+    phase: Optional[str] = None  # "primary" | "fallback" | "recovery"
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {
+            "engine": self.engine,
+            "ok": self.ok,
+            "category": self.category,
+            "elapsed_ms": round(self.elapsed_ms, 2),
+            "count": self.count,
+        }
+        if self.timeout_ms is not None:
+            d["timeout_ms"] = round(self.timeout_ms, 2)
+        if self.message:
+            d["message"] = self.message
+        if self.phase:
+            d["phase"] = self.phase
+        return d
+
+
+@dataclass
+class RouteTrace:
+    """路由过程的诊断追踪信息。"""
+    mode: Optional[str] = None
+    mode_reason: Optional[str] = None
+    selected_engines: List[str] = field(default_factory=list)
+    events: List[DiagnosticEvent] = field(default_factory=list)
+    elapsed_ms: float = 0.0
+    timeout_ms: Optional[float] = None
+    health_cache_age_ms: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {
+            "events": [e.to_dict() for e in self.events],
+            "elapsed_ms": round(self.elapsed_ms, 2),
+        }
+        if self.mode:
+            d["mode"] = self.mode
+        if self.mode_reason:
+            d["mode_reason"] = self.mode_reason
+        if self.selected_engines:
+            d["selected_engines"] = self.selected_engines
+        if self.timeout_ms is not None:
+            d["timeout_ms"] = round(self.timeout_ms, 2)
+        if self.health_cache_age_ms is not None:
+            d["health_cache_age_ms"] = round(self.health_cache_age_ms, 2)
+        return d
+
+
+@dataclass
 class RouterResult:
     """路由结果。payload 为引擎返回（List[SearchResult] 或 ExtractResult）。"""
     actual_provider: str
@@ -96,6 +154,8 @@ class RouterResult:
     mode: Optional[str] = None
     fusion_method: Optional[str] = None
     weights: Optional[Dict[str, Any]] = None
+    # v6.1：诊断追踪
+    diagnostics: Optional[RouteTrace] = None
 
     @property
     def degraded_from(self) -> Optional[str]:

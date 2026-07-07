@@ -141,3 +141,35 @@ def test_unknown_provider_in_chain_fails_gracefully():
         assert False
     except AllEnginesFailedError as e:
         assert "unknown provider" in str(e)
+
+
+# ── diagnostics 追踪 ─────────────────────────────────────────────────
+def test_route_success_includes_diagnostics():
+    """成功 route 应包含 diagnostics 字段。"""
+    reg = _reg(FakeEngine("exa", search_results=mk_results(2)))
+    rr = run(route("search", SearchOptions("q"), reg))
+    assert rr.diagnostics is not None
+    assert rr.diagnostics.mode_reason == "v4_fallback_chain"
+    assert "exa" in rr.diagnostics.selected_engines
+    assert len(rr.diagnostics.events) >= 1
+    assert rr.diagnostics.events[0].engine == "exa"
+    assert rr.diagnostics.events[0].ok is True
+    assert rr.diagnostics.events[0].count == 2
+
+
+def test_route_fallback_includes_all_events():
+    """fallback 路径应记录所有引擎的 events。"""
+    reg = _reg(FakeEngine("exa", error="exa down"),
+               FakeEngine("brave", search_results=mk_results(1)))
+    rr = run(route("search", SearchOptions("q"), reg))
+    assert rr.actual_provider == "brave"
+    assert rr.diagnostics is not None
+    assert len(rr.diagnostics.events) == 2
+    # exa 失败
+    assert rr.diagnostics.events[0].engine == "exa"
+    assert rr.diagnostics.events[0].ok is False
+    assert "exa down" in rr.diagnostics.events[0].message
+    # brave 成功
+    assert rr.diagnostics.events[1].engine == "brave"
+    assert rr.diagnostics.events[1].ok is True
+    assert rr.diagnostics.events[1].count == 1

@@ -51,7 +51,10 @@ def test_issue_search_maps_quality_signals():
     assert "👍30" in out[0].snippet and "💬12" in out[0].snippet
     assert "✅completed" in out[0].snippet and "·PR" in out[0].snippet
     # sort:interactions 注入 query
-    assert "sort:interactions" in FakeAsyncClient.captured[0]["params"]["q"]
+    # captured[0] 是 INIT，captured[1] 是实际的 GET 请求
+    get_call = next((c for c in FakeAsyncClient.captured if "params" in c), None)
+    assert get_call is not None
+    assert "sort:interactions" in get_call["params"]["q"]
 
 
 # ── GraphQL 批量活跃度（消 N+1）─────────────────────────────────────

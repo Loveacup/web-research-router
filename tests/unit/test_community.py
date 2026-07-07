@@ -262,16 +262,16 @@ def test_item_to_result_drops_incomplete():
 
 
 def test_search_does_not_probe_or_restart_opencli_daemon():
-    """H3 (v6.1): search 热路径只运行 1s read-only daemon status probe，不重启 daemon。"""
+    """H3 refactor: search 热路径不再运行 daemon status probe 或 restart。"""
     recorded: list = []
     orig = cm._run_cmd
 
     async def guard(cli, timeout):
         if cli[:3] == ["opencli", "daemon", "restart"]:
             raise AssertionError("search hot path must not run opencli daemon restart")
-        recorded.append(cli)
         if cli[:3] == ["opencli", "daemon", "status"]:
-            return (0, "Daemon: running on port 19825\nExtension: connected", "")
+            raise AssertionError("search hot path must not run opencli daemon status")
+        recorded.append(cli)
         joined = " ".join(cli).lower()
         if "reddit" in joined:
             return (0, json.dumps(_REDDIT[:1]), "")
@@ -284,8 +284,8 @@ def test_search_does_not_probe_or_restart_opencli_daemon():
     finally:
         cm._run_cmd = orig
     assert len(out) == 1
-    assert any(cli[:3] == ["opencli", "daemon", "status"] for cli in recorded)
-    assert all(cli[:3] != ["opencli", "daemon", "restart"] for cli in recorded)
+    # 验证没有调用任何 daemon 相关命令
+    assert all(cli[:2] != ["opencli", "daemon"] for cli in recorded)
 
 
 # ── 源适配器 seam（Slice 1）─────────────────────────────────────────
@@ -358,38 +358,41 @@ def test_build_chain_promotes_community():
 
 
 # ── OpenCLI 断开快速失败（端到端时延）───────────────────────────────────
-def test_opencli_disconnect_fails_fast_in_search():
-    """当 OpenCLI extension 断开时，_fetch_source 应在 1s probe 内快速失败，
-    而不是等待 20s 的 opencli search 超时。"""
+def test_opencli_disconnect_no_longer_fails_fast_in_search():
+    """H3 refactor: search 热路径不再预检 opencli，即使断开也会尝试 fetch。
+
+    Daemon/extension 健康检查由 health_check() 负责，search 路径不再快速失败。
+    如果 opencli 实际断开，fetch 会因超时返回空结果（由 adapter 捕获异常）。
+    """
     eng = cm.CommunityEngine()
-    start = time.monotonic()
 
     async def fake_probe(timeout):
-        return (False, "OpenCLI browser extension not connected")
+        # 即使 probe 返回失败，search 也不再调用它
+        raise AssertionError("_probe_opencli_status should not be called in search")
 
     async def fake_run(cli, timeout):
-        # 如果走到这里，说明没有快速失败，测试会等待 20s（实际不应发生）
-        return (0, json.dumps(_REDDIT), "")
+        # 模拟 opencli search 实际执行但失败（返回空）
+        return (0, "[]", "")
 
     orig_probe = cm._probe_opencli_status
+    orig_run = cm._run_cmd
     cm._probe_opencli_status = fake_probe
+    cm._run_cmd = fake_run
     try:
-        # _fetch_source 应 raise EngineError 并在 1s 内返回
-        with pytest.raises(EngineError, match="OpenCLI browser extension not connected"):
-            run(eng._fetch_source("reddit", SearchOptions("python", count=5), datetime.now(timezone.utc)))
+        # 不再抛出 EngineError，而是返回空结果
+        res = run(eng._fetch_source("reddit", SearchOptions("python", count=5), datetime.now(timezone.utc)))
+        assert res == []  # fetch 返回空（adapter 捕获了失败）
     finally:
         cm._probe_opencli_status = orig_probe
-
-    elapsed = time.monotonic() - start
-    assert elapsed < 2.0, f"expected fast fail within 2s, took {elapsed:.2f}s"
+        cm._run_cmd = orig_run
 
 
-def test_opencli_probe_fast_pass_when_connected():
-    """当 OpenCLI extension 连接时，probe 快速通过后继续正常抓取。"""
+def test_opencli_fetch_without_probe():
+    """H3 refactor: search 路径直接 fetch，不再预检 probe。"""
     eng = cm.CommunityEngine()
 
     async def fake_probe(timeout):
-        return (True, "opencli ready")
+        raise AssertionError("_probe_opencli_status should not be called in search")
 
     async def fake_run(cli, timeout):
         return (0, json.dumps(_REDDIT), "")
@@ -405,3 +408,46 @@ def test_opencli_probe_fast_pass_when_connected():
         cm._run_cmd = orig_run
 
     assert len(res) == len(_REDDIT)
+
+
+def test_fetch_source_no_opencli_preflight():
+    """H3 refactor: search 热路径不再调用 _probe_opencli_status preflight。"""
+    eng = cm.CommunityEngine()
+
+    async def probe_guard(timeout):
+        raise AssertionError("_probe_opencli_status must not be called in search hot path")
+
+    async def fake_run(cli, timeout):
+        return (0, json.dumps(_REDDIT), "")
+
+    orig_probe = cm._probe_opencli_status
+    orig_run = cm._run_cmd
+    cm._probe_opencli_status = probe_guard
+    cm._run_cmd = fake_run
+    try:
+        # 如果 _fetch_source 仍调用 probe，会触发 AssertionError
+        res = run(eng._fetch_source("reddit", SearchOptions("python", count=5), datetime.now(timezone.utc)))
+        assert len(res) == len(_REDDIT)  # 确认正常获取数据
+    finally:
+        cm._probe_opencli_status = orig_probe
+        cm._run_cmd = orig_run
+
+
+def test_health_check_uses_probe_opencli_status():
+    """health_check() 仍然调用 _probe_opencli_status 进行健康检查。"""
+    probe_called = []
+
+    async def fake_probe(timeout):
+        probe_called.append(timeout)
+        return (True, "opencli ready")
+
+    orig_probe = cm._probe_opencli_status
+    cm._probe_opencli_status = fake_probe
+    try:
+        import shutil
+        if shutil.which("opencli"):  # 只在 opencli 存在时测试
+            result = run(cm.CommunityEngine().health_check(deep=False))
+            assert len(probe_called) > 0, "health_check should call _probe_opencli_status"
+            assert probe_called[0] == 1.0  # timeout=1.0
+    finally:
+        cm._probe_opencli_status = orig_probe

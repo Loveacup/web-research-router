@@ -61,7 +61,7 @@ def test_search_rrf_aggregates_multi_source():
 
 
 def test_search_rrf_does_not_probe_or_restart_opencli_daemon():
-    """H3 (v6.1): search_rrf 热路径只运行 1s read-only daemon status probe，不重启 daemon。"""
+    """H3 (v6.1): search_rrf 热路径 fast-fail 设计，不调用 daemon probe 或 restart。"""
     recorded: list = []
     orig = cm._run_cmd
 
@@ -83,7 +83,8 @@ def test_search_rrf_does_not_probe_or_restart_opencli_daemon():
     finally:
         cm._run_cmd = orig
     assert len(out) == 1
-    assert any(cli[:3] == ["opencli", "daemon", "status"] for cli in recorded)
+    # P0-3 fast-fail 设计：热路径不再调用 daemon status probe
+    assert all(cli[:3] != ["opencli", "daemon", "status"] for cli in recorded)
     assert all(cli[:3] != ["opencli", "daemon", "restart"] for cli in recorded)
 
 

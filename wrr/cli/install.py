@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from wrr.engines.loader import EngineDiscovery, discover_engine_plugins
+from wrr.runtime.control_plane import (
+    filter_env,
+    prepare_control_plane_env,
+    required_env_names,
+)
 from wrr.runtime.detect import RuntimeInfo, detect_runtime
 from wrr.runtime.env import EnvSnapshot, load_env
 
@@ -59,18 +64,19 @@ def install(
 
     resolved_cwd = Path.cwd() if cwd is None else Path(cwd)
     process_env = os.environ if env is None else env
-    runtime = detect_runtime(explicit=runtime_hint, cwd=resolved_cwd, env=process_env)
-    paths = tuple(plugin_paths or (resolved_cwd / "plugins" / "engines",))
-    discoveries = tuple(
-        discover_engine_plugins(paths, include_builtin=True, trust_project=trust_project)
-    )
-    required_env = _required_env(discoveries)
-    snapshot = load_env(
-        runtime,
-        overrides=_filtered_env(process_env, required_env),
+    control = prepare_control_plane_env(
+        runtime_hint=runtime_hint,
+        cwd=resolved_cwd,
+        process_env=process_env,
         env_files=env_files,
+        plugin_paths=plugin_paths,
+        include_builtin=True,
         trust_project=trust_project,
     )
+    runtime = control.runtime
+    paths = control.plugin_paths
+    discoveries = control.discoveries
+    snapshot = control.env
     missing = _missing_required_env(discoveries, snapshot)
     config_target = Path.home() / ".config" / "wrr" / "config.yaml"
     planned_writes = ({"path": str(config_target), "action": "create_or_update_config"},)
@@ -110,16 +116,8 @@ def install(
 
 
 def _required_env(discoveries: Iterable[EngineDiscovery]) -> set[str]:
-    names: set[str] = set()
-    for discovery in discoveries:
-        manifest = discovery.manifest
-        if not discovery.valid or manifest is None:
-            continue
-        for requirement in _env_requirements(manifest.requirements):
-            if not bool(requirement.get("required", True)):
-                continue
-            names.update(_env_names(requirement))
-    return names
+    """Compatibility wrapper for required_env_names."""
+    return set(required_env_names(discoveries))
 
 
 def _missing_required_env(
@@ -165,4 +163,5 @@ def _env_names(item: Mapping[str, Any]) -> list[str]:
 
 
 def _filtered_env(env: Mapping[str, str], names: set[str]) -> dict[str, str]:
-    return {name: env[name] for name in names if name in env}
+    """Compatibility wrapper for filter_env."""
+    return filter_env(env, names)
