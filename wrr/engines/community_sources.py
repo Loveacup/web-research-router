@@ -11,7 +11,17 @@
   - 禁止在本模块引入任何浏览器自动化框架或浏览器启动逻辑。
 """
 import json
-from typing import Any, Awaitable, Callable, Dict, List, Protocol, Tuple, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+
+try:
+    import httpx  # type: ignore
+except ImportError:  # pragma: no cover
+    httpx = None  # type: ignore
+
+try:
+    import xml.etree.ElementTree as ET  # type: ignore
+except ImportError:  # pragma: no cover
+    ET = None  # type: ignore
 
 # run_cmd 注入契约：(cli, timeout) -> (returncode, stdout, stderr)
 RunCmd = Callable[[List[str], float], Awaitable[Tuple[Any, str, str]]]
@@ -120,8 +130,91 @@ class Last30DaysSourceAdapter:
         return items
 
 
+class RssSourceAdapter:
+    """通用 RSS 源适配器。
+
+    用于接入公开 RSS feed（如 AI HOT 精选/日报、WeChat 公众号 RSS）。
+    通过 `cfg["feed_url"]` 获取 XML，解析 `<item>` 列表。
+    适配器自我隔离失败：网络/解析异常返回空列表。
+    """
+
+    async def fetch(self, cfg: Dict[str, Any], options: Any,
+                    run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
+        feed_url = cfg.get("feed_url")
+        if not feed_url:
+            return []
+        if ET is None:
+            return []
+        try:
+            client = cfg.get("client")
+            if client is not None:
+                r = await client.get(feed_url, headers={"User-Agent": "wrr/4.0"})
+                r.raise_for_status()
+                text = r.text
+            elif httpx is not None:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.get(feed_url, headers={"User-Agent": "wrr/4.0"})
+                    r.raise_for_status()
+                    text = r.text
+            else:
+                return []
+        except Exception:
+            return []
+        return self._parse_rss(text)
+
+    def _parse_rss(self, text: str) -> List[Dict[str, Any]]:
+        if not text or not ET:
+            return []
+        try:
+            root = ET.fromstring(text.encode("utf-8"))
+        except ET.ParseError:
+            return []
+        channel = root.find("channel")
+        if channel is None:
+            return []
+        items: List[Dict[str, Any]] = []
+        for item in channel.findall("item"):
+            title = self._text(item, "title")
+            link = self._text(item, "link")
+            desc = self._text(item, "description")
+            if not (title and link):
+                continue
+            snippet = desc or ""
+            # AI HOT 的 description 通常包含 via AI HOT 链接和原文链接，截断到更干净的摘要
+            if "via AI HOT" in snippet:
+                snippet = snippet.split("via AI HOT")[0].strip()
+            items.append({
+                "title": title,
+                "url": link,
+                "snippet": snippet,
+                "published_at": self._parse_pub_date(self._text(item, "pubDate")),
+                "category": self._text(item, "category"),
+                "sources": [self._text(item, "author")] if self._text(item, "author") else None,
+            })
+        return items
+
+    def _text(self, item: Any, tag: str) -> Optional[str]:
+        el = item.find(tag)
+        if el is None or not el.text:
+            return None
+        return el.text.strip()
+
+    def _parse_pub_date(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        # RSS pubDate 常见格式：Mon, 06 Jul 2026 17:45:30 GMT
+        # 直接保留原字符串，让下游 _parse_time 处理 ISO / 秒 / 字符串回退
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(value, "%a, %d %b %Y %H:%M:%S %Z")
+            return dt.isoformat()
+        except ValueError:
+            return value
+
+
 # kind → 适配器实例（无状态，可复用）
 SOURCE_ADAPTERS: Dict[str, CommunitySourceAdapter] = {
     "opencli": OpenCliSourceAdapter(),
     "last30days": Last30DaysSourceAdapter(),
+    "rss": RssSourceAdapter(),
 }

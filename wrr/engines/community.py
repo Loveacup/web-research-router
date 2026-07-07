@@ -60,6 +60,17 @@ COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
         "engagement": "likes", "comments": None, "time": "published_at",
         "title": "title", "url": "url", "snippet": "title", "eng_max": 10000,
     },
+    "aihot_rss": {
+        "kind": "rss",
+        "feed_url": config.AIHOT_RSS_FEED,
+        "engagement": None, "comments": None, "time": "published_at", "eng_max": 1000,
+    },
+    "wechat_rss": {
+        "kind": "rss",
+        "feed_url": config.WECHAT_RSS_FEEDS[0] if config.WECHAT_RSS_FEEDS else "",
+        "feed_urls": config.WECHAT_RSS_FEEDS,
+        "engagement": None, "comments": None, "time": "published_at", "eng_max": 1000,
+    },
     "v2ex": {
         "kind": "opencli", "cli": ["opencli", "v2ex", "search"],
         "engagement": "replies", "comments": "replies", "time": "created",
@@ -309,6 +320,14 @@ class CommunityEngine(SearchEngine):
         # 平台关键词
         if any(k in q for k in ("小红书", "xiaohongshu", "xhs")):
             add("xiaohongshu")
+
+        # P3: AI HOT 中文 AI 资讯
+        if any(k in q for k in config.AIHOT_KEYWORDS):
+            add("aihot_rss")
+
+        # P3: WeChat RSS（用户已配置 feed 或查询显式提及）
+        if any(k in q for k in config.WECHAT_KEYWORDS) or config.WECHAT_RSS_FEEDS:
+            add("wechat_rss")
 
         # V2EX has hot/latest/node APIs but no full-text search endpoint.
         # Let auto routing fall through to web engines for site:v2ex.com instead

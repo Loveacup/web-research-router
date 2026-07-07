@@ -4,7 +4,7 @@
 """
 import os
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 
 def _env_float(key: str, default: float, *, minimum: float = 0.1) -> float:
@@ -171,6 +171,15 @@ COMMUNITY_TRIGGER_SITES = ("reddit.com", "news.ycombinator.com", "twitter.com",
 COMMUNITY_PLATFORM_NAMES = ("reddit", "hacker news", "hackernews", "hn",
                             "twitter", "zhihu", "微博", "weibo",
                             "小红书", "xiaohongshu")
+
+# Community RSS source defaults (P3-1: AI HOT, P3-2: WeChat RSS)
+AIHOT_RSS_FEED: str = os.environ.get("WRR_AIHOT_RSS_FEED", "https://aihot.virxact.com/feed.xml")
+WECHAT_RSS_FEEDS: Tuple[str, ...] = tuple(
+    filter(None, os.environ.get("WRR_WECHAT_RSS_FEEDS", "").split(","))
+)
+AIHOT_KEYWORDS = ("aihot", "ai hot", "今天 ai", "ai 日报", "ai 热点", "ai 圈", "ai 资讯",
+                  "ai 动态", "ai 新闻", "ai 行业", "模型发布", "产品发布")
+WECHAT_KEYWORDS = ("wechat", "微信", "公众号", "weixin", "we-mp-rss")
 
 
 def community_triggered(query: str) -> bool:
