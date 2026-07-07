@@ -96,13 +96,17 @@ P3 目标：为 WRR 增加**早期新闻 / 热点捕获**能力，分三路推�
 - 触发条件：查询含 `wechat`/`微信`/`公众号`/`weixin`/`we-mp-rss` **或** 用户已配置 feed。
 - 测试已覆盖 WeChat RSS 解析（同 `test_rss_source_adapter.py`）。
 
-### 3.3 P3-3 early-news 路由模式（待规划）
+### 3.3 P3-3 early-news 路由模式（已完成，commit `fb2758f`）
 
 当前方案：
-- 在 `wrr/config.py` 中新增 `EARLY_NEWS_KEYWORDS` 触发词（"今天 AI 圈"、"AI 日报"、"AI 热点"、"early news"、"发生了什么"、"今日热点"等）。
-- 在 `classify_intent` / `resolve_mode` 中增加 `early-news` 分支：命中关键词 → 模式 `early-news`。
-- 该模式使用社区引擎，但只启用 `aihot_rss`、`wechat_rss`、`last30days` 等 early-signal 源。
-- 保持 `community` 模式不变；`early-news` 是其子集/特化。
+- 在 `wrr/config.py` 中新增 `EARLY_NEWS_KEYWORDS` 触发词（只保留 AI 强相关复合词，如 `"ai 早报"`、`"ai 热点"`、`"latest ai"`、`"ai news"`、`"ai 动态"`、`"模型发布"`、`"今天 ai"` 等）。
+- 在 `wrr/router.py` 的 `build_chain()` 中当 `early_news_triggered(query)` 为真时，把 `community` 提升到 fallback 链首；`site:github.com` 仍优先于 early-news。
+- 在 `wrr/engines/community.py` 的 `_detect_sources()` 中当 early-news 命中时，自动加入 `aihot_rss` 和（已配置的）`wechat_rss`。
+- 不新增独立模式；`early-news` 是 `community` 的自动触发/源扩展。
+
+关键设计取舍：
+- 为避免误伤 `site:news.ycombinator.com` 等社区过滤查询，关键词只保留 **AI 相关复合词**，不保留单独 `"news"`、`"热点"`。
+- 显式 `--engine` 或 `site:github.com` 仍覆盖 early-news 提升。
 
 ### 3.4 关键接口/数据契约
 
@@ -147,6 +151,23 @@ class RssSourceAdapter:
 - `WRR_V6_ROUTER=0 pytest tests/unit -q` → **697 passed, 1 failed**
   - 失败项：`test_openalex_live_single_source`（外部 OpenAlex 429/timeout，与 P3-1 无关）
 - 红线检查：`wrr/router.py`、`wrr/registry.py`、`wrr/deps.py` 自 v6.1.1 以来未改动（独立 git diff --name-only 取证）
+
+- P3-3 特殊说明：本阶段需要修改 `wrr/router.py` 的 `build_chain()` 以提升 `community` 到链首（与 P1-2 类似属于规划授权例外）。`registry.py` 与 `deps.py` 保持未改动。详见 3.3 节。
+
+### P3-3 验证与状态
+
+- 实现 commit：`fb2758f` feat(p3-3): early-news routing mode promotes community + auto RSS
+- 测试：
+  - `pytest tests/unit/test_router_early_news_mode.py` → **5 passed**
+  - `pytest tests/unit/test_community.py` → **28 passed**（无回归）
+  - 全量 `WRR_V6_ROUTER=0 pytest tests/unit -q` → **~702 passed**（新增 5 + 原有 697），1 failed（外部 OpenAlex `test_openalex_live_single_source`，无关）
+- 设计取舍：
+  - 不新增独立模式，避免改动 `registry.py` / `deps.py`。
+  - 触发词只保留 AI 复合词，避免误伤 `site:news.ycombinator.com`。
+- 红线：
+  - `wrr/router.py` 修改（已授权，规划内）
+  - `wrr/registry.py` 未改动
+  - `wrr/deps.py` 未改动
 
 ### OMP 审计闭环（2026-07-07）
 
