@@ -212,15 +212,40 @@ class RssSourceAdapter:
 - **方法教训**（v0.7.x 实战补充）：
   - 即使 evidence bundle 预填了 git diff name-only，OMP 仍会出于好奇读相邻文件。下次 P3-3 重审时应把 `community_sources.py` 也加进 allowed_paths（它不是红线文件，允许只读），避免审计者因信息缺口而越界。
 
-## 五、状态总结
+## 五、P3-1 后审（CLI 多轮测试 + 修复，2026-07-08）
+
+CLI 多轮测试暴露 `wrr search --provider community "AI 热点"` 失败，根因为 `RssSourceAdapter` 返回的 ISO-8601 `published_at` 被 `_parse_time()` 转成 naive datetime，而 `CommunityEngine` 传 `time.time()` float 给 `calculate_score()` 的 `now`，导致 `_recency_score()` 中 `now - created` 抛出 `TypeError`。
+
+修复提交：
+- `daed79d` fix(p3-1): RSS datetime/timezone handling in community scoring
+  - `_recency_score()` 支持 float/int 和 naive datetime 作为 `now`，归一化为 tz-aware UTC
+  - `_parse_time()` 确保字符串解析结果带 `tzinfo=timezone.utc`
+  - 新增 `test_fetch_source_rss_accepts_float_now_and_datetime_published_at`
+- `a636da5` fix(p3-1): defensively normalize created in _recency_score
+  - 对 `created` 参数也做 float/int/naive datetime 防御归一化，overflow 返回 0.5
+  - 新增 `test_recency_score_created_defensive` 覆盖 4 路径
+
+OMP 审计：
+- R1（omp-rss-time-fix）：concern（criterion 4 证据不足 + `_recency_score` 未归一化 `created`）
+- R2（omp-rss-time-fix-r2）：1-3 pass，criterion 4 warn（redline 缺少 v6.1.1 基线上下文）
+- R3（omp-rss-time-fix-r3）：OMP 因 raw 过大（52MB+）/watch 超时未能正常完成；Hermes 独立取证：
+  - 读 `wrr/engines/community.py:126-137` 确认 `created` 归一化已实现
+  - 读 `tests/unit/test_community.py:50-64` 确认 4 路径测试覆盖
+  - 跑 `git log --oneline v6.1.1..HEAD -- wrr/registry.py wrr/deps.py` 输出为空
+  - 跑 `git diff v6.1.1..HEAD -- wrr/registry.py wrr/deps.py` 输出为空
+  - 全量 `pytest tests/unit -q` 通过
+- **Hermes 人工裁决**：P3-1 RSS 修复通过，severity=**pass**。
+
+## 六、状态总结
 
 | 路线 | 状态 | 验证 |
 |---|---|---|
 | P3-1 AI HOT RSS 适配器 | ✅ 已提交并审计闭合 | 6 tests + 697 full unit |
+| P3-1 后审（CLI 修复） | ✅ 已提交并人工裁决通过 | 30 community tests + 全量 |
 | P3-2 WeChat RSS 框架 | ✅ 已随 P3-1 落地 | 配置/适配器已就绪，需用户自行配置 feed |
 | P3-3 early-news 路由模式 | ✅ 已提交并人工裁决通过 | 5 tests + 全量无回归 |
 
-**P3 全部完成。** 当前 HEAD：`e3fd5d5`。
+**P3 全部完成。** 当前 HEAD：`a636da5`。
 
 后续可选：
 - 发布 v6.2.0 tag（包含 P3 全部功能）。
