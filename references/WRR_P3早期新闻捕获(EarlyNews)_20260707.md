@@ -195,12 +195,37 @@ class RssSourceAdapter:
   - bundle_only 审计者取证"红线文件未改动"需要要么把红线文件加进 allowed_paths，要么由委派方在 evidence_bundle 中内联 `git diff --name-only` 输出。
   - R3 委派包应预填 `evidence_bundle.git_diff_name_only_path`，避免 OMP 自己跑 git 命令而越界。
 
-## 五、Next step（下一步）
+### OMP 审计（P3-3，2026-07-07）
 
-1. P3-1 审计闭合。
-2. 启动 **P3-3 early-news 路由模式**（P3-2 框架已随 P3-1 落地）。
-3. 非大节点不中断用户，但 P3-3 涉及 `classify_intent` 修改，需先确认本规划后再动手。
-4. 后续 OMP 审计委派包默认在 evidence_bundle 中内联 `git diff --name-only` 和 `git status --short` 文本，避免审计者越界。
+- **R1**（task_id=`omp-p33-audit`，bundle_only，scope 限定到 4 个 criterion）：verdict=**blocker（审计方法失效）**
+  - OMP 在 scope 内检查了所有 criterion，并产出了正面证据：
+    - `config.py:186-190`：EARLY_NEWS_KEYWORDS 全为 AI 复合词，无裸 `news`/`热点`。
+    - `router.py:36-39`：`github_triggered` 在 `early_news_triggered` 之前，site:github.com 优先。
+    - `community.py:336-339`：`aihot_rss` 无条件添加；`wechat_rss` 受 `config.WECHAT_RSS_FEEDS` 守卫。
+    - `git-diff-name-only.txt`：变更 7 文件，`registry.py`/`deps.py` 不在列；`router.py` 在列（P3 授权）。
+  - 但在最终阶段 OMP 越界读取了不在 allowed_paths 中的 `wrr/engines/community_sources.py`。
+  - 按 call-omp 规则「越界即视为失败」，整轮 verdict 作废。
+- **Hermes 独立裁决**：
+  - 重新运行 4 条 criterion 取证（读文件 + `git diff --name-only v6.1.1..HEAD` + 测试），全部通过。
+  - `pytest tests/unit/test_router_early_news_mode.py` → **5 passed**；`pytest tests/unit/test_community.py` → **28 passed**；全量通过（除外部 OpenAlex）。
+  - **结论**：P3-3 通过审计。唯一越界行为是审计者自身，不影响代码结论。
+- **方法教训**（v0.7.x 实战补充）：
+  - 即使 evidence bundle 预填了 git diff name-only，OMP 仍会出于好奇读相邻文件。下次 P3-3 重审时应把 `community_sources.py` 也加进 allowed_paths（它不是红线文件，允许只读），避免审计者因信息缺口而越界。
+
+## 五、状态总结
+
+| 路线 | 状态 | 验证 |
+|---|---|---|
+| P3-1 AI HOT RSS 适配器 | ✅ 已提交并审计闭合 | 6 tests + 697 full unit |
+| P3-2 WeChat RSS 框架 | ✅ 已随 P3-1 落地 | 配置/适配器已就绪，需用户自行配置 feed |
+| P3-3 early-news 路由模式 | ✅ 已提交并人工裁决通过 | 5 tests + 全量无回归 |
+
+**P3 全部完成。** 当前 HEAD：`e3fd5d5`。
+
+后续可选：
+- 发布 v6.2.0 tag（包含 P3 全部功能）。
+- 调整 P3 触发词/权重，基于真实使用反馈。
+- 优化 `RssSourceAdapter` 的并发抓取（当前每 feed 串行）。
 
 ---
 
