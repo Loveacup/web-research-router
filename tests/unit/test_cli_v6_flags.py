@@ -245,6 +245,30 @@ def test_doctor_v6_profile_matrix_does_not_load_legacy_env():
     assert "aws_secret_xyz" not in completed.stdout
 
 
+def test_test_subcommand_accepts_unit_argument():
+    cli = _load_cli_module()
+    parser = cli.build_parser()
+    args = parser.parse_args(["test", "unit"])
+    assert args.what == "unit"
+    args_default = parser.parse_args(["test"])
+    assert args_default.what == "smoke"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["test", "unknown"])
+
+
+def test_cli_test_unit_runs_pytest_with_v6_router_disabled():
+    cli = _load_cli_module()
+    parser = cli.build_parser()
+    ns = parser.parse_args(["test", "unit"])
+    import subprocess
+    from unittest import mock
+    with mock.patch.object(subprocess, "call", return_value=0) as mocked:
+        cli.cmd_test_unit(ns)
+        called_args, called_kwargs = mocked.call_args
+        assert called_args[0] == ["pytest", "tests/unit", "-q"]
+        assert called_kwargs["env"]["WRR_V6_ROUTER"] == "0"
+
+
 def test_cli_search_json_includes_diagnostics():
     """CLI search --json 应输出 diagnostics 字段。"""
     import os

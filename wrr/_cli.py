@@ -196,9 +196,12 @@ def cmd_similar(ns) -> int:
 
 
 def cmd_test(ns) -> int:
-    """冒烟测试：依次验证 search / fetch / similar 能否调通。"""
+    """冒烟测试或单元测试入口。"""
     from wrr.schemas import SearchOptions, ExtractOptions, SimilarOptions
     from wrr.errors import WRRError
+
+    if ns.what == "unit":
+        return cmd_test_unit(ns)
 
     prov = ns.provider
     cases = [
@@ -247,6 +250,19 @@ def cmd_test(ns) -> int:
                 print(f"  {mark} {r['op']:<8} {r['error']}: {r['detail']}")
         print("结果：" + ("全部通过" if overall_ok else "存在失败"))
     return 0 if overall_ok else 1
+
+
+def cmd_test_unit(ns) -> int:
+    """运行 wrr 单元测试。"""
+    import subprocess
+
+    env = os.environ.copy()
+    env["WRR_V6_ROUTER"] = "0"
+    args = ["pytest", "tests/unit", "-q"]
+    if ns.json:
+        args = ["pytest", "tests/unit", "-q", "--json-report"]
+    print("运行单元测试：" + " ".join(args))
+    return subprocess.call(args, env=env)
 
 
 def cmd_install(ns) -> int:
@@ -529,7 +545,9 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--count", type=int, default=10, help="结果数（默认 10）")
     mp.set_defaults(func=cmd_similar)
 
-    tp = sub.add_parser("test", parents=[common], help="冒烟测试 search/fetch/similar")
+    tp = sub.add_parser("test", parents=[common], help="冒烟测试 search/fetch/similar 或运行单元测试")
+    tp.add_argument("what", nargs="?", default="smoke", choices=["smoke", "unit"],
+                    help="测试类型：smoke（默认）或 unit")
     tp.set_defaults(func=cmd_test)
 
     ip = sub.add_parser(

@@ -112,7 +112,7 @@ def test_detect_sources_default_and_triggers():
     assert eng._detect_sources("python") == list(config.COMMUNITY_DEFAULT_SOURCES)
     assert eng._detect_sources("x site:reddit.com") == ["reddit"]
     assert eng._detect_sources("y site:x.com") == ["twitter"]
-    assert eng._detect_sources("z site:news.ycombinator.com") == ["last30days_en"]
+    assert eng._detect_sources("z site:news.ycombinator.com") == ["hackernews"]
     assert eng._detect_sources("w site:zhihu.com") == ["last30days_cn"]
     assert eng._detect_sources("site:v2ex.com python") == []
     assert "xiaohongshu" in eng._detect_sources("小红书 美食")
@@ -240,9 +240,9 @@ def test_search_last30days_clusters_mapped():
     cm._run_cmd = _fake_run_factory({"last30days": _L30})
     config.COMMUNITY_INCLUDE_LAST30DAYS = True
     try:
-        # site:news.ycombinator.com → 仅 last30days_en
+        # trending AI → last30days_en/cn
         out = run(cm.CommunityEngine().search(
-            SearchOptions("ai site:news.ycombinator.com", count=5)))
+            SearchOptions("trending AI", count=5)))
     finally:
         cm._run_cmd = orig
         config.COMMUNITY_INCLUDE_LAST30DAYS = False
@@ -400,6 +400,35 @@ def test_fetch_source_rss_accepts_float_now_and_datetime_published_at():
     assert score > 0
     assert result.title == "AI 热点"
     assert result.source_tag == "aihot_rss"
+
+
+def test_hackernews_item_without_time():
+    """Hackernews source: time=None → recency=0.5, does not crash."""
+    eng = cm.CommunityEngine()
+    cfg = cm.COMMUNITY_SOURCES["hackernews"]
+    now = datetime.now(timezone.utc)
+    item = {
+        "title": "HN story without timestamp",
+        "url": "https://news.ycombinator.com/item?id=12345",
+        "score": 100,
+        "comments": 50,
+    }
+    scored = eng._item_to_result(item, "hackernews", cfg, now)
+    assert scored is not None
+    score, result = scored
+    assert result.title == "HN story without timestamp"
+    assert result.url == "https://news.ycombinator.com/item?id=12345"
+    assert result.source_tag == "hackernews"
+    assert score > 0  # 应该有非零分数 (engagement + 0.5*recency + quality)
+    # 验证 recency 部分确实使用了 0.5
+    expected_recency = 0.5
+    w_e, w_r, w_q = config.COMMUNITY_SCORE_WEIGHTS
+    expected_score = (
+        w_e * cm._engagement_score(100, 1000) +
+        w_r * expected_recency +
+        w_q * cm._quality_score(50, 100)
+    )
+    assert abs(score - expected_score) < 1e-9
 
 
 # ── 自动触发链 ───────────────────────────────────────────────────────

@@ -58,27 +58,37 @@ class CommunitySourceAdapter(Protocol):
 
 
 class OpenCliSourceAdapter:
-    """OpenCLI 渠道适配器（reddit / twitter / xiaohongshu / v2ex）。
+    """OpenCLI 渠道适配器（reddit / twitter / xiaohongshu / v2ex / hackernews）。
 
     命令形状与解析逐字节保留自原 `_fetch_opencli`：
       `<cli...> <query> -f json --limit <min(count,20)>`，严格 json.loads。
+    支持 `backup_commands` 配置：当 primary 失败/空时依次执行 backup CLI。
     """
 
     async def fetch(self, cfg: Dict[str, Any], options: Any,
                     run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
-        cli = cfg["cli"] + [options.query, "-f", "json",
-                            "--limit", str(min(options.count, 20))]
-        rc, out, err = await run_cmd(cli, timeout)
-        if rc != 0 or not out.strip():
-            return []
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("results") or data.get("items") or []
+        commands = [cfg["cli"]] + cfg.get("backup_commands", [])
+        for idx, cli in enumerate(commands):
+            is_backup = idx > 0
+            if is_backup and not options.query:
+                continue
+            # backup 命令通常不含 <query> 占位；这里统一追加 query（适配器可自行忽略）
+            call = cli + [options.query, "-f", "json",
+                          "--limit", str(min(options.count * 3 if is_backup else options.count, 20))]
+            rc, out, err = await run_cmd(call, timeout)
+            if rc != 0 or not out.strip():
+                continue
+            try:
+                data = json.loads(out)
+            except json.JSONDecodeError:
+                continue
+            items = data if isinstance(data, list) else (data.get("results") or data.get("items") or [])
+            if not items:
+                continue
+            if is_backup and cfg.get("backup_filter_by_query"):
+                q = (options.query or "").lower()
+                items = [it for it in items if q in str(it.get(cfg.get("title", "title"), "")).lower()]
+            return items[:options.count]
         return []
 
 

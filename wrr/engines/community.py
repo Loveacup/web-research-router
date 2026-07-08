@@ -76,6 +76,13 @@ COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
         "engagement": "replies", "comments": "replies", "time": "created",
         "title": "title", "url": "url", "snippet": "content", "eng_max": 1000,
     },
+    "hackernews": {
+        "kind": "opencli", "cli": ["opencli", "hackernews", "search"],
+        "backup_commands": [["opencli", "hackernews", "top"]],
+        "backup_filter_by_query": True,
+        "engagement": "score", "comments": "comments", "time": None,
+        "title": "title", "url": "url", "snippet": "title", "eng_max": 1000,
+    },
     "last30days_en": {
         "kind": "last30days", "cli": [_L30_EN_PYTHON, _L30_EN],
         "engagement": "score", "comments": None, "time": None, "eng_max": 100,
@@ -116,7 +123,7 @@ def _parse_time(time_val) -> Optional[datetime]:
 
 def _recency_score(created: Optional[datetime], now: Optional[datetime] = None) -> float:
     """时间衰减：≤24h=1.0, ≤7d=0.7, ≤30d=0.3, 更旧=0；未知时间给中等分 0.5。"""
-    if not created:
+    if created is None:
         return 0.5
     now = now or datetime.now(timezone.utc)
     if isinstance(now, (int, float)):
@@ -330,7 +337,7 @@ class CommunityEngine(SearchEngine):
         if "site:twitter.com" in q or "site:x.com" in q:
             add("twitter")
         if "site:news.ycombinator.com" in q:
-            add("last30days_en")
+            add("hackernews")
         if "site:zhihu.com" in q or "site:weibo.com" in q:
             add("last30days_cn")
         # 平台关键词
@@ -399,8 +406,9 @@ class CommunityEngine(SearchEngine):
         url = str(item.get(cfg.get("url", "url")) or item.get("url") or "").strip()
         if not title or not url:
             return None
-        snippet = str(item.get(cfg.get("snippet", "snippet"))
-                      or item.get("selftext") or item.get("text") or "")
+        snippet_field = cfg.get("snippet", "snippet")
+        snippet = str(item.get(snippet_field) or item.get("selftext")
+                      or item.get("text") or title or "")
         sc = calculate_score(item, cfg, now)
         return (sc, SearchResult(title=title[:200], url=url,
                                  snippet=snippet[:500], source_tag=source))
