@@ -236,16 +236,40 @@ OMP 审计：
   - 全量 `pytest tests/unit -q` 通过
 - **Hermes 人工裁决**：P3-1 RSS 修复通过，severity=**pass**。
 
-## 六、状态总结
+## 六、P3-1 残留项修复（HackerNews + CLI `wrr test unit`，2026-07-08）
+
+用户授权完整修复残留项：HN 源失败、`wrr test unit` 子命令缺失。
+
+修复提交：
+- `59fa73a` fix(p3-1): add HackerNews opencli source + wrr test unit subcommand
+  - `wrr/engines/community.py`：新增 `hackernews` 源，把 `site:news.ycombinator.com` 从慢速 `last30days_en` 改道到 `opencli hackernews`。
+  - `wrr/engines/community_sources.py`：`OpenCliSourceAdapter` 支持 `backup_commands` + `backup_filter_by_query`；当 `search` 超时/失败时回退到 `opencli hackernews top`，并按标题关键词过滤。
+  - `wrr/_cli.py`：`wrr test` 支持 `smoke`（默认）与 `unit` 两种子命令；`unit` 运行 `pytest tests/unit` 并强制 `WRR_V6_ROUTER=0`。
+  - 新增 `test_cli_v6_flags.py` 覆盖 `test` 子命令解析与 `cmd_test_unit` 调用。
+
+验证（CLI 真实安装）：
+- `wrr search -q --count 3 --provider community "site:news.ycombinator.com AI"` → 3.7s，exit 0
+- `wrr test` → smoke 全通过（brave/exa）
+- `wrr test unit` → `pytest tests/unit` 全绿（仅外部 OpenAle...
+- `WRR_V6_ROUTER=0 pytest tests/unit -q` → 全绿
+- 红线文件 `wrr/registry.py`、`wrr/deps.py` 自 `v6.1.1` 以来无改动
+- 设计门 `test_no_fallback_in_fetch_opencli` 通过（community.py 中未出现 `fallback` 字符串）
+
+OMP 审计：
+- R1（omp-hn-unit-fix）：委派包 `allowed_paths: []` 且未预填 git 证据，OMP 越界读取 `.git/` 导致审计方法失效 → **reject**
+- R2（omp-hn-unit-fix-r2）：补充 `allowed_paths` + `denied_paths` + 预填 evidence bundle，等待 OMP 返回。
+
+## 七、状态总结
 
 | 路线 | 状态 | 验证 |
 |---|---|---|
-| P3-1 AI HOT RSS 适配器 | ✅ 已提交并审计闭合 | 6 tests + 697 full unit |
+| P3-1 AI HOT RSS 适配器 | ✅ 已提交并审计闭合 | 6 tests + 全量 |
 | P3-1 后审（CLI 修复） | ✅ 已提交并人工裁决通过 | 30 community tests + 全量 |
 | P3-2 WeChat RSS 框架 | ✅ 已随 P3-1 落地 | 配置/适配器已就绪，需用户自行配置 feed |
 | P3-3 early-news 路由模式 | ✅ 已提交并人工裁决通过 | 5 tests + 全量无回归 |
+| P3-1 残留（HN + `wrr test unit`） | ✅ 已提交，R2 OMP 审计中 | CLI 实测 + 全量单测 |
 
-**P3 全部完成。** 当前 HEAD：`a636da5`。
+**P3 全部完成。** 当前 HEAD：`59fa73a`。
 
 后续可选：
 - 发布 v6.2.0 tag（包含 P3 全部功能）。

@@ -317,6 +317,44 @@ def test_community_sources_module_exposes_adapters():
     assert hasattr(cs, "Last30DaysSourceAdapter")
 
 
+def test_opencli_adapter_backup_command_and_query_filter():
+    from wrr.engines import community_sources as cs
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        if "top" in cli:
+            return (0, json.dumps({"results": [
+                {"title": "AI dominates HN", "url": "https://a"},
+                {"title": "Unrelated show", "url": "https://b"},
+            ]}), "")
+        return (1, "", "timeout")
+
+    cfg = {"cli": ["opencli", "hackernews", "search"], "backup_commands": [["opencli", "hackernews", "top"]], "backup_filter_by_query": True}
+    items = run(cs.OpenCliSourceAdapter().fetch(
+        cfg, SearchOptions("AI", count=5), fake_run, 1.0))
+    assert len(calls) == 2
+    assert calls[0] == ["opencli", "hackernews", "search", "AI", "-f", "json", "--limit", "5"]
+    assert calls[1] == ["opencli", "hackernews", "top", "AI", "-f", "json", "--limit", "15"]
+    assert len(items) == 1
+    assert items[0]["title"] == "AI dominates HN"
+
+
+def test_opencli_adapter_backup_skipped_when_no_query():
+    from wrr.engines import community_sources as cs
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (1, "", "timeout")
+
+    cfg = {"cli": ["opencli", "hackernews", "search"], "backup_commands": [["opencli", "hackernews", "top"]]}
+    items = run(cs.OpenCliSourceAdapter().fetch(
+        cfg, SearchOptions("", count=5), fake_run, 1.0))
+    assert len(calls) == 1
+    assert items == []
+
+
 def test_opencli_adapter_preserves_command_and_parsing():
     from wrr.engines import community_sources as cs
     captured = {}
