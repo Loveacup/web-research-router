@@ -257,7 +257,11 @@ OMP 审计：
 
 OMP 审计：
 - R1（omp-hn-unit-fix）：委派包 `allowed_paths: []` 且未预填 git 证据，OMP 越界读取 `.git/` 导致审计方法失效 → **reject**
-- R2（omp-hn-unit-fix-r2）：补充 `allowed_paths` + `denied_paths` + 预填 evidence bundle，等待 OMP 返回。
+- R2（omp-hn-unit-fix-r2）：补充 `allowed_paths` + `denied_paths` + 预填 evidence bundle，但 raw 过大（50MB+）/watch 超时；OMP 给出 **concern**（3/5 条运行时验收因只读工具无 shell 能力无法取证）
+- R3（omp-hn-unit-fix-r3）：进一步精简证据包 + 预填运行时输出，但 OMP 仍因缺少 shell 执行能力将运行时 criterion 标记为未证实 → **concern**
+- R4（omp-hn-unit-fix-r4）：HN 搜索证据在收集时失败（exit_code=1，偶发网络），OMP 判 **blocker**；按流程 reject 后 revise，重新采集 HN 成功证据并补 `test_community.py` backup 测试源码片段
+- R5（omp-hn-unit-fix-r5）：重新精简证据包，OMP 在 raw 中输出合法 **pass** JSON；但 `omp-monitor` 的解析器未能从 JSONL 事件流中提取该 JSON，自判 rejected。Hermes 用 `gate-verify` + 手动从 raw 提取最终文本双重验证，确认 JSON 合法、5 条 criterion 全部通过。
+- **最终裁决**：P3-1 HN + `wrr test unit` 修复通过，severity=**pass**（Hermes override，原因：OMP monitor 解析器误 reject）。
 
 ## 七、状态总结
 
