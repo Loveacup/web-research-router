@@ -66,15 +66,27 @@ def test_quality_ratio():
     assert cm._quality_score(2, 100) == 0.1
 
 
-def test_parse_time_epoch_and_iso():
+def test_parse_time_epoch_iso_and_search_date_formats():
     assert cm._parse_time(1778165271).year >= 2026          # epoch 秒
     assert cm._parse_time(1778165271000).year >= 2026       # epoch 毫秒
     dt = cm._parse_time("2026-06-01T00:00:00Z")
     assert dt is not None
     assert dt.tzinfo is not None
+
+    relative_before = datetime.now(timezone.utc)
+    relative = cm._parse_time("2 hours ago")
+    relative_after = datetime.now(timezone.utc)
+    assert relative is not None
+    assert relative_before - timedelta(hours=2, seconds=1) <= relative <= relative_after - timedelta(hours=2)
+
+    assert cm._parse_time("Apr 28, 2026") == datetime(2026, 4, 28, tzinfo=timezone.utc)
+    assert cm._parse_time("12/01/2024") == datetime(2024, 12, 1, tzinfo=timezone.utc)
+    assert cm._parse_time("Apr 28") is None                # 不猜测缺失年份
+
     # naive / aware subtract must not raise (P3 RSS regression)
     now = datetime(2026, 7, 7, 12, 0, tzinfo=timezone.utc)
     assert cm._recency_score(dt, now) >= 0.0
+    assert cm._recency_score(datetime(2099, 1, 1, tzinfo=timezone.utc), now) == 1.0
     assert cm._parse_time("garbage") is None
     assert cm._parse_time(None) is None
 
@@ -335,7 +347,7 @@ def test_opencli_adapter_backup_command_and_query_filter():
         cfg, SearchOptions("AI", count=5), fake_run, 1.0))
     assert len(calls) == 2
     assert calls[0] == ["opencli", "hackernews", "search", "AI", "-f", "json", "--limit", "5"]
-    assert calls[1] == ["opencli", "hackernews", "top", "AI", "-f", "json", "--limit", "15"]
+    assert calls[1] == ["opencli", "hackernews", "top", "-f", "json", "--limit", "15"]
     assert len(items) == 1
     assert items[0]["title"] == "AI dominates HN"
 
@@ -467,6 +479,154 @@ def test_hackernews_item_without_time():
         w_q * cm._quality_score(50, 100)
     )
     assert abs(score - expected_score) < 1e-9
+
+
+def test_hackernews_item_with_enriched_time_uses_recency():
+    """Firebase 回填的 HN Unix time 必须实际进入统一评分。"""
+    eng = cm.CommunityEngine()
+    cfg = cm.COMMUNITY_SOURCES["hackernews"]
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    item = {
+        "title": "HN story with timestamp",
+        "url": "https://news.ycombinator.com/item?id=12346",
+        "score": 100,
+        "comments": 50,
+        "time": int((now - timedelta(hours=2)).timestamp()),
+    }
+    scored = eng._item_to_result(item, "hackernews", cfg, now)
+    assert scored is not None
+    score, _result = scored
+    w_e, w_r, w_q = config.COMMUNITY_SCORE_WEIGHTS
+    expected_score = (
+        w_e * cm._engagement_score(100, 1000)
+        + w_r * 1.0
+        + w_q * cm._quality_score(50, 100)
+    )
+    assert abs(score - expected_score) < 1e-9
+
+
+def test_hackernews_search_includes_sort_date():
+    """HN primary search 命令应包含 --sort date 参数。"""
+    from wrr.engines import community_sources as cs
+    captured = {}
+
+    async def fake_run(cli, timeout):
+        captured["cli"] = cli
+        return (0, json.dumps([{"title": "HN A", "url": "https://news.ycombinator.com/item?id=1", "score": 10}]), "")
+
+    cfg = cm.COMMUNITY_SOURCES["hackernews"]
+    items = run(cs.OpenCliSourceAdapter().fetch(
+        cfg, SearchOptions("python", count=5), fake_run, 1.0))
+    assert "--sort" in captured["cli"]
+    assert "date" in captured["cli"]
+
+
+def test_hackernews_time_enrichment_from_firebase():
+    """HN 行应尝试从 Firebase API 回填 time 字段（best-effort）。"""
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        # opencli hackernews search 返回无 time 的 items
+        return (0, json.dumps([
+            {"id": 41000001, "title": "Story A", "score": 100},  # 真实 search 形状：无 url
+            {"id": "invalid", "title": "Story B", "score": 50},  # 非法 id
+            {"id": "41000003", "title": "Story C", "score": 30},
+        ]), "")
+
+    # mock httpx.AsyncClient.get
+    class FakeResponse:
+        def __init__(self, data):
+            self._data = data
+        def json(self):
+            return self._data
+        def raise_for_status(self):
+            if self._data is None:
+                raise Exception("404")
+
+    class FakeClient:
+        def __init__(self):
+            self.requests = []
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def get(self, url, timeout=None):
+            self.requests.append(url)
+            item_id = url.split("/")[-1].replace(".json", "")
+            if item_id == "41000001":
+                return FakeResponse({"time": 1720000000})  # Unix 秒
+            elif item_id == "41000003":
+                return FakeResponse({"time": 1720001000})
+            return FakeResponse(None)  # 模拟 404
+
+    fake_client = FakeClient()
+
+    import wrr.engines.community_sources as cs_module
+    orig_httpx = cs_module.httpx
+    try:
+        # 注入 fake httpx
+        class FakeHttpx:
+            AsyncClient = lambda *args, **kwargs: fake_client
+        cs_module.httpx = FakeHttpx()
+
+        cfg = cm.COMMUNITY_SOURCES["hackernews"]
+        items = run(cs.OpenCliSourceAdapter().fetch(
+            cfg, SearchOptions("python", count=5), fake_run, 2.0))
+    finally:
+        cs_module.httpx = orig_httpx
+
+    assert len(items) == 3
+    assert items[0]["url"] == "https://news.ycombinator.com/item?id=41000001"
+    assert items[2]["url"] == "https://news.ycombinator.com/item?id=41000003"
+    # 检查 time 是否已回填
+    assert items[0].get("time") == 1720000000  # Story A 成功回填
+    assert "time" not in items[1]              # Story B 无效 id,保持无 time
+    assert items[2].get("time") == 1720001000  # Story C 成功回填
+    # 验证请求了正确的 Firebase URL
+    assert len(fake_client.requests) == 2  # 只请求了两个有效 id
+    assert "41000001" in fake_client.requests[0]
+    assert "41000003" in fake_client.requests[1]
+
+
+def test_hackernews_time_enrichment_timeout_bounded():
+    """HN Firebase 回填应有超时限制,避免阻塞整个搜索。"""
+    from wrr.engines import community_sources as cs
+    import time
+
+    async def fake_run(cli, timeout):
+        return (0, json.dumps([
+            {"title": "Story", "url": "https://news.ycombinator.com/item?id=41000001", "score": 100},
+        ]), "")
+
+    class SlowClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def get(self, url, timeout=None):
+            await asyncio.sleep(10)  # 模拟超时
+            return None
+
+    import wrr.engines.community_sources as cs_module
+    orig_httpx = cs_module.httpx
+    try:
+        class FakeHttpx:
+            AsyncClient = lambda *args, **kwargs: SlowClient()
+        cs_module.httpx = FakeHttpx()
+
+        cfg = cm.COMMUNITY_SOURCES["hackernews"]
+        start = time.time()
+        items = run(cs.OpenCliSourceAdapter().fetch(
+            cfg, SearchOptions("python", count=5), fake_run, 2.0))
+        elapsed = time.time() - start
+    finally:
+        cs_module.httpx = orig_httpx
+
+    # 应在 3s 内完成（超时后立即返回,不等待 10s）
+    assert elapsed < 3.0
+    # 超时不影响返回（保持原始 item）
+    assert len(items) == 1
+    assert "time" not in items[0]
 
 
 # ── 自动触发链 ───────────────────────────────────────────────────────

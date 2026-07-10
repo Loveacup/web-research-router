@@ -24,7 +24,7 @@ import math
 import os
 import re
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import SearchEngine
@@ -78,9 +78,10 @@ COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
     },
     "hackernews": {
         "kind": "opencli", "cli": ["opencli", "hackernews", "search"],
+        "cli_extra_args": ["--sort", "date"],
         "backup_commands": [["opencli", "hackernews", "top"]],
         "backup_filter_by_query": True,
-        "engagement": "score", "comments": "comments", "time": None,
+        "engagement": "score", "comments": "comments", "time": "time",
         "title": "title", "url": "url", "snippet": "title", "eng_max": 1000,
     },
     "last30days_en": {
@@ -102,8 +103,28 @@ def _to_int(v) -> int:
         return 0
 
 
+_RELATIVE_TIME_RE = re.compile(
+    r"\b(\d+)\s*(minute|hour|day|week|month|year)s?\s*ago\b", re.IGNORECASE
+)
+_MONTH_NAME_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y")
+_SHORT_DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%d/%m/%y")
+_RELATIVE_TIME_DELTAS = {
+    "minute": "minutes",
+    "hour": "hours",
+    "day": "days",
+    "week": "weeks",
+    "month": "days",
+    "year": "days",
+}
+
+
 def _parse_time(time_val) -> Optional[datetime]:
-    """解析 Unix 秒/毫秒 或 ISO 8601。"""
+    """解析 Unix 秒/毫秒、ISO 8601 与常见搜索摘要中的英文日期。
+
+    自然语言日期只接受带年份的绝对日期，避免把 ``Apr 28`` 这类缺少
+    年份的内容错误归为当年；相对日期（如 ``2 hours ago``）以当前 UTC
+    时间为基准。所有成功结果都归一化为带 UTC 时区的 datetime。
+    """
     if isinstance(time_val, datetime):
         return time_val if time_val.tzinfo else time_val.replace(tzinfo=timezone.utc)
     if isinstance(time_val, (int, float)) and time_val > 0:
@@ -112,12 +133,32 @@ def _parse_time(time_val) -> Optional[datetime]:
             return datetime.fromtimestamp(ts, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
-    if isinstance(time_val, str) and time_val:
+    if not isinstance(time_val, str) or not time_val.strip():
+        return None
+
+    value = time_val.strip()
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    relative = _RELATIVE_TIME_RE.search(value)
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2).lower()
+        # Month/year use deliberately coarse day approximations for ranking only.
+        kwargs = {_RELATIVE_TIME_DELTAS[unit]: amount * ({"month": 30, "year": 365}.get(unit, 1))}
+        return datetime.now(timezone.utc) - timedelta(**kwargs)
+
+    for fmt in _MONTH_NAME_DATE_FORMATS + _SHORT_DATE_FORMATS:
         try:
-            dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(value, fmt)
         except ValueError:
-            return None
+            continue
+        # Date strings found in snippets may be versions or unrelated numbers.
+        if 1990 <= dt.year <= datetime.now(timezone.utc).year + 1:
+            return dt.replace(tzinfo=timezone.utc)
     return None
 
 

@@ -10,6 +10,7 @@
     适配器自身不持有子进程实现，也不导入 community（避免循环依赖）。
   - 禁止在本模块引入任何浏览器自动化框架或浏览器启动逻辑。
 """
+import asyncio
 import json
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -72,9 +73,13 @@ class OpenCliSourceAdapter:
             is_backup = idx > 0
             if is_backup and not options.query:
                 continue
-            # backup 命令通常不含 <query> 占位；这里统一追加 query（适配器可自行忽略）
-            call = cli + [options.query, "-f", "json",
-                          "--limit", str(min(options.count * 3 if is_backup else options.count, 20))]
+            # backup 命令通常不含 <query> 位置参数；仍用 options.query 做本地标题过滤。
+            # 只有 primary search 接收 query；top/new 等 backup 命令没有位置参数。
+            call = cli + ([] if is_backup else [options.query])
+            # 支持 cli_extra_args（如 HN 的 --sort date）
+            if not is_backup and cfg.get("cli_extra_args"):
+                call.extend(cfg["cli_extra_args"])
+            call.extend(["-f", "json", "--limit", str(min(options.count * 3 if is_backup else options.count, 20))])
             rc, out, err = await run_cmd(call, timeout)
             if rc != 0 or not out.strip():
                 continue
@@ -88,8 +93,64 @@ class OpenCliSourceAdapter:
             if is_backup and cfg.get("backup_filter_by_query"):
                 q = (options.query or "").lower()
                 items = [it for it in items if q in str(it.get(cfg.get("title", "title"), "")).lower()]
+            # P3-2: HN 时效回填
+            if cli[:3] == ["opencli", "hackernews", "search"]:
+                items = await self._enrich_hn_time(items)
             return items[:options.count]
         return []
+
+    async def _enrich_hn_time(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Best-effort 回填 HN item 的 time 字段（从 Firebase API）。
+
+        仅处理有效 id（URL 格式 https://news.ycombinator.com/item?id=<num>）。
+        并发限制 5、超时 1.5s、失败保持原 item。
+        """
+        if httpx is None:
+            return items
+
+        import re
+        id_pattern = re.compile(r"news\.ycombinator\.com/item\?id=(\d+)")
+
+        # OpenCLI search 返回 item.id；top 兼容旧形状时再从 URL 回退提取。
+        tasks = []
+        seen_ids = set()
+        for i, item in enumerate(items):
+            raw_id = item.get("id")
+            item_id = str(raw_id) if isinstance(raw_id, (int, str)) else ""
+            if not item_id.isdigit():
+                match = id_pattern.search(str(item.get("url", "")))
+                item_id = match.group(1) if match else ""
+            if not item_id or item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            # OpenCLI HN search 行只含 id/title；构造官方 item 的 canonical URL，
+            # 让聚合层不会因缺 url 丢弃这条已检索到的 story。
+            if not str(item.get("url") or "").strip():
+                item["url"] = f"https://news.ycombinator.com/item?id={item_id}"
+            tasks.append((item_id, i))
+
+        if not tasks:
+            return items
+
+        # 并发回填（限制 5 并发、单请求超时 1.5s）
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_time(item_id: str, idx: int):
+            async with sem:
+                try:
+                    async def _do_fetch():
+                        async with httpx.AsyncClient(timeout=1.5) as client:
+                            resp = await client.get(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json")
+                            resp.raise_for_status()
+                            data = resp.json()
+                            if "time" in data and data["time"]:
+                                items[idx]["time"] = data["time"]
+                    await asyncio.wait_for(_do_fetch(), timeout=1.5)
+                except Exception:
+                    pass  # best-effort,失败保持原样
+
+        await asyncio.gather(*[fetch_time(tid, tidx) for tid, tidx in tasks], return_exceptions=True)
+        return items
 
 
 class Last30DaysSourceAdapter:
