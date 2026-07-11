@@ -5,7 +5,7 @@ plugin.yaml ``entry: __init__.py`` 指向此文件。这是兼容 Hermes plugin 
 wrr.doctor / wrr.engines.loader），所有重依赖在 ``register(ctx)`` 内部延迟 import。
 """
 
-__version__ = "6.1.0"
+__version__ = "6.1.1"
 
 _SEARCH_PROVIDERS = [
     "exa", "brave", "community", "academic", "github", "skill", "searxng",

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -131,6 +132,12 @@ def rrf_fuse(per_source: Dict[str, List[SearchResult]],
             slot["rrf"] += w * mult * local_mult / (k + rank)
             slot["sources"].add(source)
             # 代表条目：取已有快照或更靠前者（首见即代表，已是源内最高秩）
+    for slot in bucket.values():
+        slot["doc"] = replace(
+            slot["doc"],
+            fusion_sources=sorted(slot["sources"]),
+            rrf_score=slot["rrf"],
+        )
     return sorted(bucket.values(), key=lambda s: s["rrf"], reverse=True)
 
 
@@ -152,17 +159,31 @@ def dedup_cluster(docs: List[SearchResult],
     输入应已按分数降序，先到者即簇代表。返回去重后的 SearchResult 列表。
     """
     out: List[SearchResult] = []
-    seen_urls: set = set()
+    seen_urls: Dict[str, int] = {}
     seen_tokens: List[set] = []
     for d in docs:
         cu = canonical_url(d.url)
-        if cu and cu in seen_urls:
-            continue
         toks = _title_tokens(d.title)
-        if any(_jaccard(toks, t) > jaccard_threshold for t in seen_tokens):
+        duplicate_index = seen_urls.get(cu) if cu else None
+        if duplicate_index is None:
+            duplicate_index = next(
+                (i for i, t in enumerate(seen_tokens)
+                 if _jaccard(toks, t) > jaccard_threshold),
+                None,
+            )
+        if duplicate_index is not None:
+            representative = out[duplicate_index]
+            merged_sources = sorted(
+                set(representative.fusion_sources) | set(d.fusion_sources)
+            )
+            if merged_sources != representative.fusion_sources:
+                out[duplicate_index] = replace(
+                    representative,
+                    fusion_sources=merged_sources,
+                )
             continue
         if cu:
-            seen_urls.add(cu)
+            seen_urls[cu] = len(out)
         seen_tokens.append(toks)
         out.append(d)
     return out

@@ -23,6 +23,40 @@ def _banner(result: RouterResult, primary: str) -> str:
             f"已降级到 **{result.actual_provider}**\n\n")
 
 
+def quality_payload(result: RouterResult) -> dict:
+    if result.quality is not None:
+        return result.quality.to_dict()
+    return {
+        "verdict": "complete",
+        "expected_sources": [result.actual_provider],
+        "successful_sources": [result.actual_provider],
+        "failed_sources": [],
+        "independent_source_count": 1,
+        "min_required": 1,
+        "reasons": ["legacy_route_without_quality"],
+    }
+
+
+def failed_quality_payload() -> dict:
+    return {
+        "verdict": "failed",
+        "expected_sources": [],
+        "successful_sources": [],
+        "failed_sources": [],
+        "independent_source_count": 0,
+        "min_required": 1,
+        "reasons": ["no_valid_results"],
+    }
+
+
+def _quality_banner(quality: dict) -> str:
+    verdict = quality["verdict"]
+    if verdict == "complete":
+        return ""
+    return (f"> ⚠️ quality: **{verdict}** "
+            f"({quality['independent_source_count']}/{quality['min_required']} sources)\n\n")
+
+
 def format_search(result: RouterResult, query: str) -> str:
     primary = config.SEARCH_FALLBACK_ORDER[0]
     items = result.payload
@@ -39,6 +73,8 @@ def format_search(result: RouterResult, query: str) -> str:
         "fallback_chain": _chain_dicts(result.fallback_chain),
         "backup_hint": config.BACKUP_HINT,
     }
+    quality = quality_payload(result)
+    details["quality"] = quality
     # v5：mode 路由 + RRF 融合诊断（仅 v5 路径有值）
     if result.mode is not None:
         details["mode"] = result.mode
@@ -48,6 +84,7 @@ def format_search(result: RouterResult, query: str) -> str:
     if result.diagnostics is not None:
         details["diagnostics"] = result.diagnostics.to_dict()
     banner = "" if result.mode is not None else _banner(result, primary)
+    banner += _quality_banner(quality)
     return json.dumps({
         "success": True,
         "content": f'## web_search (provider: {result.actual_provider}, query: "{query}")\n\n'
@@ -59,12 +96,13 @@ def format_search(result: RouterResult, query: str) -> str:
 def format_extract(result: RouterResult, url: str) -> str:
     primary = config.EXTRACT_FALLBACK_ORDER[0]
     ex = result.payload
+    quality = quality_payload(result)
     hl = ("\n\n**Highlights:**\n" + "\n".join(f"- {h}" for h in ex.highlights)
           ) if ex.highlights else ""
     return json.dumps({
         "success": True,
         "content": f"## web_fetch (provider: {result.actual_provider}, url: {url})\n\n"
-                   f"{_banner(result, primary)}{ex.text}{hl}",
+                   f"{_banner(result, primary)}{_quality_banner(quality)}{ex.text}{hl}",
         "details": {
             "url": url,
             "provider": result.actual_provider,
@@ -73,19 +111,22 @@ def format_extract(result: RouterResult, url: str) -> str:
             "highlights": ex.highlights,
             "fallback_chain": _chain_dicts(result.fallback_chain),
             "backup_hint": config.BACKUP_HINT,
+            "quality": quality,
         },
     }, ensure_ascii=False)
 
 
 def format_similar(result: RouterResult, url: str) -> str:
     items = result.payload
+    quality = quality_payload(result)
     formatted = "\n\n".join(
         f"**{i + 1}. {r.title}**\n   {r.url}\n   {r.snippet}"
         for i, r in enumerate(items)
     )
     return json.dumps({
         "success": True,
-        "content": f"## web_similar (provider: {result.actual_provider}, url: {url})\n\n{formatted}",
+        "content": f"## web_similar (provider: {result.actual_provider}, url: {url})\n\n"
+                   f"{_quality_banner(quality)}{formatted}",
         "details": {
             "url": url,
             "provider": result.actual_provider,
@@ -93,6 +134,7 @@ def format_similar(result: RouterResult, url: str) -> str:
             "results": [r.to_dict() for r in items],
             "fallback_chain": _chain_dicts(result.fallback_chain),
             "backup_hint": config.BACKUP_HINT,
+            "quality": quality,
         },
     }, ensure_ascii=False)
 
@@ -101,7 +143,10 @@ def format_error(operation: str, identifier: str, error: Exception,
                  fallback_chain: Optional[List[FallbackStep]] = None) -> str:
     payload = {
         "error": f"{operation} failed: {str(error)}",
-        "details": {"identifier": identifier},
+        "details": {
+            "identifier": identifier,
+            "quality": failed_quality_payload(),
+        },
     }
     if fallback_chain is not None:
         payload["details"]["fallback_chain"] = _chain_dicts(fallback_chain)

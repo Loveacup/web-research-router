@@ -84,7 +84,15 @@ def _result_to_payload(operation: str, result) -> object:
     """RouterResult.payload → 可 JSON 化结构（search/similar 为 list，extract 为 dict）。"""
     payload = result.payload
     if isinstance(payload, list):
-        return [dataclasses.asdict(r) for r in payload]
+        items = []
+        for item in payload:
+            value = dataclasses.asdict(item)
+            if not value.get("fusion_sources"):
+                value.pop("fusion_sources", None)
+            if value.get("rrf_score") is None:
+                value.pop("rrf_score", None)
+            items.append(value)
+        return items
     if dataclasses.is_dataclass(payload):
         return dataclasses.asdict(payload)
     return payload
@@ -104,12 +112,14 @@ async def _run(operation: str, options, provider: str | None):
 def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatter):
     """执行 + 渲染 + 退出码。返回 0/1。"""
     from wrr.errors import AllEnginesFailedError, WRRError
+    from wrr.formatters import failed_quality_payload, quality_payload
     try:
         result = asyncio.run(_run(operation, options, provider))
     except AllEnginesFailedError as e:
         if as_json:
             _emit_json({"operation": operation, "ok": False,
-                        "error": "all_engines_failed", "detail": str(e)})
+                        "error": "all_engines_failed", "detail": str(e),
+                        "quality": failed_quality_payload()})
         else:
             _eprint(f"✗ 所有引擎失败（{operation}）：\n{e}")
             _eprint("  提示：检查 API key（EXA_API_KEY / BRAVE_API_KEY / SEARXNG_URL）、"
@@ -118,7 +128,8 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
     except WRRError as e:
         if as_json:
             _emit_json({"operation": operation, "ok": False,
-                        "error": type(e).__name__, "detail": str(e)})
+                        "error": type(e).__name__, "detail": str(e),
+                        "quality": failed_quality_payload()})
         else:
             _eprint(f"✗ {type(e).__name__}: {e}")
         return 1
@@ -130,6 +141,7 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
             "provider": result.actual_provider,
             "fallback_chain": _chain_to_list(result),
             "result": _result_to_payload(operation, result),
+            "quality": quality_payload(result),
         }
         if hasattr(result, "diagnostics") and result.diagnostics is not None:
             payload["diagnostics"] = result.diagnostics.to_dict()

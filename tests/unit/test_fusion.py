@@ -114,3 +114,43 @@ def test_dedup_cluster_title_jaccard():
     ]
     clusters = fz.dedup_cluster(docs, jaccard_threshold=0.8)
     assert len(clusters) == 1                          # 标题高度相似 → 合并
+
+
+def test_rrf_materializes_provenance_without_mutating_inputs():
+    first = SearchResult(title="A", url="https://a")
+    duplicate = SearchResult(title="A copy", url="https://a?utm_source=s2")
+    per_source = {"s1": [first], "s2": [duplicate]}
+
+    fused = fz.rrf_fuse(per_source, k=60)
+    item = fused[0]
+
+    assert item["sources"] == {"s1", "s2"}          # 旧 wrapper 契约保留
+    assert item["doc"].fusion_sources == ["s1", "s2"]
+    assert item["doc"].rrf_score == item["rrf"]
+    assert item["doc"] is not first                    # 不原地污染调用方对象
+    assert first.to_dict() == {
+        "title": "A", "url": "https://a", "snippet": "",
+        "highlights": [], "source_tag": "",
+    }
+
+
+def test_dedup_cluster_merges_fusion_sources_without_reordering_or_rescoring():
+    representative = SearchResult(
+        title="GPT 5 released today",
+        url="https://a.com/1",
+        fusion_sources=["s1"],
+        rrf_score=0.9,
+    )
+    duplicate = SearchResult(
+        title="GPT 5 released today",
+        url="https://b.com/2",
+        fusion_sources=["s2", "s1"],
+        rrf_score=0.5,
+    )
+
+    clusters = fz.dedup_cluster([representative, duplicate], jaccard_threshold=0.8)
+
+    assert len(clusters) == 1
+    assert clusters[0].url == representative.url
+    assert clusters[0].fusion_sources == ["s1", "s2"]
+    assert clusters[0].rrf_score == 0.9

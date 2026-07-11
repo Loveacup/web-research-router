@@ -90,7 +90,13 @@ def test_live_health_is_cached_until_ttl_expires(tmp_path):
 
     marker.unlink()
     second = _registry(tmp_path, state_file, plugin_paths, ttl=60).health(mode="live")[0]
-    assert second.to_dict() == first.to_dict()
+    # P0-2: health_source differs (probe vs cache), so compare without it
+    first_dict = first.to_dict()
+    second_dict = second.to_dict()
+    assert second_dict.get("health_source") == "cache"
+    first_dict.pop("health_source", None)
+    second_dict.pop("health_source", None)
+    assert second_dict == first_dict
     assert not marker.exists()
 
     state = load_state(state_file)
@@ -111,7 +117,13 @@ def test_auto_health_reuses_live_cache_but_does_not_run_live_probe(tmp_path):
 
     auto = _registry(tmp_path, state_file, plugin_paths).health(mode="auto")[0]
 
-    assert auto.to_dict() == live.to_dict()
+    # P0-2: health_source differs (probe vs cache), so compare without it
+    live_dict = live.to_dict()
+    auto_dict = auto.to_dict()
+    assert auto_dict.get("health_source") == "cache"
+    live_dict.pop("health_source", None)
+    auto_dict.pop("health_source", None)
+    assert auto_dict == live_dict
     assert not marker.exists()
 
 
@@ -294,8 +306,10 @@ def test_circuit_breaker_state_survives_registry_instances(tmp_path):
     report = _registry(tmp_path, state_file, plugin_paths).report()
     descriptor = report.resolved[0]
 
+    assert descriptor.health is not None
     assert descriptor.health.status == "unhealthy"
     assert descriptor.health.checks[0].type == "circuit_breaker"
+    assert descriptor.health.health_source == "circuit_breaker"
     assert descriptor.routable is False
 
 
@@ -520,3 +534,118 @@ def test_doctor_v6_deep_runs_live_health(tmp_path, monkeypatch):
     probe = next(item for item in payload["health"] if item["engine_id"] == "probe")
     assert probe["checks"][1]["type"] == "live_probe"
     assert marker.exists()
+
+
+def test_doctor_v6_non_deep_reuses_live_cache_with_diagnostic_truth(tmp_path, monkeypatch):
+    """P0-2: non-deep doctor_v6 reuses live cache without probing and exposes diagnostic truth."""
+    plugin_paths, marker = _plugin(tmp_path)
+    state_file = tmp_path / "doctor-state.json"
+    monkeypatch.setenv("WRR_STATE_PATH", str(state_file))
+
+    # Seed live cache via live health
+    _registry(tmp_path, state_file, plugin_paths).health(mode="live")
+    assert marker.exists()
+    marker.unlink()
+
+    # Inject V6_ROUTER env for diagnostic truth
+    test_env = {"WRR_V6_ROUTER": "auto"}
+    monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
+
+    # Non-deep doctor_v6 must reuse live cache without probing
+    payload = doctor_v6(
+        runtime_hint="standalone",
+        cwd=tmp_path,
+        env=test_env,
+        plugin_paths=[plugin_paths],
+        deep=False,
+        trust_project=True,
+    ).to_dict()
+
+    # Assert probe never ran
+    assert not marker.exists()
+
+    # Assert health has capability and health_source diagnostics
+    probe_health = next(item for item in payload["health"] if item["engine_id"] == "probe")
+    assert probe_health.get("capability") == "live"
+    assert probe_health.get("health_source") == "cache"
+    assert isinstance(probe_health.get("health_cache_age_ms"), (int, float))
+    assert probe_health.get("health_cache_expires_at") is not None
+
+    # Router enables descriptor routing only for the literal WRR_V6_ROUTER="1".
+    assert payload["summary"].get("v6_router_enabled") is False
+    assert payload["summary"].get("v6_router_setting") == "auto"
+
+    # Assert additive diagnostics in resolved
+    probe_descriptor = next(item for item in payload["resolved"] if item["id"] == "probe")
+    assert probe_descriptor.get("registry_source") is not None
+    assert probe_descriptor.get("routable_reason") is not None
+    assert "routable_reasons" in probe_descriptor
+
+
+def test_v6_router_enabled_semantic_bool_from_env(tmp_path, monkeypatch):
+    """Doctor must mirror router.py's strict WRR_V6_ROUTER == "1" contract."""
+    plugin_paths, _marker = _plugin(tmp_path)
+
+    def summary(env):
+        return doctor_v6(
+            runtime_hint="standalone",
+            cwd=tmp_path,
+            env=env,
+            plugin_paths=[plugin_paths],
+            deep=False,
+            trust_project=True,
+        ).to_dict()["summary"]
+
+    enabled = summary({"WRR_V6_ROUTER": "1"})
+    assert enabled["v6_router_enabled"] is True
+    assert enabled["v6_router_setting"] == "1"
+
+    disabled = summary({"WRR_V6_ROUTER": "0"})
+    assert disabled["v6_router_enabled"] is False
+    assert disabled["v6_router_setting"] == "0"
+
+    auto = summary({"WRR_V6_ROUTER": "auto"})
+    assert auto["v6_router_enabled"] is False
+    assert auto["v6_router_setting"] == "auto"
+
+    # router.py ignores this legacy-looking alias entirely.
+    alias_only = summary({"V6_ROUTER": "1"})
+    assert alias_only["v6_router_enabled"] is False
+    assert "v6_router_setting" not in alias_only
+
+    unset = summary({})
+    assert unset["v6_router_enabled"] is False
+    assert "v6_router_setting" not in unset
+
+
+def test_health_source_diagnostic_for_all_paths(tmp_path, monkeypatch):
+    """P0-2 R3: health_source must be light/cache/live_recovery for all health paths."""
+    plugin_paths, marker = _plugin(tmp_path)
+    state_file = tmp_path / "doctor-state.json"
+    monkeypatch.setenv("WRR_STATE_PATH", str(state_file))
+
+    # Test case 1: light health → health_source=light
+    registry = _registry(tmp_path, state_file, plugin_paths)
+    light_health = registry.health(mode="light")[0]
+    assert light_health.health_source == "light"
+
+    # Test case 2: live health → health_source=probe
+    live_health = registry.health(mode="live")[0]
+    assert live_health.health_source == "probe"
+    marker.unlink()
+
+    # Test case 3: cached live health → health_source=cache
+    cached_health = registry.health(mode="auto")[0]
+    assert cached_health.health_source == "cache"
+
+    # Test case 4: deep doctor (live_recovery) → health_source=live_recovery
+    payload = doctor_v6(
+        runtime_hint="standalone",
+        cwd=tmp_path,
+        env={},
+        plugin_paths=[plugin_paths],
+        deep=True,
+        trust_project=True,
+    ).to_dict()
+    probe_health = next(item for item in payload["health"] if item["engine_id"] == "probe")
+    assert probe_health.get("health_source") == "live_recovery"

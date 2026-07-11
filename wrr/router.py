@@ -15,7 +15,8 @@ from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
 from .errors import EngineError, AllEnginesFailedError
-from .schemas import DiagnosticEvent, FallbackStep, RouteTrace, RouterResult, SearchResult
+from .schemas import (DiagnosticEvent, FallbackStep, RouteQuality, RouteTrace,
+                      RouterResult, SearchResult)
 
 
 class SearchRegistry(Protocol):
@@ -168,6 +169,12 @@ async def route(operation: str, options, registry: SearchRegistry,
         raise AllEnginesFailedError(f"All engines failed for {operation}:\n{reasons}")
 
     route_elapsed = _elapsed_ms(start)
+    quality = _route_quality(
+        None,
+        [step.provider for step in steps],
+        steps,
+        payload is not None,
+    )
     trace = RouteTrace(
         mode=None,
         mode_reason="v4_fallback_chain",
@@ -175,6 +182,7 @@ async def route(operation: str, options, registry: SearchRegistry,
         events=events,
         elapsed_ms=route_elapsed,
         timeout_ms=budget * 1000.0,
+        quality=quality,
     )
     return RouterResult(actual_provider=actual, payload=payload, fallback_chain=steps,
                         diagnostics=trace)
@@ -187,6 +195,56 @@ async def route(operation: str, options, registry: SearchRegistry,
 
 _V5_MODES = ("discovery", "grounding", "research", "academic", "platform",
              "recovery", "local", "broad")
+
+_QUALITY_MIN_SOURCES = {
+    "grounding": 2,
+    "academic": 2,
+    "research": 2,
+    "broad": 2,
+    "discovery": 1,
+    "platform": 1,
+    "local": 1,
+    "recovery": 1,
+}
+
+
+def _unique(items) -> List[str]:
+    return list(dict.fromkeys(items))
+
+
+def _route_quality(mode, selected_engines, steps, has_results: bool) -> RouteQuality:
+    """按 D2 contract 计算 route-level quality；不改变路由控制流。"""
+    expected = _unique(selected_engines)
+    successful_set = {
+        step.provider for step in steps
+        if step.ok and step.count > 0 and step.provider in expected
+    }
+    successful = [name for name in expected if name in successful_set]
+    failed = [name for name in expected if name not in successful_set]
+    min_required = _QUALITY_MIN_SOURCES.get(mode, 1)
+
+    if not has_results:
+        verdict = "failed"
+        reasons = ["no_valid_results"]
+    elif len(successful) < min_required:
+        verdict = "insufficient"
+        reasons = [f"successful_sources_below_minimum:{len(successful)}<{min_required}"]
+    elif failed:
+        verdict = "degraded_success"
+        reasons = ["expected_sources_failed"]
+    else:
+        verdict = "complete"
+        reasons = []
+
+    return RouteQuality(
+        verdict=verdict,
+        expected_sources=expected,
+        successful_sources=successful,
+        failed_sources=failed,
+        independent_source_count=len(successful),
+        min_required=min_required,
+        reasons=reasons,
+    )
 
 
 def resolve_mode(options) -> str:
@@ -383,6 +441,7 @@ async def route_search_v5(
         events.extend(revents)
         if rpayload is not None:
             route_elapsed = _elapsed_ms(route_start)
+            quality = _route_quality("recovery", rec_names, steps, bool(rpayload))
             trace = RouteTrace(
                 mode="recovery",
                 mode_reason="recovery_fallback",
@@ -390,6 +449,7 @@ async def route_search_v5(
                 events=events,
                 elapsed_ms=route_elapsed,
                 timeout_ms=budget * 1000.0,
+                quality=quality,
             )
             return RouterResult(actual_provider=f"rrf:recovery", payload=rpayload,
                                 fallback_chain=steps, mode="recovery",
@@ -401,6 +461,9 @@ async def route_search_v5(
         raise AllEnginesFailedError(f"All engines failed for search (mode={mode}):\n{reasons}")
 
     route_elapsed = _elapsed_ms(route_start)
+    quality = _route_quality(
+        mode, [step.provider for step in steps], steps, bool(payload)
+    )
     trace = RouteTrace(
         mode=mode,
         mode_reason=mode_reason,
@@ -408,6 +471,7 @@ async def route_search_v5(
         events=events,
         elapsed_ms=route_elapsed,
         timeout_ms=budget * 1000.0,
+        quality=quality,
     )
     used = {n: weights.get(n, 1.0) for n in engine_names}
     return RouterResult(actual_provider=f"rrf:{mode}", payload=payload,

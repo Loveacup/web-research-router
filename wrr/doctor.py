@@ -244,9 +244,9 @@ def doctor_v6(
         include_builtin=True,
         trust_project=trust_project,
     )
-    report = registry.report(health_mode="live_recovery" if deep else "light")
+    report = registry.report(health_mode="live_recovery" if deep else "auto")
     findings = _trust_findings(env_snapshot, report.resolved, trust_project=trust_project)
-    summary = _summarize_v6(report)
+    summary = _summarize_v6(report, env_snapshot, process_env)
     summary["findings"] = len(findings)
     summary["trust_project_explicit"] = trust_project
     return DoctorReport(
@@ -261,7 +261,7 @@ def doctor_v6(
     )
 
 
-def _summarize_v6(report: Any) -> dict[str, Any]:
+def _summarize_v6(report: Any, env: Any = None, process_env: Mapping[str, str] | None = None) -> dict[str, Any]:
     health_counts = {
         "unknown": 0,
         "healthy": 0,
@@ -280,7 +280,11 @@ def _summarize_v6(report: Any) -> dict[str, Any]:
         status = "warn"
     else:
         status = "ok"
-    return {
+
+    # Mirror router.py: only the literal WRR_V6_ROUTER="1" enables v6 routing.
+    v6_router_setting = process_env.get("WRR_V6_ROUTER") if process_env else None
+
+    result = {
         "status": status,
         "discovered": len(report.discovered),
         "valid_discoveries": valid_discoveries,
@@ -294,6 +298,15 @@ def _summarize_v6(report: Any) -> dict[str, Any]:
         "cooldown": health_counts.get("cooldown", 0),
         "routable": len(report.routable),
     }
+
+    # Keep the boolean and raw setting aligned with router.py's exact gate.
+    if v6_router_setting is not None:
+        result["v6_router_enabled"] = v6_router_setting == "1"
+        result["v6_router_setting"] = v6_router_setting
+    else:
+        result["v6_router_enabled"] = False
+
+    return result
 
 
 def _health_with_cache_age(

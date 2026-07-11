@@ -1,8 +1,11 @@
 """formatters 输出契约单测。"""
 import json
 
+import pytest
+
 from conftest import mk_results
-from wrr.schemas import FallbackStep, RouterResult, ExtractResult
+from wrr.schemas import (FallbackStep, RouterResult, ExtractResult,
+                         RouteQuality, RouteTrace)
 from wrr.formatters import format_search, format_extract, format_similar, format_error
 from wrr import config
 
@@ -34,6 +37,7 @@ def test_format_extract_includes_highlights():
     out = json.loads(format_extract(rr, "https://x"))
     assert out["details"]["actualProvider"] == "exa"
     assert out["details"]["highlights"] == ["hl1"]
+    assert out["details"]["quality"]["verdict"] == "complete"
     assert "Highlights" in out["content"]
 
 
@@ -41,6 +45,7 @@ def test_format_similar_keys():
     rr = RouterResult("exa", mk_results(2), [FallbackStep("exa", True, 2)])
     out = json.loads(format_similar(rr, "https://x"))
     assert out["details"]["result_count"] == 2
+    assert out["details"]["quality"]["verdict"] == "complete"
     assert "web_similar" in out["content"]
 
 
@@ -75,3 +80,66 @@ def test_format_search_includes_diagnostics():
     assert d["events"][0]["engine"] == "exa"
     assert d["events"][0]["ok"] is True
     assert d["elapsed_ms"] == 150.7
+
+
+def _result_with_quality(verdict, *, failed=None, success=None, min_required=1):
+    successful = success or ["exa"]
+    failed_sources = failed or []
+    expected = successful + [name for name in failed_sources if name not in successful]
+    quality = RouteQuality(
+        verdict=verdict,
+        expected_sources=expected,
+        successful_sources=successful,
+        failed_sources=failed_sources,
+        independent_source_count=len(successful),
+        min_required=min_required,
+        reasons=[] if verdict == "complete" else ["test_reason"],
+    )
+    trace = RouteTrace(mode="grounding", quality=quality)
+    return RouterResult(
+        "rrf:grounding", mk_results(1), [FallbackStep("exa", True, 1)],
+        mode="grounding", diagnostics=trace,
+    )
+
+
+def test_format_search_always_exposes_machine_readable_quality():
+    complete = json.loads(format_search(_result_with_quality("complete"), "q"))
+    legacy = json.loads(format_search(
+        RouterResult("exa", mk_results(1), [FallbackStep("exa", True, 1)]), "q"
+    ))
+
+    assert complete["details"]["quality"]["verdict"] == "complete"
+    assert "⚠️ quality" not in complete["content"]
+    assert legacy["details"]["quality"]["verdict"] == "complete"
+    assert legacy["details"]["quality"]["reasons"] == ["legacy_route_without_quality"]
+
+
+@pytest.mark.parametrize("verdict", ["insufficient", "degraded_success"])
+def test_format_search_warns_only_for_non_complete_quality(verdict):
+    result = _result_with_quality(
+        verdict, failed=["brave"], success=["exa"], min_required=2,
+    )
+    out = json.loads(format_search(result, "q"))
+
+    assert out["details"]["quality"]["verdict"] == verdict
+    assert "⚠️ quality" in out["content"]
+    assert verdict in out["content"]
+
+
+def test_format_error_exposes_failed_quality():
+    out = json.loads(format_error("web_search", "q", ValueError("boom")))
+
+    quality = out["details"]["quality"]
+    assert quality["verdict"] == "failed"
+    assert quality["independent_source_count"] == 0
+    assert quality["reasons"] == ["no_valid_results"]
+
+
+def test_format_similar_warns_for_noncomplete_quality():
+    result = _result_with_quality(
+        "degraded_success", failed=["brave"], success=["exa"],
+    )
+    out = json.loads(format_similar(result, "https://x"))
+
+    assert out["details"]["quality"]["verdict"] == "degraded_success"
+    assert "⚠️ quality" in out["content"]

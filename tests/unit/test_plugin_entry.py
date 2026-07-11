@@ -9,11 +9,15 @@
   - OpenAI function schema 的 parameters.required 正确（query / url / url）。
 """
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ENTRY = Path(__file__).resolve().parents[2] / "__init__.py"
+PLUGIN_MANIFEST = ENTRY.parent / "plugin.yaml"
+PYPROJECT = ENTRY.parent / "pyproject.toml"
+PACKAGE_INIT = ENTRY.parent / "wrr" / "__init__.py"
 
 FORBIDDEN = ["httpx", "yaml", "wrr.router", "wrr.doctor", "wrr.engines.loader"]
 
@@ -38,6 +42,23 @@ class MockCtx:
             "is_async": is_async,
             "override": override,
         }
+
+
+def _version_from(path: Path, pattern: str) -> str:
+    match = re.search(pattern, path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match is not None, f"version declaration missing from {path}"
+    return match.group(1)
+
+
+def test_canonical_versions_match():
+    """Plugin entry、manifest、package metadata 必须声明同一版本。"""
+    sources = {
+        "plugin_entry": _load_entry().__version__,
+        "plugin_manifest": _version_from(PLUGIN_MANIFEST, r"^version:\s*(\S+)\s*$"),
+        "pyproject": _version_from(PYPROJECT, r'^version\s*=\s*"([^"]+)"\s*$'),
+        "package": _version_from(PACKAGE_INIT, r'^__version__\s*=\s*"([^"]+)"\s*$'),
+    }
+    assert len(set(sources.values())) == 1, sources
 
 
 def test_top_level_import_is_light():

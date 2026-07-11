@@ -141,6 +141,8 @@ class EngineHealth:
     reason: str | None = None
     failure_category: str | None = None
     breaker: dict[str, Any] | None = None
+    capability: str | None = None
+    health_source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -154,6 +156,10 @@ class EngineHealth:
             payload["failure_category"] = self.failure_category
         if self.breaker is not None:
             payload["breaker"] = dict(self.breaker)
+        if self.capability is not None:
+            payload["capability"] = self.capability
+        if self.health_source is not None:
+            payload["health_source"] = self.health_source
         return payload
 
     @classmethod
@@ -174,6 +180,8 @@ class EngineHealth:
                 else None
             ),
             breaker=dict(payload["breaker"]) if isinstance(payload.get("breaker"), Mapping) else None,
+            capability=str(payload["capability"]) if payload.get("capability") is not None else None,
+            health_source=str(payload["health_source"]) if payload.get("health_source") is not None else None,
         )
 
 
@@ -216,7 +224,7 @@ class EngineDescriptor:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "id": self.id,
             "name": self.name,
             "kind": self.kind,
@@ -233,6 +241,13 @@ class EngineDescriptor:
             "manifest": self.manifest.to_dict(),
             "discovery": self.discovery.to_dict(),
         }
+        # P0-2: Inject diagnostic truth
+        payload["registry_source"] = getattr(self.discovery, "source", "unknown")
+        if self.routable_reasons:
+            payload["routable_reason"] = self.routable_reasons[0]
+        else:
+            payload["routable_reason"] = "routable" if self.routable else "not_routable"
+        return payload
 
 
 @dataclass(frozen=True)
@@ -424,6 +439,7 @@ class EngineRegistry:
         breaker = circuit_status(descriptor.id, path=self.state_file)
         if breaker.open:
             breaker_payload = breaker.to_dict()
+            # P0-2 R3: circuit_breaker path gets health_source
             return EngineHealth(
                 descriptor.id,
                 "unhealthy",
@@ -441,6 +457,8 @@ class EngineRegistry:
                 reason="circuit_open",
                 failure_category="daemon_disconnected",
                 breaker=breaker_payload,
+                capability=None,
+                health_source="circuit_breaker",
             )
 
         health_mode = _normalize_health_mode(mode)
@@ -453,7 +471,18 @@ class EngineRegistry:
                 path=self.state_file,
             )
         if cached is not None:
-            return EngineHealth.from_dict(cached)
+            health = EngineHealth.from_dict(cached)
+            # P0-2: Inject diagnostic truth for cached health
+            return EngineHealth(
+                engine_id=health.engine_id,
+                status=health.status,
+                checks=health.checks,
+                reason=health.reason,
+                failure_category=health.failure_category,
+                breaker=health.breaker,
+                capability="live",
+                health_source="cache",
+            )
         if health_mode == "auto":
             health_mode = "light"
 
@@ -471,7 +500,28 @@ class EngineRegistry:
                 self.health_ttl_sec,
                 path=self.state_file,
             )
-        return health
+            # P0-2: Inject diagnostic truth for fresh live probe
+            return EngineHealth(
+                engine_id=health.engine_id,
+                status=health.status,
+                checks=health.checks,
+                reason=health.reason,
+                failure_category=health.failure_category,
+                breaker=health.breaker,
+                capability="live",
+                health_source="probe",
+            )
+        # P0-2 R3: light path gets health_source
+        return EngineHealth(
+            engine_id=health.engine_id,
+            status=health.status,
+            checks=health.checks,
+            reason=health.reason,
+            failure_category=health.failure_category,
+            breaker=health.breaker,
+            capability=health_mode,
+            health_source="light",
+        )
 
     def _manifest_health(
         self,
@@ -514,7 +564,17 @@ class EngineRegistry:
                 self.health_ttl_sec,
                 path=self.state_file,
             )
-            return initial
+            # P0-2 R3: live_recovery path without recovery gets health_source
+            return EngineHealth(
+                engine_id=initial.engine_id,
+                status=initial.status,
+                checks=initial.checks,
+                reason=initial.reason,
+                failure_category=initial.failure_category,
+                breaker=initial.breaker,
+                capability="live",
+                health_source="live_recovery",
+            )
 
         recovery_check = self._run_recovery_command(config)
         if not recovery_check.ok:
@@ -546,7 +606,17 @@ class EngineRegistry:
             self.health_ttl_sec,
             path=self.state_file,
         )
-        return final
+        # P0-2 R3: live_recovery path with successful recovery gets health_source
+        return EngineHealth(
+            engine_id=final.engine_id,
+            status=final.status,
+            checks=final.checks,
+            reason=final.reason,
+            failure_category=final.failure_category,
+            breaker=final.breaker,
+            capability="live",
+            health_source="live_recovery",
+        )
 
     def _run_recovery_command(self, config: Mapping[str, Any]) -> HealthCheckResult:
         command = config.get("command")
@@ -620,6 +690,7 @@ class EngineRegistry:
             cooldown_sec=float(cooldown) if cooldown is not None else DEFAULT_BREAKER_COOLDOWN_SEC,
         )
         checks = tuple([*live_health.checks, recovery_check])
+        # P0-2 R3: recovery failure gets health_source
         return EngineHealth(
             descriptor.id,
             "unhealthy",
@@ -627,6 +698,8 @@ class EngineRegistry:
             reason=reason,
             failure_category="daemon_disconnected",
             breaker=breaker.to_dict(),
+            capability="live",
+            health_source="live_recovery",
         )
 
     def _run_check(

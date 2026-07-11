@@ -25,6 +25,9 @@ class SearchResult:
     # ── v5.3 时效感知 ──
     source_ts: float = 0.0                                # 数据源时间戳（unix timestamp，0=未知）
     freshness_score: float = 0.5                           # 时效分 (0.0-1.0)，0.5=未知
+    # ── v6.2 融合来源（纯加法；非 RRF 结果保持为空）──
+    fusion_sources: List[str] = field(default_factory=list)
+    rrf_score: Optional[float] = None
 
     @property
     def age_days(self) -> Optional[float]:
@@ -44,6 +47,10 @@ class SearchResult:
         if self.source_ts > 0:
             d["source_ts"] = self.source_ts
             d["freshness_score"] = round(self.freshness_score, 3)
+        if self.fusion_sources:
+            d["fusion_sources"] = list(self.fusion_sources)
+        if self.rrf_score is not None:
+            d["rrf_score"] = self.rrf_score
         return d
 
 
@@ -116,6 +123,29 @@ class DiagnosticEvent:
 
 
 @dataclass
+class RouteQuality:
+    """一次路由的机器可读质量判定（来源按 engine/provider 计）。"""
+    verdict: str
+    expected_sources: List[str] = field(default_factory=list)
+    successful_sources: List[str] = field(default_factory=list)
+    failed_sources: List[str] = field(default_factory=list)
+    independent_source_count: int = 0
+    min_required: int = 1
+    reasons: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "expected_sources": list(self.expected_sources),
+            "successful_sources": list(self.successful_sources),
+            "failed_sources": list(self.failed_sources),
+            "independent_source_count": self.independent_source_count,
+            "min_required": self.min_required,
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass
 class RouteTrace:
     """路由过程的诊断追踪信息。"""
     mode: Optional[str] = None
@@ -125,6 +155,7 @@ class RouteTrace:
     elapsed_ms: float = 0.0
     timeout_ms: Optional[float] = None
     health_cache_age_ms: Optional[float] = None
+    quality: Optional[RouteQuality] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -141,6 +172,8 @@ class RouteTrace:
             d["timeout_ms"] = round(self.timeout_ms, 2)
         if self.health_cache_age_ms is not None:
             d["health_cache_age_ms"] = round(self.health_cache_age_ms, 2)
+        if self.quality is not None:
+            d["quality"] = self.quality.to_dict()
         return d
 
 
@@ -156,6 +189,11 @@ class RouterResult:
     weights: Optional[Dict[str, Any]] = None
     # v6.1：诊断追踪
     diagnostics: Optional[RouteTrace] = None
+
+    @property
+    def quality(self) -> Optional[RouteQuality]:
+        """RouteTrace quality 的只读代理，避免双份状态漂移。"""
+        return self.diagnostics.quality if self.diagnostics is not None else None
 
     @property
     def degraded_from(self) -> Optional[str]:
