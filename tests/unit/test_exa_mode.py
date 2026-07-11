@@ -30,8 +30,11 @@ def test_get_search_mode_auto_routing():
 
 
 def test_get_search_mode_explicit_override():
-    # 显式 Exa search type 优先于自动路由
+    # 显式 Exa search type 优先于 route/legacy mode 与自动路由
     assert exa_mod.get_search_mode(SearchOptions("survey", mode="fast")) == "fast"
+    assert exa_mod.get_search_mode(
+        SearchOptions("survey", mode="grounding", route_mode="research", exa_mode="fast")
+    ) == "fast"
 
 
 def test_get_search_mode_maps_wrr_router_modes_to_exa_types():

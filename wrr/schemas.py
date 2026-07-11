@@ -12,7 +12,9 @@ class SearchOptions:
     query: str
     count: int = config.DEFAULT_SEARCH_COUNT
     provider: Optional[str] = None   # 显式 provider → 禁用 fallback
-    mode: Optional[str] = None       # 显式 mode → 禁用自动路由（exa: fast/auto/deep-lite/deep）
+    mode: Optional[str] = None       # legacy 兼容：Hermes WRR mode / CLI Exa alias
+    route_mode: Optional[str] = None # 显式 WRR router mode
+    exa_mode: Optional[str] = None   # 显式 Exa API search type
 
 
 @dataclass

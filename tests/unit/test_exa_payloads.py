@@ -65,6 +65,16 @@ def test_exa_search_uses_mode_timeout():
     assert init_record["kwargs"]["timeout"] == config.EXA_MODE_TIMEOUT["deep"]
 
 
+def test_exa_search_payload_uses_exa_mode_when_route_mode_is_also_set():
+    _patch({"results": [{"title": "T", "url": "U", "text": "body", "highlights": []}]}, "k")
+    eng = exa_mod.ExaEngine()
+    run(eng.search(SearchOptions("hello", route_mode="research", exa_mode="fast")))
+    sent = [r for r in FakeAsyncClient.captured if r.get("method") == "POST"][0]
+    init_record = [r for r in FakeAsyncClient.captured if r.get("method") == "INIT"][0]
+    assert sent["json"]["type"] == "fast"
+    assert init_record["kwargs"]["timeout"] == config.EXA_MODE_TIMEOUT["fast"]
+
+
 def test_exa_extract_and_similar_use_engine_timeout():
     _patch({"results": [{"url": "U", "text": "long", "highlights": []}]}, "k")
     eng = exa_mod.ExaEngine()

@@ -61,16 +61,24 @@ def classify_query(query: str) -> str:
 
 
 def get_search_mode(options: SearchOptions) -> str:
-    """确定搜索模式。显式 mode 优先，否则自动路由。"""
-    # 用户显式指定 mode
-    if options.mode:
-        if options.mode in EXA_SEARCH_TYPES:
-            return options.mode
-        return WRR_MODE_TO_EXA_TYPE.get(options.mode, "auto")
-    
-    # 自动路由
-    query_type = classify_query(options.query)
-    return MODE_ROUTING.get(query_type, "auto")
+    """确定 Exa API search type；exa_mode 优先，legacy mode 保持兼容。"""
+    exa_mode = getattr(options, "exa_mode", None)
+    if exa_mode:
+        return exa_mode if exa_mode in EXA_SEARCH_TYPES else "auto"
+
+    legacy_mode = options.mode
+    if legacy_mode:
+        if legacy_mode in EXA_SEARCH_TYPES:
+            return legacy_mode
+        return WRR_MODE_TO_EXA_TYPE.get(legacy_mode, "auto")
+
+    route_mode = getattr(options, "route_mode", None)
+    if route_mode:
+        return WRR_MODE_TO_EXA_TYPE.get(route_mode, "auto")
+
+    category = classify_query(options.query)
+    return MODE_ROUTING.get(category, "auto")
+
 
 
 def get_timeout_for_mode(mode: str) -> float:

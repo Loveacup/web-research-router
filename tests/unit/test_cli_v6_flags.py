@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import subprocess
@@ -56,6 +57,109 @@ def test_old_cli_examples_still_parse():
     assert similar.cmd == "similar"
     assert similar.provider == "exa"
     assert similar.count == 5
+
+
+def test_search_route_and_exa_mode_flags_are_orthogonal_and_legacy_alias_parses():
+    cli = _load_cli_module()
+    parser = cli.build_parser()
+
+    both = parser.parse_args([
+        "search", "q", "--route-mode", "research", "--exa-mode", "fast",
+    ])
+    assert both.route_mode == "research"
+    assert both.exa_mode == "fast"
+    assert both.mode is None
+
+    legacy = parser.parse_args(["search", "q", "--mode", "deep"])
+    assert legacy.mode == "deep"
+    assert legacy.exa_mode is None
+    assert legacy.route_mode is None
+
+
+def test_cmd_search_rejects_conflicting_legacy_and_explicit_exa_modes(monkeypatch):
+    cli = _load_cli_module()
+    ns = cli.build_parser().parse_args([
+        "search", "q", "--mode", "deep", "--exa-mode", "fast",
+    ])
+    monkeypatch.setattr(cli, "_dispatch", lambda *args, **kwargs: pytest.fail("must not dispatch"))
+
+    assert cli.cmd_search(ns) == 2
+
+    completed = _run_cli("search", "q", "--mode", "deep", "--exa-mode", "fast", "--json")
+    assert completed.returncode == 2
+    assert "值必须一致" in completed.stderr
+
+
+def test_cmd_search_allows_equal_legacy_and_explicit_exa_modes(monkeypatch):
+    cli = _load_cli_module()
+    ns = cli.build_parser().parse_args([
+        "search", "q", "--mode", "deep", "--exa-mode", "deep",
+    ])
+    captured = {}
+
+    def fake_dispatch(operation, options, provider, ident, as_json, quiet, formatter):
+        captured["options"] = options
+        return 0
+
+    monkeypatch.setattr(cli, "_dispatch", fake_dispatch)
+    assert cli.cmd_search(ns) == 0
+    assert captured["options"].mode == "deep"
+    assert captured["options"].exa_mode == "deep"
+
+
+def test_cmd_search_builds_both_mode_fields(monkeypatch):
+    cli = _load_cli_module()
+    ns = cli.build_parser().parse_args([
+        "search", "q", "--route-mode", "research", "--exa-mode", "fast",
+    ])
+    captured = {}
+
+    def fake_dispatch(operation, options, provider, ident, as_json, quiet, formatter):
+        captured["options"] = options
+        return 0
+
+    monkeypatch.setattr(cli, "_dispatch", fake_dispatch)
+    assert cli.cmd_search(ns) == 0
+    assert captured["options"].route_mode == "research"
+    assert captured["options"].exa_mode == "fast"
+
+
+def test_run_uses_v5_only_when_route_mode_is_explicit(monkeypatch):
+    cli = _load_cli_module()
+    import wrr.registry as registry_module
+    import wrr.router as router_module
+    from wrr.schemas import SearchOptions
+
+    calls = []
+    sentinel_v5 = object()
+    sentinel_legacy = object()
+    monkeypatch.setattr(registry_module, "get_registry", lambda: "registry")
+
+    async def fake_v5(options, registry):
+        calls.append(("v5", options.route_mode, registry))
+        return sentinel_v5
+
+    async def fake_legacy(operation, options, registry, explicit_provider=None):
+        calls.append(("legacy", operation, registry, explicit_provider))
+        return sentinel_legacy
+
+    monkeypatch.setattr(router_module, "route_search_v5", fake_v5)
+    monkeypatch.setattr(router_module, "route", fake_legacy)
+
+    routed = asyncio.run(cli._run("search", SearchOptions("q", route_mode="research"), None))
+    explicit = asyncio.run(cli._run(
+        "search", SearchOptions("q", provider="exa", route_mode="research"), "exa"
+    ))
+    legacy = asyncio.run(cli._run("search", SearchOptions("q"), None))
+
+    assert routed is sentinel_v5
+    assert explicit is sentinel_legacy
+    assert legacy is sentinel_legacy
+    assert calls == [
+        ("v5", "research", "registry"),
+        ("legacy", "search", "registry", "exa"),
+        ("legacy", "search", "registry", None),
+    ]
 
 
 def test_search_fetch_similar_provider_choices_are_preserved():

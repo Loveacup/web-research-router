@@ -66,6 +66,7 @@ def test_classify_intent_recovery():
 
 
 def test_resolve_mode_explicit_and_recovery():
+    assert resolve_mode(SearchOptions("anything", route_mode="research", exa_mode="fast")) == "research"
     assert resolve_mode(SearchOptions("anything", mode="recovery")) == "recovery"
     assert resolve_mode(SearchOptions("anything", mode="academic")) == "academic"
     # 非法 mode 回退自动分类

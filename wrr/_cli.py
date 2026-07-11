@@ -6,7 +6,7 @@
 
 用法::
 
-    wrr-cli.py search "查询词" [--provider exa] [--count 10] [--mode deep] [--lang zh-CN]
+    wrr-cli.py search "查询词" [--provider exa] [--count 10] [--exa-mode deep] [--lang zh-CN]
     wrr-cli.py fetch  "https://..." [--provider exa] [--max-chars 5000]
     wrr-cli.py similar "https://..." [--count 10]
     wrr-cli.py test  [--provider exa]
@@ -105,8 +105,12 @@ def _chain_to_list(result) -> list:
 # ── 运行单个动作（统一异常 → 退出码）─────────────────────────────────
 async def _run(operation: str, options, provider: str | None):
     from wrr.registry import get_registry
-    from wrr.router import route
-    return await route(operation, options, get_registry(), explicit_provider=provider)
+    from wrr.router import route, route_search_v5
+
+    registry = get_registry()
+    if operation == "search" and getattr(options, "route_mode", None) and provider is None:
+        return await route_search_v5(options, registry)
+    return await route(operation, options, registry, explicit_provider=provider)
 
 
 def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatter):
@@ -170,8 +174,20 @@ def cmd_search(ns) -> int:
     if ns.count < 1 or ns.count > config.MAX_SEARCH_COUNT:
         _eprint(f"✗ --count 须在 1..{config.MAX_SEARCH_COUNT}")
         return 2
-    opts = SearchOptions(query=ns.query, count=ns.count,
-                         provider=ns.provider, mode=ns.mode)
+    legacy_exa_mode = getattr(ns, "mode", None)
+    explicit_exa_mode = getattr(ns, "exa_mode", None)
+    if legacy_exa_mode and explicit_exa_mode and legacy_exa_mode != explicit_exa_mode:
+        _eprint("✗ --mode 是 deprecated Exa alias；与 --exa-mode 同时使用时值必须一致")
+        return 2
+    effective_exa_mode = explicit_exa_mode or legacy_exa_mode
+    opts = SearchOptions(
+        query=ns.query,
+        count=ns.count,
+        provider=ns.provider,
+        mode=legacy_exa_mode,
+        route_mode=getattr(ns, "route_mode", None),
+        exa_mode=effective_exa_mode,
+    )
     return _dispatch("search", opts, ns.provider, ns.query,
                      ns.json, ns.quiet, format_search)
 
@@ -523,7 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Web Research Router CLI —— 独立于 Hermes 的 search/fetch/similar。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
-               "  wrr-cli.py search \"claude opus 4.8\" --mode deep --count 5\n"
+               "  wrr-cli.py search \"claude opus 4.8\" --exa-mode deep --count 5\n"
                "  wrr-cli.py fetch https://exa.ai --max-chars 2000 --json\n"
                "  wrr-cli.py similar https://exa.ai\n"
                "  wrr-cli.py test --provider exa",
@@ -542,8 +558,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("search", parents=[common], help="多引擎 fallback 搜索")
     sp.add_argument("query")
     sp.add_argument("--count", type=int, default=10, help="结果数（默认 10）")
-    sp.add_argument("--mode", choices=["fast", "auto", "deep-lite", "deep"],
-                    default=None, help="Exa 模式；缺省自动路由")
+    sp.add_argument(
+        "--route-mode",
+        choices=["discovery", "grounding", "research", "academic", "platform",
+                 "recovery", "local", "broad"],
+        default=None,
+        help="WRR 路由 mode；启用 mode/RRF 多引擎路径",
+    )
+    sp.add_argument(
+        "--exa-mode",
+        choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
+        default=None,
+        help="Exa API search type；可与 --route-mode 同时使用",
+    )
+    sp.add_argument(
+        "--mode",
+        choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
+        default=None,
+        help="deprecated：Exa mode 兼容别名；请改用 --exa-mode",
+    )
     sp.set_defaults(func=cmd_search)
 
     fp = sub.add_parser("fetch", parents=[common], help="抓取 URL 正文")

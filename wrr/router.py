@@ -248,10 +248,13 @@ def _route_quality(mode, selected_engines, steps, has_results: bool) -> RouteQua
 
 
 def resolve_mode(options) -> str:
-    """显式 options.mode（若是 v5 mode）优先，否则 classify_intent 自动分类。"""
-    m = getattr(options, "mode", None)
-    if m in _V5_MODES:
-        return m
+    """route_mode 优先；legacy mode 若为 WRR mode 继续兼容，否则自动分类。"""
+    route_mode = getattr(options, "route_mode", None)
+    if route_mode in _V5_MODES:
+        return route_mode
+    legacy_mode = getattr(options, "mode", None)
+    if legacy_mode in _V5_MODES:
+        return legacy_mode
     return config.classify_intent(getattr(options, "query", "") or "")
 
 
@@ -394,7 +397,11 @@ async def route_search_v5(
         return await route("search", options, registry, explicit_provider=explicit)
 
     mode = resolve_mode(options)
-    mode_reason = "explicit" if getattr(options, "mode", None) in _V5_MODES else "classify_intent"
+    explicit_mode = (
+        getattr(options, "route_mode", None) in _V5_MODES
+        or getattr(options, "mode", None) in _V5_MODES
+    )
+    mode_reason = "explicit" if explicit_mode else "classify_intent"
     budget = config.budget_for("search")
     weights = config.MODE_WEIGHTS.get(mode, config.MODE_WEIGHTS["grounding"])
     engine_names = config.mode_engines(mode, getattr(options, "query", "") or "")
