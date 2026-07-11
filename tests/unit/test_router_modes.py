@@ -3,8 +3,8 @@ import asyncio
 
 from conftest import FakeEngine, mk_results
 from wrr.registry import EngineRegistry
-from wrr.router import route_search_v5, resolve_mode
-from wrr.schemas import SearchOptions
+from wrr.router import route_search_v5, resolve_mode, legacy_selection_plan
+from wrr.schemas import SearchOptions, DecisionSnapshot
 from wrr.errors import AllEnginesFailedError
 from wrr import config
 
@@ -223,3 +223,80 @@ def test_recovery_fallback_sets_mode_reason_recovery_fallback():
     # 如果走了 recovery fallback，mode 应为 recovery
     if rr.diagnostics.mode == "recovery":
         assert rr.diagnostics.mode_reason == "recovery_fallback"
+
+
+# ── P1 S1: legacy_selection_plan → frozen DecisionSnapshot ───────────
+def test_legacy_plan_auto_classification():
+    """自动分类：无显式 provider/mode → mode 由 classify_intent 决定。"""
+    plan = legacy_selection_plan(SearchOptions("survey of llm", count=5))
+    assert isinstance(plan, DecisionSnapshot)
+    assert plan.source == "legacy"
+    assert plan.mode == "academic"
+    assert plan.mode_reason == "classify_intent"
+    assert plan.explicit_provider is None
+    assert "academic" in plan.engine_names
+    assert dict(plan.weights).get("academic") == 1.0
+
+
+def test_legacy_plan_explicit_route_mode():
+    """显式 route_mode → mode_reason=explicit，无 explicit_provider。"""
+    plan = legacy_selection_plan(SearchOptions("anything", route_mode="research"))
+    assert plan.mode == "research"
+    assert plan.mode_reason == "explicit"
+    assert plan.explicit_provider is None
+    # legacy mode 别名同样视为显式
+    plan2 = legacy_selection_plan(SearchOptions("anything", mode="academic"))
+    assert plan2.mode == "academic"
+    assert plan2.mode_reason == "explicit"
+
+
+def test_legacy_plan_explicit_provider_single_element():
+    """显式 provider → 单元素 snapshot，mode=None，engine_names=(provider,)。"""
+    plan = legacy_selection_plan(SearchOptions("q", provider="brave"))
+    assert plan.explicit_provider == "brave"
+    assert plan.engine_names == ("brave",)
+    assert plan.mode is None
+    assert plan.mode_reason == "explicit_provider"
+    assert plan.weights == ()
+
+
+def test_decision_snapshot_is_frozen_hashable_and_tuple_typed():
+    """immutability + hash/tuple 合同：快照可安全用于比较与集合键。"""
+    import dataclasses
+    plan = legacy_selection_plan(SearchOptions("survey of llm"))
+    assert isinstance(plan.engine_names, tuple)
+    assert isinstance(plan.weights, tuple)
+    assert all(
+        isinstance(pair, tuple)
+        and len(pair) == 2
+        and isinstance(pair[1], float)
+        for pair in plan.weights
+    )
+    assert plan in {plan}
+    assert isinstance(hash(plan), int)
+    try:
+        plan.mode = "grounding"
+        assert False, "DecisionSnapshot must be frozen (immutable)"
+    except dataclasses.FrozenInstanceError:
+        pass
+
+
+def test_route_search_v5_consumes_legacy_plan(monkeypatch):
+    """用与 config 不同的 sentinel 证明 route_search_v5 真消费 selection seam。"""
+    sentinel = DecisionSnapshot(
+        source="legacy",
+        mode="grounding",
+        mode_reason="sentinel",
+        explicit_provider=None,
+        engine_names=("academic",),
+        weights=(("academic", 0.37),),
+    )
+    monkeypatch.setattr("wrr.router.legacy_selection_plan", lambda options: sentinel)
+
+    rr = run(route_search_v5(SearchOptions("深度分析 ai", count=10), _full_reg()))
+
+    assert rr.mode == "grounding"
+    assert rr.diagnostics is not None
+    assert rr.diagnostics.mode_reason == "sentinel"
+    assert rr.weights == {"academic": 0.37}
+    assert [step.provider for step in rr.fallback_chain] == ["academic"]

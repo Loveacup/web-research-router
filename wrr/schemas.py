@@ -1,6 +1,6 @@
 """WRR 统一 dataclass：Search / Extract / Similar 的 options/result + 路由结构。"""
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import time as _time
 
 from . import config
@@ -80,6 +80,28 @@ class SimilarOptions:
     url: str
     count: int = config.DEFAULT_SEARCH_COUNT
     provider: Optional[str] = None
+
+
+# ── 选择快照（P1 S1）─────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DecisionSnapshot:
+    """一次搜索路由的选择决策快照（frozen / 可哈希）。
+
+    纯选择结果，不含执行副作用；由 legacy_selection_plan(options) 产出，
+    供 route_search_v5 消费，也作为后续选择策略 parity 对比的稳定 seam。
+    - source:            选择策略来源（当前恒为 "legacy"）
+    - mode:              解析出的 WRR mode（显式 provider 时为 None）
+    - mode_reason:       "explicit" | "classify_intent" | "explicit_provider"
+    - explicit_provider: 显式单引擎（无则 None）
+    - engine_names:      待发射引擎组合（保序 tuple）
+    - weights:           (engine, weight) 对的 tuple（显式 provider 时为空）
+    """
+    source: str
+    mode: Optional[str]
+    mode_reason: str
+    explicit_provider: Optional[str]
+    engine_names: Tuple[str, ...]
+    weights: Tuple[Tuple[str, float], ...]
 
 
 # ── 路由公共结构 ─────────────────────────────────────────────────────

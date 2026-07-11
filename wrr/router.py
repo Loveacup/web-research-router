@@ -15,8 +15,8 @@ from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
 from .errors import EngineError, AllEnginesFailedError
-from .schemas import (DiagnosticEvent, FallbackStep, RouteQuality, RouteTrace,
-                      RouterResult, SearchResult)
+from .schemas import (DecisionSnapshot, DiagnosticEvent, FallbackStep,
+                      RouteQuality, RouteTrace, RouterResult, SearchResult)
 
 
 class SearchRegistry(Protocol):
@@ -258,6 +258,42 @@ def resolve_mode(options) -> str:
     return config.classify_intent(getattr(options, "query", "") or "")
 
 
+def legacy_selection_plan(options) -> DecisionSnapshot:
+    """纯选择：从 options 计算 legacy 路由的 DecisionSnapshot（无执行副作用）。
+
+    显式 provider → 单元素 snapshot（mode=None，engine_names=(provider,)）；
+    否则 resolve_mode → mode_engines/MODE_WEIGHTS，weights 收窄到实际引擎组合。
+    """
+    explicit = getattr(options, "provider", None)
+    if explicit:
+        return DecisionSnapshot(
+            source="legacy",
+            mode=None,
+            mode_reason="explicit_provider",
+            explicit_provider=explicit,
+            engine_names=(explicit,),
+            weights=(),
+        )
+    mode = resolve_mode(options)
+    explicit_mode = (
+        getattr(options, "route_mode", None) in _V5_MODES
+        or getattr(options, "mode", None) in _V5_MODES
+    )
+    mode_reason = "explicit" if explicit_mode else "classify_intent"
+    query = getattr(options, "query", "") or ""
+    weights = config.MODE_WEIGHTS.get(mode, config.MODE_WEIGHTS["grounding"])
+    engine_names = config.mode_engines(mode, query)
+    used = tuple((n, float(weights.get(n, 1.0))) for n in engine_names)
+    return DecisionSnapshot(
+        source="legacy",
+        mode=mode,
+        mode_reason=mode_reason,
+        explicit_provider=None,
+        engine_names=tuple(engine_names),
+        weights=used,
+    )
+
+
 def _elapsed_ms(start: float) -> float:
     """计算从 start 到现在的毫秒数。"""
     return (time.monotonic() - start) * 1000.0
@@ -391,20 +427,19 @@ async def route_search_v5(
         descriptor_registry_factory=descriptor_registry_factory,
     )
 
-    # 显式 provider → 单引擎（复用 v4 route 语义，禁用 mode 路由）
-    explicit = getattr(options, "provider", None)
-    if explicit:
-        return await route("search", options, registry, explicit_provider=explicit)
+    # P1 S1：先做纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）
+    plan = legacy_selection_plan(options)
 
-    mode = resolve_mode(options)
-    explicit_mode = (
-        getattr(options, "route_mode", None) in _V5_MODES
-        or getattr(options, "mode", None) in _V5_MODES
-    )
-    mode_reason = "explicit" if explicit_mode else "classify_intent"
+    # 显式 provider → 单引擎（复用 v4 route 语义，禁用 mode 路由）
+    if plan.explicit_provider:
+        return await route("search", options, registry,
+                           explicit_provider=plan.explicit_provider)
+
+    mode = plan.mode
+    mode_reason = plan.mode_reason
     budget = config.budget_for("search")
-    weights = config.MODE_WEIGHTS.get(mode, config.MODE_WEIGHTS["grounding"])
-    engine_names = config.mode_engines(mode, getattr(options, "query", "") or "")
+    weights = dict(plan.weights)
+    engine_names = list(plan.engine_names)
 
     payload, steps, events = await _dispatch(registry, engine_names, options, weights, mode, budget)
 
