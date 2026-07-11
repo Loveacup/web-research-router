@@ -103,6 +103,103 @@ class DecisionSnapshot:
     engine_names: Tuple[str, ...]
     weights: Tuple[Tuple[str, float], ...]
 
+    def __post_init__(self) -> None:
+        if len(set(self.engine_names)) != len(self.engine_names):
+            raise ValueError("duplicate engine names are not allowed")
+        weight_names = tuple(name for name, _ in self.weights)
+        if len(set(weight_names)) != len(weight_names):
+            raise ValueError("duplicate weights are not allowed")
+        if self.explicit_provider is not None:
+            if self.engine_names != (self.explicit_provider,) or self.weights:
+                raise ValueError("explicit_provider must be the sole unweighted engine")
+        elif weight_names != self.engine_names:
+            raise ValueError("weights must align with engine_names in order")
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    """离线 descriptor selection 消费的不可变 control-plane 快照。"""
+
+    snapshot_version: str
+    built_at: float
+    expires_at: float
+    runtime: str
+    profile: str
+    registry_source: str
+    routable_descriptor_ids: Tuple[str, ...]
+    bridged_provider_ids: Tuple[str, ...]
+    missing_provider_ids: Tuple[str, ...]
+    adapter_errors: Tuple[Tuple[str, str], ...]
+    descriptor_reasons: Tuple[Tuple[str, Tuple[str, ...]], ...]
+    descriptor_provider_aliases: Tuple[Tuple[str, str], ...]
+    config_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if self.expires_at < self.built_at:
+            raise ValueError("expires_at must be greater than or equal to built_at")
+
+        object.__setattr__(
+            self, "routable_descriptor_ids", tuple(sorted(set(self.routable_descriptor_ids)))
+        )
+        object.__setattr__(
+            self, "bridged_provider_ids", tuple(sorted(set(self.bridged_provider_ids)))
+        )
+        object.__setattr__(
+            self, "missing_provider_ids", tuple(sorted(set(self.missing_provider_ids)))
+        )
+        object.__setattr__(
+            self, "adapter_errors", _canonical_unique_mapping(self.adapter_errors, "adapter error")
+        )
+        object.__setattr__(
+            self, "descriptor_reasons", _canonical_reason_mapping(self.descriptor_reasons)
+        )
+        object.__setattr__(
+            self,
+            "descriptor_provider_aliases",
+            _canonical_unique_mapping(self.descriptor_provider_aliases, "alias"),
+        )
+
+
+@dataclass(frozen=True)
+class DescriptorSelectionDecision:
+    """离线 descriptor plan；只描述选择，不授权或触发执行。"""
+
+    context_snapshot_version: str
+    config_fingerprint: str
+    legacy_plan: DecisionSnapshot
+    executable: bool
+    status: str
+    selected_provider_ids: Tuple[str, ...]
+    selected_weights: Tuple[Tuple[str, float], ...]
+    blocked: Tuple[Tuple[str, str, Tuple[str, ...]], ...]
+    explicit_provider: Optional[str]
+    explicit_provider_status: Optional[str]
+    reasons: Tuple[str, ...]
+    source: str = "descriptor_selection"
+
+
+def _canonical_unique_mapping(
+    entries: Tuple[Tuple[str, str], ...], label: str
+) -> Tuple[Tuple[str, str], ...]:
+    mapping: Dict[str, str] = {}
+    for key, value in entries:
+        if key in mapping and mapping[key] != value:
+            raise ValueError(f"conflicting {label} for {key}")
+        mapping[key] = value
+    return tuple(sorted(mapping.items()))
+
+
+def _canonical_reason_mapping(
+    entries: Tuple[Tuple[str, Tuple[str, ...]], ...],
+) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    merged: Dict[str, set[str]] = {}
+    for descriptor_id, reasons in entries:
+        merged.setdefault(descriptor_id, set()).update(reasons)
+    return tuple(
+        (descriptor_id, tuple(sorted(reasons)))
+        for descriptor_id, reasons in sorted(merged.items())
+    )
+
 
 # ── 路由公共结构 ─────────────────────────────────────────────────────
 @dataclass
