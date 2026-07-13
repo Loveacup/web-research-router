@@ -8,10 +8,12 @@
   - 三者 is_async=True、toolset="wrr"；
   - OpenAI function schema 的 parameters.required 正确（query / url / url）。
 """
+import asyncio
 import importlib.util
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 ENTRY = Path(__file__).resolve().parents[2] / "__init__.py"
@@ -33,6 +35,7 @@ def _load_entry():
 class MockCtx:
     def __init__(self):
         self.tools = {}
+        self.hooks = []
 
     def register_tool(self, name, handler, schema, toolset, is_async, override=False):
         self.tools[name] = {
@@ -42,6 +45,9 @@ class MockCtx:
             "is_async": is_async,
             "override": override,
         }
+
+    def register_hook(self, event, handler):
+        self.hooks.append({"event": event, "handler": handler})
 
 
 def _version_from(path: Path, pattern: str) -> str:
@@ -101,13 +107,15 @@ def test_register_loads_from_non_repo_cwd():
         "m = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(m)\n"
         "class Ctx:\n"
-        "    def __init__(self): self.tools = {}\n"
+        "    def __init__(self): self.tools = {}; self.hooks = []\n"
         "    def register_tool(self, name, handler, schema, toolset, is_async, override=False):\n"
         "        self.tools[name] = {'toolset': toolset, 'is_async': is_async, 'override': override}\n"
+        "    def register_hook(self, event, handler): self.hooks.append(event)\n"
         "ctx = Ctx()\n"
         "m.register(ctx)\n"
         "assert set(ctx.tools) == {'web_search', 'web_fetch', 'web_similar'}, ctx.tools\n"
         "assert ctx.tools['web_search']['override'] is True\n"
+        "assert 'pre_llm_call' in ctx.hooks, ctx.hooks\n"
         "assert all(t['is_async'] is True and t['toolset'] == 'wrr' for t in ctx.tools.values())\n"
         "print('OK')\n"
     )
@@ -218,3 +226,443 @@ def test_provider_schema_rejects_fusion_labels():
 
     similar_provider = ctx.tools["web_similar"]["schema"]["parameters"]["properties"]["provider"]
     assert similar_provider["enum"] == ["exa"]
+
+
+# ── web_search 显式依赖执行 seam 合同 ─────────────────────────────────────
+
+async def _spy_route_factory(calls):
+    async def _route(options, registry, *, descriptor_registry_factory=None,
+                     decision_context=None, shadow_evaluated_at=None,
+                     stage_s_enabled=None):
+        calls.append({
+            "options": options, "registry": registry,
+            "decision_context": decision_context, "stage_s_enabled": stage_s_enabled,
+        })
+        return object()
+    return _route
+
+
+def test_execute_web_search_seam_passes_explicit_deps(monkeypatch):
+    """execute_web_search 把显式 registry / decision_context / stage_s_enabled
+    原样透传给 route_search_v5，并复用 format 逻辑。"""
+    import wrr.tools.web_search as ws
+
+    calls = []
+    async def _route(options, registry, *, descriptor_registry_factory=None,
+                     decision_context=None, shadow_evaluated_at=None,
+                     stage_s_enabled=None):
+        calls.append({"registry": registry, "decision_context": decision_context,
+                      "stage_s_enabled": stage_s_enabled, "query": options.query})
+        return object()
+    monkeypatch.setattr(ws, "route_search_v5", _route)
+    monkeypatch.setattr(ws, "format_search", lambda result, query: f"FORMATTED:{query}")
+
+    reg = object()
+    dctx = object()
+    out = asyncio.run(ws.execute_web_search(
+        {"query": "hi"}, registry=reg, decision_context=dctx, stage_s_enabled=True))
+
+    assert out == "FORMATTED:hi"
+    assert calls[-1]["registry"] is reg
+    assert calls[-1]["decision_context"] is dctx
+    assert calls[-1]["stage_s_enabled"] is True
+    assert calls[-1]["query"] == "hi"
+
+
+def test_handle_web_search_defaults_to_get_registry_and_legacy(monkeypatch):
+    """兼容入口默认 get_registry()，不注入 Stage S 依赖（context None / stage None）。"""
+    import wrr.tools.web_search as ws
+
+    sentinel_registry = object()
+    calls = []
+    async def _route(options, registry, *, descriptor_registry_factory=None,
+                     decision_context=None, shadow_evaluated_at=None,
+                     stage_s_enabled=None):
+        calls.append({"registry": registry, "decision_context": decision_context,
+                      "stage_s_enabled": stage_s_enabled})
+        return object()
+    monkeypatch.setattr(ws, "route_search_v5", _route)
+    monkeypatch.setattr(ws, "format_search", lambda result, query: "OK")
+    monkeypatch.setattr(ws, "get_registry", lambda: sentinel_registry)
+
+    out = asyncio.run(ws.handle_web_search({"query": "hi"}))
+
+    assert out == "OK"
+    assert calls[-1]["registry"] is sentinel_registry
+    assert calls[-1]["decision_context"] is None
+    assert calls[-1]["stage_s_enabled"] is None
+
+
+def test_handle_web_search_ignores_magic_kwargs_as_deps(monkeypatch):
+    """**kwargs 只为签名兼容，不得被当作依赖注入通道。"""
+    import wrr.tools.web_search as ws
+
+    sentinel_registry = object()
+    calls = []
+    async def _route(options, registry, *, descriptor_registry_factory=None,
+                     decision_context=None, shadow_evaluated_at=None,
+                     stage_s_enabled=None):
+        calls.append({"registry": registry, "decision_context": decision_context,
+                      "stage_s_enabled": stage_s_enabled})
+        return object()
+    monkeypatch.setattr(ws, "route_search_v5", _route)
+    monkeypatch.setattr(ws, "format_search", lambda result, query: "OK")
+    monkeypatch.setattr(ws, "get_registry", lambda: sentinel_registry)
+
+    asyncio.run(ws.handle_web_search(
+        {"query": "hi"}, decision_context=object(), stage_s_enabled=False,
+        registry=object()))
+
+    assert calls[-1]["registry"] is sentinel_registry
+    assert calls[-1]["decision_context"] is None
+    assert calls[-1]["stage_s_enabled"] is None
+
+
+# ── root register wiring：同源 legacy registry / provider / hook ──────────
+
+_SENTINEL_REGISTRY = object()
+_SENTINEL_CONTEXT = object()
+_RAISE = object()
+
+
+class _FakeProvider:
+    """Records builder identity and get()/refresh() call counts for register tests."""
+
+    def __init__(self, builder):
+        self.builder = builder
+        self.get_calls = 0
+        self.refresh_calls = 0
+        self.snapshot = None
+        self.refresh_result = None
+
+    def get(self):
+        self.get_calls += 1
+        return self.snapshot
+
+    def refresh(self):
+        self.refresh_calls += 1
+        if self.refresh_result is _RAISE:
+            raise RuntimeError("assembly boom")
+        self.snapshot = self.refresh_result
+        return self.snapshot
+
+
+def _install_register_fakes(monkeypatch, *, snapshot=None, refresh_result=_RAISE):
+    """Patch register()'s lazy deps; return (created_providers, build_calls)."""
+    import wrr.registry
+    import wrr.runtime.decision_context_assembly as dca
+    import wrr.runtime.decision_context_provider as dcp
+
+    monkeypatch.setattr(wrr.registry, "get_registry", lambda: _SENTINEL_REGISTRY)
+
+    build_calls = []
+    def _fake_build(legacy, **kwargs):
+        build_calls.append(legacy)
+        return _SENTINEL_CONTEXT
+    monkeypatch.setattr(dca, "build_control_plane_decision_context", _fake_build)
+
+    created = []
+    def _factory(builder):
+        p = _FakeProvider(builder)
+        p.snapshot = snapshot
+        p.refresh_result = refresh_result
+        created.append(p)
+        return p
+    monkeypatch.setattr(dcp, "CachedDecisionContextProvider", _factory)
+
+    return created, build_calls
+
+
+def _install_exec_spy(monkeypatch):
+    import wrr.tools.web_search as ws
+    exec_calls = []
+    async def _fake_exec(args, *, registry, decision_context=None, stage_s_enabled=None):
+        exec_calls.append({"registry": registry, "decision_context": decision_context,
+                           "stage_s_enabled": stage_s_enabled})
+        return "OK"
+    monkeypatch.setattr(ws, "execute_web_search", _fake_exec)
+    return exec_calls
+
+
+def test_register_survives_eager_refresh_failure(monkeypatch):
+    """eager refresh 抛错时 register 不抛，三工具 + pre_llm_call hook 仍注册。"""
+    created, _ = _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    mod = _load_entry()
+    ctx = MockCtx()
+
+    mod.register(ctx)  # must not raise despite refresh failure
+
+    assert set(ctx.tools) == {"web_search", "web_fetch", "web_similar"}
+    assert [h["event"] for h in ctx.hooks] == ["pre_llm_call"]
+    assert created[0].refresh_calls == 1  # eager attempted exactly once
+
+
+def test_register_builder_and_handler_share_exact_legacy_registry(monkeypatch):
+    """builder 桥接、handler 执行都用 get_registry() 返回的同一个 legacy object。"""
+    created, build_calls = _install_register_fakes(
+        monkeypatch, snapshot=None, refresh_result=_RAISE)
+    exec_calls = _install_exec_spy(monkeypatch)
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+
+    assert len(created) == 1
+    provider = created[0]
+
+    # builder 闭包桥接的 legacy registry 身份一致。
+    provider.builder()
+    assert build_calls == [_SENTINEL_REGISTRY]
+
+    # handler 执行传入的 registry 身份一致。
+    asyncio.run(ctx.tools["web_search"]["handler"]({"query": "x"}))
+    assert exec_calls[-1]["registry"] is _SENTINEL_REGISTRY
+
+
+def test_bound_handler_cold_passes_none_and_stage_s_true(monkeypatch):
+    """冷态：handler 每请求 get() 恰一次，传 decision_context=None + stage_s_enabled=True，
+    且不 refresh。"""
+    created, _ = _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    exec_calls = _install_exec_spy(monkeypatch)
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+    provider = created[0]
+
+    get_before = provider.get_calls
+    refresh_before = provider.refresh_calls
+    asyncio.run(ctx.tools["web_search"]["handler"]({"query": "x"}))
+
+    assert provider.get_calls - get_before == 1          # exactly one get() per request
+    assert provider.refresh_calls == refresh_before       # handler never refreshes
+    assert exec_calls[-1]["decision_context"] is None
+    assert exec_calls[-1]["stage_s_enabled"] is True
+
+
+def test_bound_handler_warm_passes_context_and_stage_s_true(monkeypatch):
+    """暖态：handler get() 一次拿到快照，传 decision_context=context + stage_s_enabled=True，
+    仍不 refresh。"""
+    created, _ = _install_register_fakes(
+        monkeypatch, snapshot=_SENTINEL_CONTEXT, refresh_result=_SENTINEL_CONTEXT)
+    exec_calls = _install_exec_spy(monkeypatch)
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+    provider = created[0]
+
+    assert provider.refresh_calls == 0  # warm at register: eager get() short-circuits
+    get_before = provider.get_calls
+    asyncio.run(ctx.tools["web_search"]["handler"]({"query": "x"}))
+
+    assert provider.get_calls - get_before == 1
+    assert provider.refresh_calls == 0
+    assert exec_calls[-1]["decision_context"] is _SENTINEL_CONTEXT
+    assert exec_calls[-1]["stage_s_enabled"] is True
+
+
+def test_register_hook_returns_none(monkeypatch):
+    """pre_llm_call hook 恒返回 None，不注入 LLM context。"""
+    _install_register_fakes(monkeypatch, snapshot=_SENTINEL_CONTEXT, refresh_result=_SENTINEL_CONTEXT)
+    _install_exec_spy(monkeypatch)
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+
+    hook = ctx.hooks[0]["handler"]
+    assert hook() is None
+
+
+# ── cold activator 合同（fake monotonic / 并发 / 二次 get）────────────────
+
+class _Clock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_cold_activator_backoff_deadline_and_cap():
+    """fake monotonic：首次立即、deadline 前跳过、到期一次、失败指数退避封顶。"""
+    mod = _load_entry()
+    clock = _Clock(0.0)
+
+    class P:
+        def __init__(self):
+            self.refresh_calls = 0
+        def get(self):
+            return None  # never warms
+        def refresh(self):
+            self.refresh_calls += 1
+            raise RuntimeError("boom")
+
+    p = P()
+    act = mod._ColdDecisionContextActivator(p, clock=clock)
+    INIT = mod._COLD_ACTIVATE_INITIAL_BACKOFF_SEC
+    MULT = mod._COLD_ACTIVATE_BACKOFF_MULTIPLIER
+    CAP = mod._COLD_ACTIVATE_MAX_BACKOFF_SEC
+
+    # 首次（deadline None）立即触发，失败 → next = 0 + INIT
+    act.activate()
+    assert p.refresh_calls == 1
+    assert act._next_attempt_at == INIT
+
+    # deadline 前跳过
+    clock.t = INIT - 0.001
+    act.activate()
+    assert p.refresh_calls == 1
+
+    # 逐次到期触发，退避指数增长并封顶
+    expected = INIT
+    deadline = INIT
+    calls = 1
+    for _ in range(8):
+        clock.t = deadline
+        act.activate()
+        calls += 1
+        expected = min(expected * MULT, CAP)
+        deadline = clock.t + expected
+        assert p.refresh_calls == calls
+        assert act._next_attempt_at == deadline
+        assert act._backoff_sec == expected
+    assert act._backoff_sec == CAP  # capped
+
+
+def test_cold_activator_backoff_measured_from_failure_completion():
+    """慢失败：退避基准是 refresh *失败完成* 时刻（重读 clock），不是 refresh 开始前的 now。
+
+    回归：若沿用 refresh 前的 now，当 refresh 耗时 > backoff 时 deadline 一返回就过期，
+    下一 turn 会立即重试，破坏 bounded retry。
+    """
+    mod = _load_entry()
+    clock = _Clock(0.0)
+    INIT = mod._COLD_ACTIVATE_INITIAL_BACKOFF_SEC
+    SLOW = 100.0  # refresh 期间流逝的时间，远大于 INIT backoff
+
+    class P:
+        def __init__(self):
+            self.refresh_calls = 0
+        def get(self):
+            return None  # never warms
+        def refresh(self):
+            self.refresh_calls += 1
+            clock.t += SLOW  # 模拟慢失败：refresh 内推进 clock
+            raise RuntimeError("boom")
+
+    p = P()
+    act = mod._ColdDecisionContextActivator(p, clock=clock)
+
+    # 首次触发：refresh 开始 now=0，失败完成时 clock=SLOW → deadline = SLOW + INIT
+    act.activate()
+    assert p.refresh_calls == 1
+    assert act._next_attempt_at == SLOW + INIT
+
+    # deadline 前不重试（修复前 deadline=0+INIT 早已过期，会在此立即重试）
+    clock.t = SLOW + INIT - 0.001
+    act.activate()
+    assert p.refresh_calls == 1
+
+    # 到期后再触发一次
+    clock.t = SLOW + INIT
+    act.activate()
+    assert p.refresh_calls == 2
+
+
+def test_cold_activator_success_stops_cold_retries():
+    """成功 refresh 后 warm fast path 只 get()，不再冷态重试。"""
+    mod = _load_entry()
+    clock = _Clock(0.0)
+    published = object()
+
+    class P:
+        def __init__(self):
+            self.refresh_calls = 0
+            self.snapshot = None
+            self.fail = True
+        def get(self):
+            return self.snapshot
+        def refresh(self):
+            self.refresh_calls += 1
+            if self.fail:
+                raise RuntimeError("boom")
+            self.snapshot = published
+            return self.snapshot
+
+    p = P()
+    act = mod._ColdDecisionContextActivator(p, clock=clock)
+
+    act.activate()                       # fail → schedules retry
+    assert p.refresh_calls == 1
+    p.fail = False
+    clock.t = act._next_attempt_at       # due → success publishes snapshot
+    act.activate()
+    assert p.refresh_calls == 2
+    assert p.snapshot is published
+
+    clock.t += 10_000                    # warm: no further refresh regardless of clock
+    act.activate()
+    act.activate()
+    assert p.refresh_calls == 2
+
+
+def test_cold_activator_concurrent_single_refresh_no_wait():
+    """并发 hook：只有一个 refresh，抢不到锁的线程不等待。"""
+    mod = _load_entry()
+    started = threading.Event()
+    release = threading.Event()
+
+    class P:
+        def __init__(self):
+            self.refresh_calls = 0
+            self.snapshot = None
+        def get(self):
+            return self.snapshot
+        def refresh(self):
+            self.refresh_calls += 1
+            started.set()
+            assert release.wait(5)
+            self.snapshot = object()
+
+    p = P()
+    act = mod._ColdDecisionContextActivator(p)  # real monotonic; next_attempt None
+
+    a = threading.Thread(target=act.pre_llm_call)
+    a.start()
+    assert started.wait(5)  # A is inside refresh, holding the attempt lock
+
+    b_done = threading.Event()
+    def run_b():
+        act.pre_llm_call()  # must return immediately, not block behind A
+        b_done.set()
+    b = threading.Thread(target=run_b)
+    b.start()
+    assert b_done.wait(2), "second hook thread blocked behind in-flight refresh"
+    assert p.refresh_calls == 1  # B did not start a second refresh
+
+    release.set()
+    a.join(5)
+    b.join(5)
+    assert p.refresh_calls == 1
+
+
+def test_cold_activator_winner_second_get_skips_duplicate_refresh():
+    """抢锁 winner 再 get() 一次，若已发布则跳过重复 refresh。"""
+    mod = _load_entry()
+
+    class P:
+        def __init__(self):
+            self.get_calls = 0
+            self.refresh_calls = 0
+            self._published = object()
+        def get(self):
+            self.get_calls += 1
+            # 顶层 get 返回 None；抢锁后二次 get 已见到发布的快照。
+            return None if self.get_calls == 1 else self._published
+        def refresh(self):
+            self.refresh_calls += 1
+
+    p = P()
+    act = mod._ColdDecisionContextActivator(p)
+    act.activate()
+
+    assert p.get_calls == 2       # top get + post-lock re-check
+    assert p.refresh_calls == 0   # second get saw a snapshot → no duplicate refresh

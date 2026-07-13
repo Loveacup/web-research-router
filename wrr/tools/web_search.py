@@ -10,7 +10,19 @@ from ..errors import AllEnginesFailedError
 from ..formatters import format_search, format_error
 
 
-async def handle_web_search(args, **kwargs) -> str:
+async def execute_web_search(
+    args,
+    *,
+    registry,
+    decision_context=None,
+    stage_s_enabled=None,
+) -> str:
+    """显式依赖执行 seam：调用方注入 registry / Stage S 依赖，复用解析·format·error 逻辑。
+
+    ``registry`` 为要执行的引擎注册表（显式，无默认）；``decision_context`` /
+    ``stage_s_enabled`` 直接透传给 ``route_search_v5``，保持其三态归一化合同。
+    root wiring 用此 seam 注入 Stage S；``handle_web_search`` 保持旧行为。
+    """
     query = args.get("query", "")
     if not query:
         return format_error("web_search", "", ValueError("'query' is required"))
@@ -22,7 +34,20 @@ async def handle_web_search(args, **kwargs) -> str:
     options = SearchOptions(query=query, count=count, provider=provider,
                             mode=args.get("mode"))
     try:
-        result = await route_search_v5(options, get_registry())
+        result = await route_search_v5(
+            options,
+            registry,
+            decision_context=decision_context,
+            stage_s_enabled=stage_s_enabled,
+        )
         return format_search(result, query)
     except AllEnginesFailedError as e:
         return format_error("web_search", query, e)
+
+
+async def handle_web_search(args, **kwargs) -> str:
+    """兼容入口：默认 ``get_registry()`` + legacy 模式（不注入 Stage S 依赖）。
+
+    ``**kwargs`` 仅为向后兼容签名保留，不作为依赖注入通道。
+    """
+    return await execute_web_search(args, registry=get_registry())
