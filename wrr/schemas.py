@@ -1,7 +1,11 @@
 """WRR 统一 dataclass：Search / Extract / Similar 的 options/result + 路由结构。"""
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+import datetime as _dt
+import math as _math
+import re as _re
 import time as _time
+import uuid as _uuid
 
 from . import config
 
@@ -193,6 +197,192 @@ class ShadowComparison:
     config_fingerprint: str = ""
 
 
+DECISION_EVIDENCE_SCHEMA_VERSION = 1
+_DECISION_STAGE = "S"
+_DECISION_OUTCOMES = frozenset({"success", "empty", "error"})
+
+# Bounded Stage-S vocabularies. Evidence records only accept the current routing
+# terms; anything else is prose or a typo and must be rejected at construction.
+_DECISION_MODES = frozenset(
+    {
+        "discovery", "broad", "grounding", "research", "academic",
+        "platform", "recovery", "local",
+    }
+)
+_DECISION_TERMINALS = frozenset(
+    {"routed", "explicit_provider", "recovery", "recovery_blocked", "all_engines_failed"}
+)
+_DECISION_VERDICTS = frozenset({"complete", "insufficient", "failed"})
+_SHADOW_CODES = frozenset({"E0", "E1", "E2", "E3", "U1", "U2", "U3", "U4"})
+
+# Machine tokens only: provider ids and reason/version/fingerprint strings must be
+# whitespace-free and drawn from the existing provider/reason-code punctuation set.
+_PROVIDER_TOKEN_RE = _re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
+_BOUNDED_TOKEN_RE = _re.compile(r"^[A-Za-z0-9_.:-]{1,256}\Z")
+
+
+def _is_provider_token(value: Any) -> bool:
+    return isinstance(value, str) and bool(_PROVIDER_TOKEN_RE.match(value))
+
+
+def _is_bounded_token(value: Any) -> bool:
+    return isinstance(value, str) and bool(_BOUNDED_TOKEN_RE.match(value))
+
+
+def _is_rfc3339_utc_z(value: Any) -> bool:
+    """True iff value is an RFC3339 timestamp in UTC terminated by 'Z'.
+
+    Rejects empties, non-dates, and non-UTC offsets (only the trailing 'Z' may
+    denote the zone; an explicit numeric offset is refused).
+    """
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    body = value[:-1]
+    if not body or "T" not in body:
+        return False
+    try:
+        parsed = _dt.datetime.fromisoformat(body)
+    except ValueError:
+        return False
+    # A numeric offset inside the body would parse to an aware datetime; only the
+    # bare 'Z' is an acceptable UTC marker.
+    return parsed.tzinfo is None
+
+
+def _validate_shadow_comparison(shadow: "ShadowComparison") -> None:
+    """Bound the nested selection comparison to machine tokens only."""
+    if type(shadow) is not ShadowComparison:
+        raise ValueError("shadow_comparison must be an exact ShadowComparison")
+    if type(shadow.safe) is not bool:
+        raise ValueError("shadow_comparison.safe must be bool")
+    if shadow.code not in _SHADOW_CODES:
+        raise ValueError("shadow_comparison.code must be one of E0-E3|U1-U4")
+    for field_name in (
+        "legacy_provider_ids",
+        "descriptor_provider_ids",
+        "omitted_provider_ids",
+        "added_provider_ids",
+    ):
+        provider_ids = getattr(shadow, field_name)
+        if type(provider_ids) is not tuple:
+            raise ValueError(f"shadow_comparison.{field_name} must be an immutable tuple")
+        for provider_id in provider_ids:
+            if not _is_provider_token(provider_id):
+                raise ValueError(
+                    f"shadow_comparison.{field_name} must be bounded machine tokens"
+                )
+    if type(shadow.reasons) is not tuple:
+        raise ValueError("shadow_comparison.reasons must be an immutable tuple")
+    for reason in shadow.reasons:
+        if not _is_bounded_token(reason):
+            raise ValueError("shadow_comparison.reasons must be bounded machine tokens")
+    for field_name in ("context_snapshot_version", "config_fingerprint"):
+        value = getattr(shadow, field_name)
+        if value != "" and not _is_bounded_token(value):
+            raise ValueError(
+                f"shadow_comparison.{field_name} must be a bounded machine token"
+            )
+
+
+def _shadow_comparison_to_dict(comparison: "ShadowComparison") -> Dict[str, Any]:
+    """Privacy-safe projection of a ShadowComparison's existing fields."""
+    return {
+        "code": comparison.code,
+        "safe": comparison.safe,
+        "legacy_provider_ids": list(comparison.legacy_provider_ids),
+        "descriptor_provider_ids": list(comparison.descriptor_provider_ids),
+        "omitted_provider_ids": list(comparison.omitted_provider_ids),
+        "added_provider_ids": list(comparison.added_provider_ids),
+        "reasons": list(comparison.reasons),
+        "context_snapshot_version": comparison.context_snapshot_version,
+        "config_fingerprint": comparison.config_fingerprint,
+    }
+
+
+def _is_uuid4(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = _uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value.lower()
+
+
+@dataclass(frozen=True)
+class DecisionEvidence:
+    """Immutable, privacy-bounded projection of a Stage-S routing decision.
+
+    Carries ONLY a fixed whitelist of non-identifying fields plus the nested
+    existing ShadowComparison. It never accepts or stores the query, any query
+    hash, result snippets, response bodies, exception messages, headers, tokens,
+    or secrets — those fields simply do not exist on this structure.
+    """
+
+    request_key: str
+    recorded_at: str
+    schema_version: int = DECISION_EVIDENCE_SCHEMA_VERSION
+    stage: str = _DECISION_STAGE
+    mode: Optional[str] = None
+    terminal: Optional[str] = None
+    outcome: str = "success"
+    actual_provider: Optional[str] = None
+    result_count: int = 0
+    quality_verdict: Optional[str] = None
+    route_elapsed_ms: float = 0.0
+    shadow_comparison: Optional["ShadowComparison"] = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != DECISION_EVIDENCE_SCHEMA_VERSION:
+            raise ValueError("unsupported decision evidence schema_version")
+        if not _is_uuid4(self.request_key):
+            raise ValueError("request_key must be a random UUIDv4 string")
+        if not _is_rfc3339_utc_z(self.recorded_at):
+            raise ValueError("recorded_at must be an RFC3339 UTC timestamp ending in 'Z'")
+        if self.stage != _DECISION_STAGE:
+            raise ValueError("stage must be 'S'")
+        if self.mode is not None and self.mode not in _DECISION_MODES:
+            raise ValueError("mode must be a current Stage-S mode")
+        if self.terminal is not None and self.terminal not in _DECISION_TERMINALS:
+            raise ValueError("terminal must be a current Stage-S terminal")
+        if self.outcome not in _DECISION_OUTCOMES:
+            raise ValueError("outcome must be one of success|empty|error")
+        if self.actual_provider is not None and not _is_provider_token(self.actual_provider):
+            raise ValueError("actual_provider must be a bounded machine token")
+        if self.quality_verdict is not None and self.quality_verdict not in _DECISION_VERDICTS:
+            raise ValueError("quality_verdict must be one of complete|insufficient|failed")
+        if isinstance(self.result_count, bool) or not isinstance(self.result_count, int):
+            raise ValueError("result_count must be a non-negative int")
+        if self.result_count < 0:
+            raise ValueError("result_count must be non-negative")
+        if isinstance(self.route_elapsed_ms, bool) or not isinstance(
+            self.route_elapsed_ms, (int, float)
+        ):
+            raise ValueError("route_elapsed_ms must be a finite non-negative number")
+        if not _math.isfinite(self.route_elapsed_ms) or self.route_elapsed_ms < 0:
+            raise ValueError("route_elapsed_ms must be finite and non-negative")
+        if self.shadow_comparison is not None:
+            _validate_shadow_comparison(self.shadow_comparison)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "request_key": self.request_key,
+            "recorded_at": self.recorded_at,
+            "stage": self.stage,
+            "mode": self.mode,
+            "terminal": self.terminal,
+            "outcome": self.outcome,
+            "actual_provider": self.actual_provider,
+            "result_count": self.result_count,
+            "quality_verdict": self.quality_verdict,
+            "route_elapsed_ms": round(float(self.route_elapsed_ms), 2),
+        }
+        if self.shadow_comparison is not None:
+            d["shadow_comparison"] = _shadow_comparison_to_dict(self.shadow_comparison)
+        return d
+
+
 def _canonical_unique_mapping(
     entries: Tuple[Tuple[str, str], ...], label: str
 ) -> Tuple[Tuple[str, str], ...]:
@@ -292,6 +482,8 @@ class RouteTrace:
     timeout_ms: Optional[float] = None
     health_cache_age_ms: Optional[float] = None
     quality: Optional[RouteQuality] = None
+    # P1 3b.1：selection-only privacy-bounded decision evidence；不授权执行。
+    decision_evidence: Optional[DecisionEvidence] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -310,6 +502,8 @@ class RouteTrace:
             d["health_cache_age_ms"] = round(self.health_cache_age_ms, 2)
         if self.quality is not None:
             d["quality"] = self.quality.to_dict()
+        if self.decision_evidence is not None:
+            d["decision_evidence"] = self.decision_evidence.to_dict()
         return d
 
 
