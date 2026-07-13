@@ -197,6 +197,10 @@ def register(ctx) -> None:
         build_control_plane_decision_context,
     )
     from wrr.runtime.decision_context_provider import CachedDecisionContextProvider
+    from wrr.runtime.decision_evidence import (
+        JsonlDecisionEvidenceSink,
+        NoopDecisionEvidenceSink,
+    )
 
     # 唯一 execution legacy registry：冷态与暖态都用同一个对象执行，get_registry()
     # 恰好调用一次。
@@ -209,15 +213,27 @@ def register(ctx) -> None:
     provider = CachedDecisionContextProvider(_build_control_plane_context)
     activator = _ColdDecisionContextActivator(provider)
 
+    # 组合层拥有唯一 sink：每次 register 恰构造一个 Jsonl sink（含路径检测），所有
+    # 请求复用同一对象，绝不 per-request 构造/探路。构造失败（如 runtime detect /
+    # 路径解析抛错）不得让注册崩溃：吞掉并降级为恰一个 Noop fallback。warning 只带
+    # 构造异常本身，不含 query / context 等其它信息。
+    try:
+        decision_evidence_sink = JsonlDecisionEvidenceSink()
+    except Exception as exc:  # noqa: BLE001 - 组合层降级，注册必须存活
+        logger.warning("decision evidence sink construction failed: %s", exc)
+        decision_evidence_sink = NoopDecisionEvidenceSink()
+
     async def _bound_web_search(args, **kwargs):
         # 每请求只 get() 一次，直接读快照（冷态 None / 暖态 context）；不 refresh /
         # discovery / report / bridge。Stage S 恒开，强制 caller legacy registry 执行。
+        # 复用组合层拥有的同一个 sink 对象（显式注入，不 per-request 构造）。
         decision_context = provider.get()
         return await execute_web_search(
             args,
             registry=legacy_registry,
             decision_context=decision_context,
             stage_s_enabled=True,
+            decision_evidence_sink=decision_evidence_sink,
         )
 
     # web_search 与内建工具（toolset="web"）同名，Hermes registry 会拒绝跨

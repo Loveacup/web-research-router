@@ -16,12 +16,14 @@ async def execute_web_search(
     registry,
     decision_context=None,
     stage_s_enabled=None,
+    decision_evidence_sink=None,
 ) -> str:
     """显式依赖执行 seam：调用方注入 registry / Stage S 依赖，复用解析·format·error 逻辑。
 
     ``registry`` 为要执行的引擎注册表（显式，无默认）；``decision_context`` /
-    ``stage_s_enabled`` 直接透传给 ``route_search_v5``，保持其三态归一化合同。
-    root wiring 用此 seam 注入 Stage S；``handle_web_search`` 保持旧行为。
+    ``stage_s_enabled`` / ``decision_evidence_sink`` 直接透传给 ``route_search_v5``，
+    保持其三态归一化合同与 sink 所有权语义。root wiring 用此 seam 注入 Stage S 与
+    组合层拥有的 sink 对象；``handle_web_search`` 保持旧行为（不注入 sink）。
     """
     query = args.get("query", "")
     if not query:
@@ -39,6 +41,7 @@ async def execute_web_search(
             registry,
             decision_context=decision_context,
             stage_s_enabled=stage_s_enabled,
+            decision_evidence_sink=decision_evidence_sink,
         )
         return format_search(result, query)
     except AllEnginesFailedError as e:

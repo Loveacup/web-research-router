@@ -233,40 +233,46 @@ def test_provider_schema_rejects_fusion_labels():
 async def _spy_route_factory(calls):
     async def _route(options, registry, *, descriptor_registry_factory=None,
                      decision_context=None, shadow_evaluated_at=None,
-                     stage_s_enabled=None):
+                     stage_s_enabled=None, decision_evidence_sink=None):
         calls.append({
             "options": options, "registry": registry,
             "decision_context": decision_context, "stage_s_enabled": stage_s_enabled,
+            "decision_evidence_sink": decision_evidence_sink,
         })
         return object()
     return _route
 
 
 def test_execute_web_search_seam_passes_explicit_deps(monkeypatch):
-    """execute_web_search 把显式 registry / decision_context / stage_s_enabled
-    原样透传给 route_search_v5，并复用 format 逻辑。"""
+    """execute_web_search 把显式 registry / decision_context / stage_s_enabled /
+    decision_evidence_sink 原样透传给 route_search_v5，并复用 format 逻辑。"""
     import wrr.tools.web_search as ws
 
     calls = []
     async def _route(options, registry, *, descriptor_registry_factory=None,
                      decision_context=None, shadow_evaluated_at=None,
-                     stage_s_enabled=None):
+                     stage_s_enabled=None, decision_evidence_sink=None):
         calls.append({"registry": registry, "decision_context": decision_context,
-                      "stage_s_enabled": stage_s_enabled, "query": options.query})
+                      "stage_s_enabled": stage_s_enabled, "query": options.query,
+                      "decision_evidence_sink": decision_evidence_sink})
         return object()
     monkeypatch.setattr(ws, "route_search_v5", _route)
     monkeypatch.setattr(ws, "format_search", lambda result, query: f"FORMATTED:{query}")
 
     reg = object()
     dctx = object()
+    sink = object()
     out = asyncio.run(ws.execute_web_search(
-        {"query": "hi"}, registry=reg, decision_context=dctx, stage_s_enabled=True))
+        {"query": "hi"}, registry=reg, decision_context=dctx, stage_s_enabled=True,
+        decision_evidence_sink=sink))
 
     assert out == "FORMATTED:hi"
     assert calls[-1]["registry"] is reg
     assert calls[-1]["decision_context"] is dctx
     assert calls[-1]["stage_s_enabled"] is True
     assert calls[-1]["query"] == "hi"
+    # sink 身份原样透传给 router（exact object，无中转/复制）。
+    assert calls[-1]["decision_evidence_sink"] is sink
 
 
 def test_handle_web_search_defaults_to_get_registry_and_legacy(monkeypatch):
@@ -277,9 +283,10 @@ def test_handle_web_search_defaults_to_get_registry_and_legacy(monkeypatch):
     calls = []
     async def _route(options, registry, *, descriptor_registry_factory=None,
                      decision_context=None, shadow_evaluated_at=None,
-                     stage_s_enabled=None):
+                     stage_s_enabled=None, decision_evidence_sink=None):
         calls.append({"registry": registry, "decision_context": decision_context,
-                      "stage_s_enabled": stage_s_enabled})
+                      "stage_s_enabled": stage_s_enabled,
+                      "decision_evidence_sink": decision_evidence_sink})
         return object()
     monkeypatch.setattr(ws, "route_search_v5", _route)
     monkeypatch.setattr(ws, "format_search", lambda result, query: "OK")
@@ -291,6 +298,8 @@ def test_handle_web_search_defaults_to_get_registry_and_legacy(monkeypatch):
     assert calls[-1]["registry"] is sentinel_registry
     assert calls[-1]["decision_context"] is None
     assert calls[-1]["stage_s_enabled"] is None
+    # 兼容入口从不注入 sink。
+    assert calls[-1]["decision_evidence_sink"] is None
 
 
 def test_handle_web_search_ignores_magic_kwargs_as_deps(monkeypatch):
@@ -301,9 +310,10 @@ def test_handle_web_search_ignores_magic_kwargs_as_deps(monkeypatch):
     calls = []
     async def _route(options, registry, *, descriptor_registry_factory=None,
                      decision_context=None, shadow_evaluated_at=None,
-                     stage_s_enabled=None):
+                     stage_s_enabled=None, decision_evidence_sink=None):
         calls.append({"registry": registry, "decision_context": decision_context,
-                      "stage_s_enabled": stage_s_enabled})
+                      "stage_s_enabled": stage_s_enabled,
+                      "decision_evidence_sink": decision_evidence_sink})
         return object()
     monkeypatch.setattr(ws, "route_search_v5", _route)
     monkeypatch.setattr(ws, "format_search", lambda result, query: "OK")
@@ -311,11 +321,13 @@ def test_handle_web_search_ignores_magic_kwargs_as_deps(monkeypatch):
 
     asyncio.run(ws.handle_web_search(
         {"query": "hi"}, decision_context=object(), stage_s_enabled=False,
-        registry=object()))
+        registry=object(), decision_evidence_sink=object()))
 
     assert calls[-1]["registry"] is sentinel_registry
     assert calls[-1]["decision_context"] is None
     assert calls[-1]["stage_s_enabled"] is None
+    # magic kwargs（含 decision_evidence_sink）不得成为注入通道。
+    assert calls[-1]["decision_evidence_sink"] is None
 
 
 # ── root register wiring：同源 legacy registry / provider / hook ──────────
@@ -376,12 +388,84 @@ def _install_register_fakes(monkeypatch, *, snapshot=None, refresh_result=_RAISE
 def _install_exec_spy(monkeypatch):
     import wrr.tools.web_search as ws
     exec_calls = []
-    async def _fake_exec(args, *, registry, decision_context=None, stage_s_enabled=None):
+    async def _fake_exec(args, *, registry, decision_context=None, stage_s_enabled=None,
+                         decision_evidence_sink=None):
         exec_calls.append({"registry": registry, "decision_context": decision_context,
-                           "stage_s_enabled": stage_s_enabled})
+                           "stage_s_enabled": stage_s_enabled,
+                           "decision_evidence_sink": decision_evidence_sink})
         return "OK"
     monkeypatch.setattr(ws, "execute_web_search", _fake_exec)
     return exec_calls
+
+
+def _install_sink_fakes(monkeypatch, *, jsonl_raises=False):
+    """Patch register()'s lazy sink classes; return (jsonl_attempts, jsonl_created, noop_created)."""
+    import wrr.runtime.decision_evidence as de
+
+    jsonl_attempts = []
+    jsonl_created = []
+    noop_created = []
+
+    class _FakeJsonl:
+        def __init__(self, *args, **kwargs):
+            jsonl_attempts.append(self)
+            if jsonl_raises:
+                raise RuntimeError("sink construction boom")
+            jsonl_created.append(self)
+
+    class _FakeNoop:
+        def __init__(self, *args, **kwargs):
+            noop_created.append(self)
+
+    monkeypatch.setattr(de, "JsonlDecisionEvidenceSink", _FakeJsonl)
+    monkeypatch.setattr(de, "NoopDecisionEvidenceSink", _FakeNoop)
+    return jsonl_attempts, jsonl_created, noop_created
+
+
+def test_register_constructs_one_jsonl_sink_reused_across_calls(monkeypatch):
+    """组合层拥有唯一 sink：register 恰构造一个 Jsonl sink（无 Noop fallback），
+    bound handler 每次请求复用同一个 sink 对象（exact identity）。"""
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    exec_calls = _install_exec_spy(monkeypatch)
+    jsonl_attempts, jsonl_created, noop_created = _install_sink_fakes(monkeypatch)
+    mod = _load_entry()
+    ctx = MockCtx()
+    mod.register(ctx)
+
+    assert len(jsonl_attempts) == 1        # exactly one Jsonl construction per register
+    assert len(jsonl_created) == 1
+    assert noop_created == []              # constructor succeeded → no fallback
+    the_sink = jsonl_created[0]
+
+    handler = ctx.tools["web_search"]["handler"]
+    asyncio.run(handler({"query": "a"}))
+    asyncio.run(handler({"query": "b"}))
+
+    # 两次以上请求复用同一个 sink 对象，绝不 per-request 构造。
+    assert len(jsonl_attempts) == 1
+    assert exec_calls[0]["decision_evidence_sink"] is the_sink
+    assert exec_calls[1]["decision_evidence_sink"] is the_sink
+
+
+def test_register_sink_constructor_failure_falls_back_to_noop(monkeypatch):
+    """Jsonl 构造抛错时 register 存活：恰一个 Noop fallback，bound handler 拿到该 fallback。"""
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    exec_calls = _install_exec_spy(monkeypatch)
+    jsonl_attempts, jsonl_created, noop_created = _install_sink_fakes(
+        monkeypatch, jsonl_raises=True)
+    mod = _load_entry()
+    ctx = MockCtx()
+
+    mod.register(ctx)  # must not raise despite sink constructor failure
+
+    assert set(ctx.tools) == {"web_search", "web_fetch", "web_similar"}
+    assert len(jsonl_attempts) == 1        # attempted exactly once
+    assert jsonl_created == []             # constructor raised
+    assert len(noop_created) == 1         # exactly one Noop fallback
+    the_fallback = noop_created[0]
+
+    asyncio.run(ctx.tools["web_search"]["handler"]({"query": "x"}))
+    assert exec_calls[-1]["decision_evidence_sink"] is the_fallback
 
 
 def test_register_survives_eager_refresh_failure(monkeypatch):
