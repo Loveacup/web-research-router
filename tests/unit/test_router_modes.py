@@ -4,7 +4,7 @@ import asyncio
 from conftest import FakeEngine, mk_results
 from wrr.registry import EngineRegistry
 from wrr.router import route_search_v5, resolve_mode, legacy_selection_plan
-from wrr.schemas import SearchOptions, DecisionSnapshot
+from wrr.schemas import SearchOptions, DecisionContext, DecisionSnapshot
 from wrr.errors import AllEnginesFailedError
 from wrr import config
 
@@ -24,6 +24,24 @@ def _full_reg():
     return _reg(*[FakeEngine(n, search_results=mk_results(2))
                   for n in ("exa", "brave", "searxng", "github",
                             "community", "academic", "skill")])
+
+
+def _shadow_context(expires_at=200.0):
+    return DecisionContext(
+        snapshot_version="ctx-v1",
+        built_at=100.0,
+        expires_at=expires_at,
+        runtime="standalone",
+        profile="default",
+        registry_source="test",
+        routable_descriptor_ids=("exa", "brave"),
+        bridged_provider_ids=("exa", "brave"),
+        missing_provider_ids=(),
+        adapter_errors=(),
+        descriptor_reasons=(),
+        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        config_fingerprint="cfg-v1",
+    )
 
 
 # ── classify_intent（每 mode ≥3 例）──────────────────────────────────
@@ -109,6 +127,152 @@ def test_v5_search_returns_rrf_details():
     # research mode 含 community/academic 权重
     assert rr.weights.get("community") == 0.35   # v5.4: research community 0.30→0.35
     assert rr.weights.get("academic") == 0.30
+
+
+def test_v5_injected_context_returns_shadow_comparison_without_changing_execution():
+    options = SearchOptions("what is python", count=5)
+    context = DecisionContext(
+        snapshot_version="ctx-v1",
+        built_at=100.0,
+        expires_at=200.0,
+        runtime="standalone",
+        profile="default",
+        registry_source="test",
+        routable_descriptor_ids=("exa", "brave"),
+        bridged_provider_ids=("exa", "brave"),
+        missing_provider_ids=(),
+        adapter_errors=(),
+        descriptor_reasons=(),
+        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        config_fingerprint="cfg-v1",
+    )
+
+    legacy = run(route_search_v5(options, _full_reg()))
+    shadow = run(route_search_v5(
+        options,
+        _full_reg(),
+        decision_context=context,
+        shadow_evaluated_at=150.0,
+    ))
+
+    assert legacy.shadow_comparison is None
+    assert shadow.shadow_comparison.code == "E0"
+    assert shadow.actual_provider == legacy.actual_provider
+    assert shadow.payload == legacy.payload
+    assert shadow.fallback_chain == legacy.fallback_chain
+
+
+def test_v5_injected_context_bypasses_descriptor_registry_replacement():
+    options = SearchOptions("what is python", count=5)
+    context = DecisionContext(
+        snapshot_version="ctx-v1",
+        built_at=100.0,
+        expires_at=200.0,
+        runtime="standalone",
+        profile="default",
+        registry_source="test",
+        routable_descriptor_ids=("exa", "brave"),
+        bridged_provider_ids=("exa", "brave"),
+        missing_provider_ids=(),
+        adapter_errors=(),
+        descriptor_reasons=(),
+        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        config_fingerprint="cfg-v1",
+    )
+
+    def forbidden_descriptor_registry():
+        raise AssertionError("Stage S must execute the supplied legacy registry")
+
+    result = run(route_search_v5(
+        options,
+        _full_reg(),
+        descriptor_registry_factory=forbidden_descriptor_registry,
+        decision_context=context,
+        shadow_evaluated_at=150.0,
+    ))
+
+    assert result.actual_provider == "rrf:grounding"
+    assert result.shadow_comparison.code == "E0"
+
+
+def test_v5_expired_context_disables_shadow_and_keeps_legacy_execution():
+    options = SearchOptions("what is python", count=5)
+    expired = DecisionContext(
+        snapshot_version="ctx-expired",
+        built_at=100.0,
+        expires_at=149.0,
+        runtime="standalone",
+        profile="default",
+        registry_source="test",
+        routable_descriptor_ids=("exa", "brave"),
+        bridged_provider_ids=("exa", "brave"),
+        missing_provider_ids=(),
+        adapter_errors=(),
+        descriptor_reasons=(),
+        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        config_fingerprint="cfg-v1",
+    )
+
+    result = run(route_search_v5(
+        options,
+        _full_reg(),
+        decision_context=expired,
+        shadow_evaluated_at=150.0,
+    ))
+
+    assert result.shadow_comparison is None
+    assert result.actual_provider == "rrf:grounding"
+    assert result.payload
+
+
+def test_v5_shadow_exception_is_fail_closed(monkeypatch):
+    def fail_comparison(*args, **kwargs):
+        raise RuntimeError("comparison boom")
+
+    monkeypatch.setattr(
+        "wrr.selection_shadow.compare_shadow_selection",
+        fail_comparison,
+    )
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context=_shadow_context(),
+        shadow_evaluated_at=150.0,
+    ))
+
+    assert result.shadow_comparison is None
+    assert result.actual_provider == "rrf:grounding"
+    assert result.payload
+
+
+def test_v5_explicit_provider_carries_shadow_comparison():
+    result = run(route_search_v5(
+        SearchOptions("q", provider="brave"),
+        _full_reg(),
+        decision_context=_shadow_context(),
+        shadow_evaluated_at=150.0,
+    ))
+
+    assert result.actual_provider == "brave"
+    assert result.shadow_comparison.code == "E0"
+
+
+def test_v5_recovery_return_carries_primary_shadow_comparison():
+    registry = _reg(
+        FakeEngine("exa", search_results=[]),
+        FakeEngine("brave", search_results=[]),
+        FakeEngine("searxng", search_results=mk_results(2)),
+    )
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        registry,
+        decision_context=_shadow_context(),
+        shadow_evaluated_at=150.0,
+    ))
+
+    assert result.actual_provider == "rrf:recovery"
+    assert result.shadow_comparison.code == "E0"
 
 
 def test_v5_academic_mode_weights():

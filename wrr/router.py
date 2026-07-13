@@ -15,7 +15,7 @@ from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
 from .errors import EngineError, AllEnginesFailedError
-from .schemas import (DecisionSnapshot, DiagnosticEvent, FallbackStep,
+from .schemas import (DecisionContext, DecisionSnapshot, DiagnosticEvent, FallbackStep,
                       RouteQuality, RouteTrace, RouterResult, SearchResult)
 
 
@@ -416,24 +416,48 @@ async def route_search_v5(
     registry: SearchRegistry,
     *,
     descriptor_registry_factory=None,
+    decision_context: Optional[DecisionContext] = None,
+    shadow_evaluated_at: Optional[float] = None,
 ) -> RouterResult:
     """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
 
     显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
     """
     route_start = time.monotonic()
-    registry = _route_registry(
-        registry,
-        descriptor_registry_factory=descriptor_registry_factory,
-    )
+    # Stage S must always execute the caller-supplied legacy registry. Existing
+    # descriptor registry replacement remains only for non-Stage-S calls.
+    if decision_context is None:
+        registry = _route_registry(
+            registry,
+            descriptor_registry_factory=descriptor_registry_factory,
+        )
 
     # P1 S1：先做纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）
     plan = legacy_selection_plan(options)
 
+    # P1 S3a：只消费注入 context。任何异常只关闭 shadow，不改变 legacy 执行。
+    shadow_comparison = None
+    if decision_context is not None:
+        try:
+            from .selection_shadow import compare_shadow_selection
+
+            shadow_comparison = compare_shadow_selection(
+                options,
+                decision_context,
+                evaluated_at=(
+                    time.time() if shadow_evaluated_at is None else shadow_evaluated_at
+                ),
+                legacy_plan=plan,
+            )
+        except Exception:
+            shadow_comparison = None
+
     # 显式 provider → 单引擎（复用 v4 route 语义，禁用 mode 路由）
     if plan.explicit_provider:
-        return await route("search", options, registry,
-                           explicit_provider=plan.explicit_provider)
+        result = await route("search", options, registry,
+                             explicit_provider=plan.explicit_provider)
+        result.shadow_comparison = shadow_comparison
+        return result
 
     mode = plan.mode
     mode_reason = plan.mode_reason
@@ -496,7 +520,8 @@ async def route_search_v5(
             return RouterResult(actual_provider=f"rrf:recovery", payload=rpayload,
                                 fallback_chain=steps, mode="recovery",
                                 fusion_method="rrf", weights=dict(rec_weights),
-                                diagnostics=trace)
+                                diagnostics=trace,
+                                shadow_comparison=shadow_comparison)
 
     if payload is None:
         reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
@@ -519,4 +544,5 @@ async def route_search_v5(
     return RouterResult(actual_provider=f"rrf:{mode}", payload=payload,
                         fallback_chain=steps, mode=mode,
                         fusion_method="rrf", weights=used,
-                        diagnostics=trace)
+                        diagnostics=trace,
+                        shadow_comparison=shadow_comparison)

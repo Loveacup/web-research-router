@@ -178,6 +178,21 @@ class DescriptorSelectionDecision:
     source: str = "descriptor_selection"
 
 
+@dataclass(frozen=True)
+class ShadowComparison:
+    """Immutable selection-only comparison; never authorizes execution."""
+
+    code: str
+    safe: bool
+    legacy_provider_ids: Tuple[str, ...]
+    descriptor_provider_ids: Tuple[str, ...]
+    omitted_provider_ids: Tuple[str, ...] = ()
+    added_provider_ids: Tuple[str, ...] = ()
+    reasons: Tuple[str, ...] = ()
+    context_snapshot_version: str = ""
+    config_fingerprint: str = ""
+
+
 def _canonical_unique_mapping(
     entries: Tuple[Tuple[str, str], ...], label: str
 ) -> Tuple[Tuple[str, str], ...]:
@@ -310,6 +325,8 @@ class RouterResult:
     weights: Optional[Dict[str, Any]] = None
     # v6.1：诊断追踪
     diagnostics: Optional[RouteTrace] = None
+    # P1 S3a：selection-only in-memory shadow evidence；不授权执行。
+    shadow_comparison: Optional[ShadowComparison] = None
 
     @property
     def quality(self) -> Optional[RouteQuality]:
