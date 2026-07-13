@@ -1,6 +1,8 @@
 """v5 mode 路由单测：classify_intent / MODE_DISPATCH / 触发提升 / gather 隔离 / RRF details。"""
 import asyncio
 
+import pytest
+
 from conftest import FakeEngine, mk_results
 from wrr.registry import EngineRegistry
 from wrr.router import route_search_v5, resolve_mode, legacy_selection_plan
@@ -387,6 +389,124 @@ def test_recovery_fallback_sets_mode_reason_recovery_fallback():
     # 如果走了 recovery fallback，mode 应为 recovery
     if rr.diagnostics.mode == "recovery":
         assert rr.diagnostics.mode_reason == "recovery_fallback"
+
+
+# ── P1 Slice A: stage_s_enabled 三态归一化合同 ───────────────────────
+class _FactoryCalled(Exception):
+    """Tripwire：descriptor registry factory / env replacement 被调用。"""
+
+
+def _tripwire_factory():
+    raise _FactoryCalled()
+
+
+def test_stage_s_enabled_cold_forces_caller_registry_no_replacement(monkeypatch):
+    """True + None：enabled-cold，强制 caller legacy registry，shadow=None；
+    即便 WRR_V6_ROUTER=1 或注入 factory 也不得 replacement。"""
+    monkeypatch.setenv("WRR_V6_ROUTER", "1")
+
+    def boom():
+        raise _FactoryCalled()
+
+    monkeypatch.setattr("wrr.router._descriptor_backed_registry", boom)
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        descriptor_registry_factory=_tripwire_factory,
+        stage_s_enabled=True,
+    ))
+
+    assert result.actual_provider == "rrf:grounding"
+    assert result.shadow_comparison is None
+    assert result.payload
+
+
+def test_stage_s_enabled_warm_forces_legacy_and_compares():
+    """True + context：enabled-warm，强制 caller legacy registry 并做 comparison。"""
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        descriptor_registry_factory=_tripwire_factory,
+        decision_context=_shadow_context(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+    ))
+
+    assert result.actual_provider == "rrf:grounding"
+    assert result.shadow_comparison.code == "E0"
+
+
+def test_stage_s_none_cold_keeps_legacy_registry_replacement():
+    """None + None：完全保持旧 _route_registry 行为（注入 factory 仍被调用）。"""
+    with pytest.raises(_FactoryCalled):
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            _full_reg(),
+            descriptor_registry_factory=_tripwire_factory,
+        ))
+
+
+def test_stage_s_disabled_cold_keeps_legacy_registry_replacement():
+    """False + None：Stage S disabled，保持旧行为（factory replacement 仍生效）。"""
+    with pytest.raises(_FactoryCalled):
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            _full_reg(),
+            descriptor_registry_factory=_tripwire_factory,
+            stage_s_enabled=False,
+        ))
+
+
+def test_stage_s_disabled_with_context_raises_valueerror_before_factory():
+    """False + context：ValueError，且不得执行/调用 registry factory
+    （若 factory 被调用会抛 _FactoryCalled 而非 ValueError → 断言失败）。"""
+    with pytest.raises(ValueError):
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            _full_reg(),
+            descriptor_registry_factory=_tripwire_factory,
+            decision_context=_shadow_context(),
+            shadow_evaluated_at=150.0,
+            stage_s_enabled=False,
+        ))
+
+
+def test_stage_s_enabled_stale_context_closes_shadow_keeps_legacy():
+    """过期 context 在 enabled 状态仍只关闭 shadow，始终执行 caller legacy registry。"""
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        descriptor_registry_factory=_tripwire_factory,
+        decision_context=_shadow_context(expires_at=149.0),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+    ))
+
+    assert result.shadow_comparison is None
+    assert result.actual_provider == "rrf:grounding"
+    assert result.payload
+
+
+def test_stage_s_enabled_comparator_exception_closes_shadow_keeps_legacy(monkeypatch):
+    """comparator 异常在 enabled 状态仍只关闭 shadow，始终执行 caller legacy registry。"""
+    def boom(*args, **kwargs):
+        raise RuntimeError("comparison boom")
+
+    monkeypatch.setattr("wrr.selection_shadow.compare_shadow_selection", boom)
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        descriptor_registry_factory=_tripwire_factory,
+        decision_context=_shadow_context(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+    ))
+
+    assert result.shadow_comparison is None
+    assert result.actual_provider == "rrf:grounding"
+    assert result.payload
 
 
 # ── P1 S1: legacy_selection_plan → frozen DecisionSnapshot ───────────

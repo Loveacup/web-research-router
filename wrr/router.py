@@ -418,15 +418,32 @@ async def route_search_v5(
     descriptor_registry_factory=None,
     decision_context: Optional[DecisionContext] = None,
     shadow_evaluated_at: Optional[float] = None,
+    stage_s_enabled: Optional[bool] = None,
 ) -> RouterResult:
     """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
 
     显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
+
+    Stage S 三态归一化合同（``stage_s_enabled`` keyword-only）：
+      - ``None`` → 由 context 存在与否推断（保持既有调用兼容）。
+      - ``True`` → Stage S enabled：强制 caller legacy registry，禁止 descriptor
+        replacement（即便 ``WRR_V6_ROUTER=1`` 或注入 factory）。
+      - ``False`` → Stage S disabled：保持旧 ``_route_registry`` 行为。
+    ``False`` 与注入 ``decision_context`` 互斥（语义矛盾）→ ``ValueError``，
+    且在触碰 registry factory 之前抛出。
     """
+    # 合同校验先于任何 registry factory 执行：False + context 语义矛盾。
+    if stage_s_enabled is False and decision_context is not None:
+        raise ValueError(
+            "stage_s_enabled=False is incompatible with an injected decision_context"
+        )
+    # 归一化：None 由 context 存在推断，显式 True/False 直接生效。
+    stage_s_on = (decision_context is not None) if stage_s_enabled is None else stage_s_enabled
+
     route_start = time.monotonic()
-    # Stage S must always execute the caller-supplied legacy registry. Existing
-    # descriptor registry replacement remains only for non-Stage-S calls.
-    if decision_context is None:
+    # Stage S enabled 时始终执行 caller-supplied legacy registry；descriptor
+    # registry replacement 仅保留给 Stage S 未启用的调用。
+    if not stage_s_on:
         registry = _route_registry(
             registry,
             descriptor_registry_factory=descriptor_registry_factory,
@@ -435,9 +452,9 @@ async def route_search_v5(
     # P1 S1：先做纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）
     plan = legacy_selection_plan(options)
 
-    # P1 S3a：只消费注入 context。任何异常只关闭 shadow，不改变 legacy 执行。
+    # P1 S3a：只消费注入 context。任何异常（含过期）只关闭 shadow，不改变 legacy 执行。
     shadow_comparison = None
-    if decision_context is not None:
+    if stage_s_on and decision_context is not None:
         try:
             from .selection_shadow import compare_shadow_selection
 
