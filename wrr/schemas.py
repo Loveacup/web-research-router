@@ -210,9 +210,12 @@ _DECISION_MODES = frozenset(
     }
 )
 _DECISION_TERMINALS = frozenset(
-    {"routed", "explicit_provider", "recovery", "recovery_blocked", "all_engines_failed"}
+    {
+        "routed", "explicit_provider", "recovery", "recovery_blocked",
+        "all_engines_failed", "execution_error",
+    }
 )
-_DECISION_VERDICTS = frozenset({"complete", "insufficient", "failed"})
+_DECISION_VERDICTS = frozenset({"complete", "degraded_success", "insufficient", "failed"})
 _SHADOW_CODES = frozenset({"E0", "E1", "E2", "E3", "U1", "U2", "U3", "U4"})
 
 # Machine tokens only: provider ids and reason/version/fingerprint strings must be

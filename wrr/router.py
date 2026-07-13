@@ -7,16 +7,21 @@
   - per-engine timeout + 按操作的总预算 config.budget_for(op)（超预算的后续引擎标记跳过）
 """
 import asyncio
+import datetime as _dt
 import os
 import time
-from typing import Any, Dict, List, Optional, Protocol
+import uuid as _uuid
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 
 from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
 from .errors import EngineError, AllEnginesFailedError
-from .schemas import (DecisionContext, DecisionSnapshot, DiagnosticEvent, FallbackStep,
-                      RouteQuality, RouteTrace, RouterResult, SearchResult)
+from .schemas import (DecisionContext, DecisionEvidence, DecisionSnapshot, DiagnosticEvent,
+                      FallbackStep, RouteQuality, RouteTrace, RouterResult, SearchResult)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .runtime.decision_evidence import DecisionEvidenceSink
 
 
 class SearchRegistry(Protocol):
@@ -411,63 +416,171 @@ def _route_registry(
     return registry
 
 
-async def route_search_v5(
+# ══════════════════════════════════════════════════════════════════════
+# P1 3b.2：Stage-S decision evidence（selection-only；不授权/不改变执行）
+# 只投影受控值：mode / terminal / outcome / actual_provider / result_count /
+# quality_verdict / elapsed / 既有 shadow_comparison。绝不传 query/result/error 文本。
+# 构造/附着/记录的任何异常都不得改变 legacy 结果或原始异常。
+# ══════════════════════════════════════════════════════════════════════
+
+class _ExecErrorState:
+    """Private, local terminal-classification holder for a single execution.
+
+    Passed by reference into ``_route_search_v5_execute`` so the Stage-S wrapper
+    can distinguish ``recovery_blocked`` vs ``all_engines_failed`` WITHOUT ever
+    mutating the raised exception object. ``terminal`` stays ``None`` until an
+    expected all-fail raise point sets it.
+    """
+
+    __slots__ = ("terminal",)
+
+    def __init__(self) -> None:
+        self.terminal: Optional[str] = None
+
+
+def _utc_now_z() -> str:
+    """Current UTC time as an RFC3339 'Z' timestamp (matches schema validator)."""
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _safe_payload_count(payload) -> int:
+    """Non-raising result count; empty/None → 0."""
+    try:
+        return len(payload) if payload else 0
+    except Exception:
+        return 0
+
+
+def _success_terminal(plan: DecisionSnapshot, result: RouterResult) -> str:
+    """Derive the Stage-S terminal for a successful return from controlled state."""
+    if plan.explicit_provider is not None:
+        return "explicit_provider"
+    reason = getattr(result.diagnostics, "mode_reason", None) if result.diagnostics else None
+    if reason == "recovery_fallback":
+        return "recovery"
+    return "routed"
+
+
+def _build_success_evidence(
+    request_key: str,
+    plan: DecisionSnapshot,
+    result: RouterResult,
+    shadow_comparison,
+    route_start: float,
+) -> DecisionEvidence:
+    count = _safe_payload_count(result.payload)
+    quality = result.quality
+    return DecisionEvidence(
+        request_key=request_key,
+        recorded_at=_utc_now_z(),
+        mode=result.mode,
+        terminal=_success_terminal(plan, result),
+        outcome="success" if count > 0 else "empty",
+        actual_provider=result.actual_provider,
+        result_count=count,
+        quality_verdict=quality.verdict if quality is not None else None,
+        route_elapsed_ms=_elapsed_ms(route_start),
+        shadow_comparison=shadow_comparison,
+    )
+
+
+def _build_error_evidence(
+    request_key: str,
+    plan: Optional[DecisionSnapshot],
+    terminal: str,
+    shadow_comparison,
+    route_start: float,
+) -> DecisionEvidence:
+    return DecisionEvidence(
+        request_key=request_key,
+        recorded_at=_utc_now_z(),
+        # None for explicit provider, or when planning itself failed (no plan).
+        mode=plan.mode if plan is not None else None,
+        terminal=terminal,
+        outcome="error",
+        actual_provider=None,
+        result_count=0,
+        quality_verdict="failed",
+        route_elapsed_ms=_elapsed_ms(route_start),
+        shadow_comparison=shadow_comparison,
+    )
+
+
+def _safe_record(sink, evidence: DecisionEvidence) -> None:
+    """Best-effort sink record; never raises. No-op when sink is None."""
+    if sink is None:
+        return
+    try:
+        sink.record(evidence)
+    except Exception:
+        return
+
+
+def _attach_success_evidence(
+    result: RouterResult,
+    sink,
+    request_key: Optional[str],
+    plan: DecisionSnapshot,
+    shadow_comparison,
+    route_start: float,
+) -> None:
+    """Build → attach to RouteTrace → record. Fully fault-swallowing.
+
+    Attachment happens before recording so a sink failure still leaves the
+    evidence on the returned RouteTrace.
+    """
+    if request_key is None:
+        return
+    try:
+        evidence = _build_success_evidence(
+            request_key, plan, result, shadow_comparison, route_start
+        )
+    except Exception:
+        return
+    try:
+        if result.diagnostics is not None:
+            result.diagnostics.decision_evidence = evidence
+    except Exception:
+        return
+    _safe_record(sink, evidence)
+
+
+def _record_error_evidence(
+    sink,
+    request_key: Optional[str],
+    plan: Optional[DecisionSnapshot],
+    terminal: str,
+    shadow_comparison,
+    route_start: float,
+) -> None:
+    """Best-effort error-evidence record; never raises (never masks re-raise)."""
+    if request_key is None:
+        return
+    try:
+        evidence = _build_error_evidence(
+            request_key, plan, terminal, shadow_comparison, route_start
+        )
+    except Exception:
+        return
+    _safe_record(sink, evidence)
+
+
+async def _route_search_v5_execute(
     options,
     registry: SearchRegistry,
-    *,
-    descriptor_registry_factory=None,
-    decision_context: Optional[DecisionContext] = None,
-    shadow_evaluated_at: Optional[float] = None,
-    stage_s_enabled: Optional[bool] = None,
+    plan: DecisionSnapshot,
+    shadow_comparison,
+    route_start: float,
+    error_state: _ExecErrorState,
 ) -> RouterResult:
-    """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
-
-    显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
-
-    Stage S 三态归一化合同（``stage_s_enabled`` keyword-only）：
-      - ``None`` → 由 context 存在与否推断（保持既有调用兼容）。
-      - ``True`` → Stage S enabled：强制 caller legacy registry，禁止 descriptor
-        replacement（即便 ``WRR_V6_ROUTER=1`` 或注入 factory）。
-      - ``False`` → Stage S disabled：保持旧 ``_route_registry`` 行为。
-    ``False`` 与注入 ``decision_context`` 互斥（语义矛盾）→ ``ValueError``，
-    且在触碰 registry factory 之前抛出。
-    """
-    # 合同校验先于任何 registry factory 执行：False + context 语义矛盾。
-    if stage_s_enabled is False and decision_context is not None:
-        raise ValueError(
-            "stage_s_enabled=False is incompatible with an injected decision_context"
-        )
-    # 归一化：None 由 context 存在推断，显式 True/False 直接生效。
-    stage_s_on = (decision_context is not None) if stage_s_enabled is None else stage_s_enabled
-
-    route_start = time.monotonic()
-    # Stage S enabled 时始终执行 caller-supplied legacy registry；descriptor
-    # registry replacement 仅保留给 Stage S 未启用的调用。
-    if not stage_s_on:
-        registry = _route_registry(
-            registry,
-            descriptor_registry_factory=descriptor_registry_factory,
-        )
-
-    # P1 S1：先做纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）
-    plan = legacy_selection_plan(options)
-
-    # P1 S3a：只消费注入 context。任何异常（含过期）只关闭 shadow，不改变 legacy 执行。
-    shadow_comparison = None
-    if stage_s_on and decision_context is not None:
-        try:
-            from .selection_shadow import compare_shadow_selection
-
-            shadow_comparison = compare_shadow_selection(
-                options,
-                decision_context,
-                evaluated_at=(
-                    time.time() if shadow_evaluated_at is None else shadow_evaluated_at
-                ),
-                legacy_plan=plan,
-            )
-        except Exception:
-            shadow_comparison = None
+    """Plan execution body (registry already resolved). Returns a RouterResult or
+    raises. Expected all-fail raise points set ``error_state.terminal`` (a private
+    local holder) so the Stage-S wrapper can classify recovery_blocked vs
+    all_engines_failed WITHOUT attaching any metadata to the exception object."""
+    # From this point an AllEnginesFailedError is an execution terminal. Before
+    # this function is entered (for example planning), the holder stays None and
+    # the wrapper classifies that exception as execution_error instead.
+    error_state.terminal = "all_engines_failed"
 
     # 显式 provider → 单引擎（复用 v4 route 语义，禁用 mode 路由）
     if plan.explicit_provider:
@@ -503,16 +616,8 @@ async def route_search_v5(
     # 主 mode 空 → recovery 兜底（Brave + Exa + SearXNG）
     if payload is None and mode != "recovery":
         if not config.recovery_allowed():
-            route_elapsed = _elapsed_ms(route_start)
-            trace = RouteTrace(
-                mode=mode,
-                mode_reason="recovery_blocked",
-                selected_engines=engine_names,
-                events=events,
-                elapsed_ms=route_elapsed,
-                timeout_ms=budget * 1000.0,
-            )
             reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
+            error_state.terminal = "recovery_blocked"
             raise AllEnginesFailedError(
                 f"All engines failed for search (mode={mode}) and recovery is blocked in this runtime:\n{reasons}"
             )
@@ -542,6 +647,7 @@ async def route_search_v5(
 
     if payload is None:
         reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
+        error_state.terminal = "all_engines_failed"
         raise AllEnginesFailedError(f"All engines failed for search (mode={mode}):\n{reasons}")
 
     route_elapsed = _elapsed_ms(route_start)
@@ -563,3 +669,103 @@ async def route_search_v5(
                         fusion_method="rrf", weights=used,
                         diagnostics=trace,
                         shadow_comparison=shadow_comparison)
+
+
+async def route_search_v5(
+    options,
+    registry: SearchRegistry,
+    *,
+    descriptor_registry_factory=None,
+    decision_context: Optional[DecisionContext] = None,
+    shadow_evaluated_at: Optional[float] = None,
+    stage_s_enabled: Optional[bool] = None,
+    decision_evidence_sink: "Optional[DecisionEvidenceSink]" = None,
+) -> RouterResult:
+    """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
+
+    显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
+
+    Stage S 三态归一化合同（``stage_s_enabled`` keyword-only）：
+      - ``None`` → 由 context 存在与否推断（保持既有调用兼容）。
+      - ``True`` → Stage S enabled：强制 caller legacy registry，禁止 descriptor
+        replacement（即便 ``WRR_V6_ROUTER=1`` 或注入 factory）。
+      - ``False`` → Stage S disabled：保持旧 ``_route_registry`` 行为。
+    ``False`` 与注入 ``decision_context`` 互斥（语义矛盾）→ ``ValueError``，
+    且在触碰 registry factory 之前抛出。
+    """
+    # 合同校验先于任何 registry factory 执行：False + context 语义矛盾。
+    if stage_s_enabled is False and decision_context is not None:
+        raise ValueError(
+            "stage_s_enabled=False is incompatible with an injected decision_context"
+        )
+    # 归一化：None 由 context 存在推断，显式 True/False 直接生效。
+    stage_s_on = (decision_context is not None) if stage_s_enabled is None else stage_s_enabled
+
+    route_start = time.monotonic()
+
+    # Stage S OFF：完全保持 legacy 行为，绝不 mint/attach/record evidence（即便传 sink）。
+    # descriptor registry replacement 仅保留给 Stage S 未启用的调用。
+    if not stage_s_on:
+        registry = _route_registry(
+            registry,
+            descriptor_registry_factory=descriptor_registry_factory,
+        )
+        plan = legacy_selection_plan(options)
+        return await _route_search_v5_execute(
+            options, registry, plan, None, route_start, _ExecErrorState()
+        )
+
+    # Stage S ON：best-effort mint request key，再把 plan + shadow comparison +
+    # execution 一并包进单一 try。UUID 失败只关闭本请求 evidence，不影响 legacy。
+    try:
+        request_key: Optional[str] = str(_uuid.uuid4())
+    except Exception:
+        request_key = None
+    error_state = _ExecErrorState()
+    plan: Optional[DecisionSnapshot] = None
+    shadow_comparison = None
+    try:
+        # P1 S1：纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）。
+        plan = legacy_selection_plan(options)
+
+        # P1 S3a：只消费注入 context。任何异常（含过期）只关闭 shadow，不改变 legacy 执行。
+        if decision_context is not None:
+            try:
+                from .selection_shadow import compare_shadow_selection
+
+                shadow_comparison = compare_shadow_selection(
+                    options,
+                    decision_context,
+                    evaluated_at=(
+                        time.time() if shadow_evaluated_at is None else shadow_evaluated_at
+                    ),
+                    legacy_plan=plan,
+                )
+            except Exception:
+                shadow_comparison = None
+
+        result = await _route_search_v5_execute(
+            options, registry, plan, shadow_comparison, route_start, error_state
+        )
+    except AllEnginesFailedError:
+        # Planning-time AllEnginesFailed is still an unexpected planning error;
+        # execute() sets the private state before any expected execution terminal.
+        terminal = error_state.terminal or "execution_error"
+        _record_error_evidence(
+            decision_evidence_sink, request_key, plan, terminal, shadow_comparison, route_start
+        )
+        raise
+    except Exception:
+        # 非预期异常（含 planning 意外抛出）：execution_error，best-effort 记录后
+        # 原样 re-raise（identity 不变）。
+        _record_error_evidence(
+            decision_evidence_sink, request_key, plan, "execution_error",
+            shadow_comparison, route_start,
+        )
+        raise
+
+    # 成功：构造 evidence → 附着到 RouteTrace（先于记录）→ best-effort 记录同一对象。
+    _attach_success_evidence(
+        result, decision_evidence_sink, request_key, plan, shadow_comparison, route_start
+    )
+    return result
