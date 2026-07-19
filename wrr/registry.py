@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 from .engines.base import SearchEngine
 from .engines.exa import ExaEngine
 from .engines.brave import BraveEngine
+from .engines.tavily import TavilyEngine
 from .engines.searxng import SearxngEngine
 from .engines.github import GitHubEngine
 from .engines.community import CommunityEngine
@@ -41,6 +42,7 @@ def default_registry() -> EngineRegistry:
     reg = EngineRegistry()
     reg.register(ExaEngine())
     reg.register(BraveEngine())
+    reg.register(TavilyEngine())        # native search adapter（无 route order 变更）
     reg.register(SearxngEngine())
     reg.register(GitHubEngine())
     reg.register(CommunityEngine())

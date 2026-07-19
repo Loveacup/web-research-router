@@ -207,6 +207,40 @@ def community_triggered(query: str) -> bool:
     return any(kw.lower() in q for kw in PRACTICAL_KEYWORDS)
 
 
+# ── Policy-sensitive 机器信号（加法式，正交于 route mode）────────────────
+# 识别政策/法规/监管/政府/法律等高风险查询，仅输出布尔信号供机器消费（如
+# formatter 输出契约）；绝不进入 classify_intent / MODE_DISPATCH / mode_engines，
+# 不改变任何路由选择。含 false-positive guards：RL 的 "policy gradient"、办公
+# "legal pad"、普通 timeout 等不得触发。
+POLICY_SENSITIVE_CN_KEYWORDS = ("政策", "法规", "法律", "监管", "政府", "合规",
+                                "立法", "条例", "法案", "规章", "备案", "执法")
+POLICY_SENSITIVE_EN_KEYWORDS = ("policy", "policies", "regulation", "regulations",
+                                "regulatory", "legislation", "legislative",
+                                "legal", "government", "governmental",
+                                "compliance", "statute", "statutory")
+# guard 短语：命中即先剔除，避免其中的关键词被误判为政策语义
+POLICY_SENSITIVE_GUARD_PHRASES = ("policy gradient", "legal pad", "legal-size",
+                                  "legal size", "legal paper", "legally blonde")
+
+
+def policy_sensitive_triggered(query: str) -> bool:
+    """查询是否触及政策/法规/监管/政府/法律等高风险语义（纯机器信号）。
+
+    仅输出布尔信号；绝不改变 classify_intent / mode_engines / 路由结果。
+    英文关键词按词边界匹配（避免 substring 误伤），中文按子串匹配；guard
+    短语先行剔除，规避 "policy gradient" / "legal pad" 等假阳性。
+    """
+    import re
+    q = (query or "").lower()
+    for phrase in POLICY_SENSITIVE_GUARD_PHRASES:
+        if phrase in q:
+            q = q.replace(phrase, " ")
+    if any(re.search(rf"\b{re.escape(kw)}\b", q, flags=re.ASCII)
+           for kw in POLICY_SENSITIVE_EN_KEYWORDS):
+        return True
+    return any(kw in q for kw in POLICY_SENSITIVE_CN_KEYWORDS)
+
+
 USER_AGENT = "wrr-hermes/4.0"
 
 # ── MCP 备份：保留 mcp_* 工具作为备份，默认不自动调用，仅在输出附 hint ──
@@ -374,6 +408,14 @@ MODE_WEIGHTS = {
     # broad（v5.2）：开放式兴趣查询，4 引擎并行，社区权重大
     "broad":     {**_W_DEFAULT, "community": 0.55, "searxng": 0.30},
 }
+
+
+# ── Diversity backfill：Brave 因 rate_limit/timeout/empty 失败、仅剩单一独立来源
+#    时，条件性调用一次 Tavily 作为独立补源。纯 policy 常量；绝不入 MODE_DISPATCH /
+#    MODE_WEIGHTS / SEARCH_FALLBACK_ORDER / recovery，仅供 router tripwire 消费。
+DIVERSITY_BACKFILL_MODES = ("grounding", "research")
+DIVERSITY_BACKFILL_PROVIDER = "tavily"
+DIVERSITY_BACKFILL_TIMEOUT_SECONDS = _env_float("WRR_DIVERSITY_BACKFILL_TIMEOUT", 3.0)
 
 
 # ── 本地搜索层配置（v5.2）────────────────────────────────────────────

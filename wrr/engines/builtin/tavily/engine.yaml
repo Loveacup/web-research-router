@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "tavily",
+  "name": "Tavily Search",
+  "kind": "web_api",
+  "adapter": "wrr.engines.tavily:TavilyEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["web"]
+  },
+  "routing": {
+    "modes": ["auto", "web", "default"],
+    "weight": 0.7,
+    "triggers": []
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [
+      {
+        "dep_id": "tavily_api_key",
+        "name": "TAVILY_API_KEY",
+        "required": true,
+        "secret": true,
+        "source_url": "https://tavily.com",
+        "description": "Tavily 搜索 API key"
+      }
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "TAVILY_API_KEY", "required": true}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

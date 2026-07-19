@@ -43,6 +43,7 @@ def test_get_all_env_keys():
     assert "EXA_API_KEY" in keys
     assert "GITHUB_TOKEN" in keys
     assert "SEARXNG_URL" in keys
+    assert "TAVILY_API_KEY" in keys
 
 
 def test_get_all_commands():
@@ -60,6 +61,19 @@ def test_brave_env_any_structure():
     assert "env_any" in brave_req
     assert "BRAVE_API_KEY" in brave_req["env_any"]
     assert "BRAVE_SEARCH_API_KEY" in brave_req["env_any"]
+
+
+def test_tavily_requirements_contract():
+    """Tavily 应在 requirements 中声明 tier=1 + TAVILY_API_KEY。
+
+    与 TavilyEngine.tier=1 一致；native Web Search API，无本地 CLI。
+    """
+    req = ENGINE_REQUIREMENTS.get("tavily")
+    assert req is not None, "tavily 应在 ENGINE_REQUIREMENTS 中"
+    assert req["tier"] == 1, "tavily tier 必须与 TavilyEngine.tier=1 一致"
+    assert req.get("env") == ["TAVILY_API_KEY"], "tavily 需要 TAVILY_API_KEY"
+    assert req.get("commands", []) == [], "tavily 为 native API，无本地 CLI"
+    assert "Tavily" in req.get("description", "")
 
 
 def test_env_example_contains_required_keys():

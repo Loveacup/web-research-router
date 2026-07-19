@@ -11,7 +11,9 @@
   - 禁止在本模块引入任何浏览器自动化框架或浏览器启动逻辑。
 """
 import asyncio
+import enum
 import json
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 try:
@@ -26,6 +28,65 @@ except ImportError:  # pragma: no cover
 
 # run_cmd 注入契约：(cli, timeout) -> (returncode, stdout, stderr)
 RunCmd = Callable[[List[str], float], Awaitable[Tuple[Any, str, str]]]
+
+
+class SourceOutcome(enum.Enum):
+    """单源抓取的可靠性分类（P0 reliability slice）。
+
+    仅刻画「这次抓取发生了什么」，不含任何恢复/重启动作：
+      - READY          ：成功且拿到结构化条目。
+      - EMPTY          ：调用成功但无结果（或普通失败），可继续常规 backup。
+      - UNAUTHENTICATED：命中登录墙 / AUTH_REQUIRED，需要人工重新登录。
+      - SOFT_BLOCKED   ：403 / 验证码 / 限流等软封锁。
+
+    UNAUTHENTICATED / SOFT_BLOCKED 是「立即返回」信号：不再尝试 backup，
+    并由上层 CommunityEngine 的 source-local TTL breaker 决定是否短期跳过。
+    """
+
+    READY = "ready"
+    EMPTY = "empty"
+    UNAUTHENTICATED = "unauthenticated"
+    SOFT_BLOCKED = "soft_blocked"
+
+
+@dataclass
+class SourceFetchResult:
+    """单源抓取结果封装：结构化条目 + 可靠性分类。"""
+
+    items: List[Dict[str, Any]] = field(default_factory=list)
+    outcome: SourceOutcome = SourceOutcome.EMPTY
+
+
+# 从 stderr（必要时含 stdout）识别登录墙 / 软封锁的标记（全小写子串匹配）。
+_UNAUTH_MARKERS = (
+    "auth_required", "auth required", "authentication required",
+    "login required", "login wall", "please log in", "please login",
+    "not logged in", "sign in required", "unauthenticated", "unauthorized",
+)
+_SOFTBLOCK_MARKERS = (
+    "captcha", "验证码", "rate limit", "ratelimit", "rate-limit",
+    "too many requests", "429", "403", "forbidden",
+    "soft block", "soft-block", "temporarily blocked", "blocked by",
+)
+
+
+def _classify_block(rc: Any, out: str, err: str) -> Optional[SourceOutcome]:
+    """从 exit/stderr/stdout 识别 UNAUTHENTICATED / SOFT_BLOCKED。
+
+    成功（rc==0）的 stdout 只可能是结构化载荷，不纳入阻断判定，避免 JSON
+    内容里出现 ``403``/``forbidden`` 等字样被误判。仅在失败（rc!=0）时才把
+    stdout 一并纳入扫描。返回 None 表示不是阻断类结果。
+    """
+    text = (err or "").lower()
+    if rc != 0:
+        text += "\n" + (out or "").lower()
+    if not text.strip():
+        return None
+    if any(m in text for m in _UNAUTH_MARKERS):
+        return SourceOutcome.UNAUTHENTICATED
+    if any(m in text for m in _SOFTBLOCK_MARKERS):
+        return SourceOutcome.SOFT_BLOCKED
+    return None
 
 
 def _json_object_from_stdout(out: str) -> Any:
@@ -68,6 +129,17 @@ class OpenCliSourceAdapter:
 
     async def fetch(self, cfg: Dict[str, Any], options: Any,
                     run_cmd: RunCmd, timeout: float) -> List[Dict[str, Any]]:
+        """向后兼容入口：返回裸 item 列表（丢弃 outcome 分类）。"""
+        result = await self.fetch_result(cfg, options, run_cmd, timeout)
+        return result.items
+
+    async def fetch_result(self, cfg: Dict[str, Any], options: Any,
+                           run_cmd: RunCmd, timeout: float) -> SourceFetchResult:
+        """带可靠性分类的抓取：命令形状/解析与既有 `fetch` 逐字节等价。
+
+        新增语义：任一命令返回登录墙 / 软封锁标记时立即短路返回对应 outcome，
+        不再尝试 backup；普通 empty / 失败仍照旧继续 backup。
+        """
         commands = [cfg["cli"]] + cfg.get("backup_commands", [])
         for idx, cli in enumerate(commands):
             is_backup = idx > 0
@@ -81,6 +153,9 @@ class OpenCliSourceAdapter:
                 call.extend(cfg["cli_extra_args"])
             call.extend(["-f", "json", "--limit", str(min(options.count * 3 if is_backup else options.count, 20))])
             rc, out, err = await run_cmd(call, timeout)
+            blocked = _classify_block(rc, out, err)
+            if blocked is not None:
+                return SourceFetchResult(items=[], outcome=blocked)  # 立即返回
             if rc != 0 or not out.strip():
                 continue
             try:
@@ -96,8 +171,9 @@ class OpenCliSourceAdapter:
             # P3-2: HN 时效回填
             if cli[:3] == ["opencli", "hackernews", "search"]:
                 items = await self._enrich_hn_time(items)
-            return items[:options.count]
-        return []
+            return SourceFetchResult(items=items[:options.count],
+                                     outcome=SourceOutcome.READY)
+        return SourceFetchResult(items=[], outcome=SourceOutcome.EMPTY)
 
     async def _enrich_hn_time(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Best-effort 回填 HN item 的 time 字段（从 Firebase API）。

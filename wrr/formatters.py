@@ -6,13 +6,76 @@ v5.1: doctor 人类可读报告 + JSON 输出。
 """
 import json
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from . import config
-from .schemas import FallbackStep, RouterResult, EngineCheckResult
+from .schemas import FallbackStep, RouterResult, EngineCheckResult, SearchResult
 
 
 def _chain_dicts(steps: List[FallbackStep]):
     return [s.to_dict() for s in steps]
+
+
+# ── Source Map：单条结果 → 互斥来源类型（policy-sensitive slice，加法式）──
+# provider 只表示抓取渠道，不等同页面权威性；官方仅由域名 / official: tag 决定。
+_COMMUNITY_SOURCE_TAGS = frozenset({
+    "reddit", "twitter", "xiaohongshu", "v2ex", "hackernews",
+    "last30days", "aihot", "wechat",
+    # CommunityEngine 实测输出的真实 source_tag（RSS / last30days 双语 CLI）
+    "aihot_rss", "wechat_rss", "last30days_en", "last30days_cn",
+})
+# 政府/官方域名后缀（按 host 结尾匹配；含常见国别政府域）
+_OFFICIAL_DOMAIN_SUFFIXES = (
+    ".gov", ".gov.uk", ".gov.cn", ".gov.au", ".gov.hk", ".go.jp",
+    ".europa.eu", ".mil", ".gouv.fr", ".gob.es",
+)
+
+
+def _is_official_domain(url: str) -> bool:
+    """URL host 是否落在政府/官方域名后缀集合（空/畸形 → False）。"""
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except (ValueError, TypeError):
+        return False
+    if not host:
+        return False
+    return any(host == suffix.lstrip(".") or host.endswith(suffix)
+               for suffix in _OFFICIAL_DOMAIN_SUFFIXES)
+
+
+def _classify_source_type(url: str, source_tag: str, providers: List[str]) -> str:
+    """把单条结果归入互斥来源类型（official|public|community|academic|local）。
+
+    优先级：local > academic > community > official > public。provider 命中
+    community/academic/local 才据此归类；官方仅由域名 / official: tag 决定，
+    绝不因 provider（如 exa）而误标 official。
+    """
+    tag = (source_tag or "").strip().lower()
+    provs = [str(p).lower() for p in providers]
+    if tag.startswith("local:") or any(p.startswith("local_") for p in provs):
+        return "local"
+    if tag.startswith("academic:") or "academic" in provs:
+        return "academic"
+    if tag in _COMMUNITY_SOURCE_TAGS or "community" in provs:
+        return "community"
+    if tag.startswith("official:") or _is_official_domain(url):
+        return "official"
+    return "public"
+
+
+def _source_map(items: List[SearchResult]) -> list:
+    """每条 SearchResult → source_map 条目（index/url/source_type/tag/providers）。"""
+    entries = []
+    for i, r in enumerate(items):
+        providers = sorted(set(r.fusion_sources or []))
+        entries.append({
+            "index": i + 1,
+            "url": r.url,
+            "source_type": _classify_source_type(r.url, r.source_tag, providers),
+            "source_tag": r.source_tag,
+            "providers": providers,
+        })
+    return entries
 
 
 def _banner(result: RouterResult, primary: str) -> str:
@@ -75,6 +138,9 @@ def format_search(result: RouterResult, query: str) -> str:
     }
     quality = quality_payload(result)
     details["quality"] = quality
+    # policy-sensitive 机器信号 + Source Map（加法式；正交于 route mode）
+    details["policy_sensitive"] = config.policy_sensitive_triggered(query)
+    details["source_map"] = _source_map(items)
     # v5：mode 路由 + RRF 融合诊断（仅 v5 路径有值）
     if result.mode is not None:
         details["mode"] = result.mode

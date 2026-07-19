@@ -565,6 +565,46 @@ def test_decision_snapshot_is_frozen_hashable_and_tuple_typed():
         pass
 
 
+# ── policy-sensitive 机器信号（正交于 route mode）─────────────────────
+def test_policy_sensitive_positive():
+    """政策/法规/监管/政府/法律高风险查询 → True。"""
+    for q in [
+        "数据安全政策监管要求",              # 中文政策监管
+        "个人信息保护 合规 立法进展",         # 中文合规立法
+        "EU AI regulation timeline",         # EU regulation
+        "government guidance on facial recognition",  # government guidance
+        "data retention legal requirements",  # data retention legal
+    ]:
+        assert config.policy_sensitive_triggered(q) is True, q
+
+
+def test_policy_sensitive_negative_and_false_positive_guards():
+    """RL policy gradient / legal pad / 普通 timeout 等不得误报。"""
+    for q in [
+        "policy gradient implementation in pytorch",  # RL 术语
+        "legal pad sizes comparison",                 # 办公用品
+        "python asyncio timeout best practice",       # 普通 timeout
+        "how to center a div in css",                 # 无关
+        "react useEffect cleanup",                    # 无关
+    ]:
+        assert config.policy_sensitive_triggered(q) is False, q
+
+
+def test_policy_predicate_orthogonal_to_routing():
+    """policy 信号为 True，但 classify_intent / mode_engines 选择明确保持未变。"""
+    # grounding 类政策查询：预测器 True，但意图仍为 grounding，引擎组合无额外注入
+    q1 = "EU data retention legal requirements"
+    assert config.policy_sensitive_triggered(q1) is True
+    assert config.classify_intent(q1) == "grounding"
+    assert config.mode_engines("grounding", q1) == list(config.MODE_DISPATCH["grounding"])
+
+    # research 类政策查询：预测器 True，但意图仍为 research，引擎组合不被 policy 扰动
+    q2 = "深度分析 数据合规政策 演进"
+    assert config.policy_sensitive_triggered(q2) is True
+    assert config.classify_intent(q2) == "research"
+    assert config.mode_engines("research", q2) == list(config.MODE_DISPATCH["research"])
+
+
 def test_route_search_v5_consumes_legacy_plan(monkeypatch):
     """用与 config 不同的 sentinel 证明 route_search_v5 真消费 selection seam。"""
     sentinel = DecisionSnapshot(

@@ -15,6 +15,7 @@ from wrr.runtime.env import load_env
 V5_PROVIDER_IDS = {
     "exa",
     "brave",
+    "tavily",
     "searxng",
     "github",
     "community",
@@ -52,6 +53,54 @@ def test_engine_from_descriptor_instantiates_legacy_adapter(tmp_path):
 
     assert isinstance(engine, SearchEngine)
     assert engine.name == "exa"
+
+
+def test_tavily_descriptor_discoverable_and_instantiates_legacy_adapter(tmp_path):
+    """v6 builtin discovery exposes a Tavily descriptor whose adapter bridges
+    cleanly to the legacy SearchEngine (name ``tavily``)."""
+    descriptors = _v6_descriptors(tmp_path)
+
+    descriptor = next(item for item in descriptors if item.id == "tavily")
+    engine = engine_from_descriptor(descriptor)
+
+    assert isinstance(engine, SearchEngine)
+    assert engine.name == "tavily"
+    # Tavily is a real provider, never a documented intentional gap.
+    assert "tavily" not in DEFAULT_INTENTIONAL_GAPS
+
+
+def test_tavily_unconfigured_is_missing_not_intentional_gap(tmp_path):
+    """Without TAVILY_API_KEY, tavily surfaces as missing (needs a key), never
+    bridged and never silently swallowed as an intentional gap."""
+    runtime = _runtime(tmp_path)
+    env = _env(runtime)
+    state_file = tmp_path / "state.json"
+
+    report = default_registry_v6_shadow(runtime=runtime, env=env, state_file=state_file)
+
+    assert "tavily" in report.v5_provider_ids
+    assert "tavily" in report.missing_provider_ids
+    assert "tavily" not in report.bridged_provider_ids
+    assert "tavily" not in report.intentional_gap_ids
+
+
+def test_tavily_bridges_when_process_env_supplies_key(tmp_path):
+    """With TAVILY_API_KEY in filtered process_env and env_files=[], tavily is
+    routable and enters bridged_provider_ids (no longer missing)."""
+    runtime = _runtime(tmp_path)
+    state_file = tmp_path / "state.json"
+
+    report = default_registry_v6_shadow(
+        runtime=runtime,
+        process_env={"TAVILY_API_KEY": "fake-tavily-key-for-test"},
+        env_files=[],
+        state_file=state_file,
+        trust_project=True,
+    )
+
+    assert "tavily" in report.bridged_provider_ids
+    assert "tavily" not in report.missing_provider_ids
+    assert report.registry.get("tavily") is not None
 
 
 def test_bridge_registry_uses_legacy_provider_names(tmp_path):

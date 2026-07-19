@@ -5,7 +5,7 @@ from typing import List
 
 from .base import SearchEngine
 from .. import config
-from ..errors import EngineError
+from ..errors import EngineError, EngineTimeoutError, RateLimitError
 from ..schemas import SearchOptions, SearchResult, ExtractOptions, ExtractResult, EngineCheckResult
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -23,15 +23,28 @@ class BraveEngine(SearchEngine):
         return key
 
     async def search(self, options: SearchOptions) -> List[SearchResult]:
-        key = self._key()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(
-                BRAVE_SEARCH_URL,
-                params={"q": options.query, "count": options.count},   # H3: 自动编码
-                headers={"Accept": "application/json", "X-Subscription-Token": key},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        key = self._key()          # 缺 key → EngineError（try 之外，保留既有行为）
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(
+                    BRAVE_SEARCH_URL,
+                    params={"q": options.query, "count": options.count},   # H3: 自动编码
+                    headers={"Accept": "application/json", "X-Subscription-Token": key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as e:
+            # 429 → RateLimitError（backfill tripwire）；其它 status → 普通 EngineError（不触发）
+            status = e.response.status_code
+            if status == 429:
+                raise RateLimitError(f"Brave rate limited (HTTP {status})") from e
+            raise EngineError(f"Brave search failed (HTTP {status})") from e
+        except httpx.TimeoutException as e:
+            # 引擎级超时归一为 EngineTimeoutError（router 归 timeout，触发 backfill）
+            raise EngineTimeoutError(f"Brave timeout: {e}") from e
+        except httpx.HTTPError as e:
+            # 其它 transport/协议错误 → 普通 EngineError（fail-closed，不触发 backfill）
+            raise EngineError(f"Brave transport error: {e}") from e
         return [SearchResult(title=r.get("title", "") or "",
                              url=r.get("url", "") or "",
                              snippet=r.get("description", "") or "")

@@ -713,6 +713,343 @@ def test_fetch_source_no_opencli_preflight():
         cm._run_cmd = orig_run
 
 
+# ── P0 reliability slice：SourceOutcome 四态分类 ─────────────────────
+def _oc_cfg():
+    return {"cli": ["opencli", "reddit", "search"]}
+
+
+def test_source_outcome_and_result_wrapper_exposed():
+    from wrr.engines import community_sources as cs
+    assert hasattr(cs, "SourceOutcome")
+    assert hasattr(cs, "SourceFetchResult")
+    # 四态齐备
+    for name in ("READY", "EMPTY", "UNAUTHENTICATED", "SOFT_BLOCKED"):
+        assert hasattr(cs.SourceOutcome, name)
+    r = cs.SourceFetchResult(items=[{"a": 1}], outcome=cs.SourceOutcome.READY)
+    assert r.items == [{"a": 1}]
+    assert r.outcome is cs.SourceOutcome.READY
+
+
+def test_opencli_outcome_ready():
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        return (0, json.dumps(_REDDIT), "")
+
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+    assert res.outcome is cs.SourceOutcome.READY
+    assert res.items == _REDDIT
+
+
+def test_opencli_outcome_empty_success_no_results():
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        return (0, "[]", "")
+
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+    assert res.outcome is cs.SourceOutcome.EMPTY
+    assert res.items == []
+
+
+def test_opencli_outcome_unauthenticated_login_wall():
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        return (1, "", "AUTH_REQUIRED: login wall, please log in to continue")
+
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+    assert res.outcome is cs.SourceOutcome.UNAUTHENTICATED
+    assert res.items == []
+
+
+def test_opencli_outcome_soft_blocked_captcha_and_403():
+    from wrr.engines import community_sources as cs
+
+    for stderr in ("HTTP 403 Forbidden", "captcha challenge presented",
+                   "验证码 required", "429 Too Many Requests (rate limit)"):
+        async def fake_run(cli, timeout, _e=stderr):
+            return (1, "", _e)
+
+        res = run(cs.OpenCliSourceAdapter().fetch_result(
+            _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+        assert res.outcome is cs.SourceOutcome.SOFT_BLOCKED, stderr
+        assert res.items == []
+
+
+def test_opencli_ready_json_payload_not_misclassified_as_block():
+    """成功 JSON 载荷即使内容含 403/forbidden 字样也不得误判为 soft_blocked。"""
+    from wrr.engines import community_sources as cs
+    payload = [{"title": "Error 403 forbidden explained", "url": "https://x/1",
+                "score": 10}]
+
+    async def fake_run(cli, timeout):
+        return (0, json.dumps(payload), "")
+
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+    assert res.outcome is cs.SourceOutcome.READY
+    assert res.items == payload
+
+
+def test_opencli_unauthenticated_short_circuits_backup():
+    """认证墙必须立即返回，不再尝试 backup 命令。"""
+    from wrr.engines import community_sources as cs
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (1, "", "login required")
+
+    cfg = {"cli": ["opencli", "hackernews", "search"],
+           "backup_commands": [["opencli", "hackernews", "top"]]}
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        cfg, SearchOptions("AI", count=5), fake_run, 1.0))
+    assert res.outcome is cs.SourceOutcome.UNAUTHENTICATED
+    assert len(calls) == 1                      # backup 未尝试
+
+
+def test_opencli_softblock_short_circuits_backup():
+    from wrr.engines import community_sources as cs
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (1, "", "HTTP 403 Forbidden")
+
+    cfg = {"cli": ["opencli", "hackernews", "search"],
+           "backup_commands": [["opencli", "hackernews", "top"]]}
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        cfg, SearchOptions("AI", count=5), fake_run, 1.0))
+    assert res.outcome is cs.SourceOutcome.SOFT_BLOCKED
+    assert len(calls) == 1
+
+
+def test_opencli_plain_empty_still_tries_backup():
+    """普通 empty（无阻断标记）仍走既有 backup 逻辑。"""
+    from wrr.engines import community_sources as cs
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        if "top" in cli:
+            return (0, json.dumps([{"title": "T", "url": "https://a"}]), "")
+        return (0, "[]", "")
+
+    cfg = {"cli": ["opencli", "hackernews", "search"],
+           "backup_commands": [["opencli", "hackernews", "top"]]}
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        cfg, SearchOptions("AI", count=5), fake_run, 1.0))
+    assert len(calls) == 2
+    assert res.outcome is cs.SourceOutcome.READY
+    assert res.items and res.items[0]["title"] == "T"
+
+
+def test_opencli_fetch_still_returns_plain_list():
+    """向后兼容：fetch() 仍返回裸 item 列表。"""
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        return (0, json.dumps(_REDDIT), "")
+
+    items = run(cs.OpenCliSourceAdapter().fetch(
+        _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+    assert items == _REDDIT
+
+
+# ── P0 reliability slice：source-local TTL breaker ──────────────────
+class _FakeClock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _install_run(fn):
+    orig = cm._run_cmd
+    cm._run_cmd = fn
+    return orig
+
+
+def test_breaker_opens_on_unauthenticated_and_skips_within_ttl():
+    clock = _FakeClock()
+    eng = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (1, "", "AUTH_REQUIRED login wall")
+
+    orig = _install_run(fake_run)
+    now = datetime.now(timezone.utc)
+    try:
+        r1 = run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert r1 == []
+        n1 = len(calls)
+        assert n1 >= 1
+        # TTL 未过 → skip，不再调用 adapter
+        r2 = run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert r2 == []
+        assert len(calls) == n1
+    finally:
+        cm._run_cmd = orig
+
+
+def test_breaker_opens_on_soft_blocked():
+    clock = _FakeClock()
+    eng = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (1, "", "captcha / 403 forbidden")
+
+    orig = _install_run(fake_run)
+    now = datetime.now(timezone.utc)
+    try:
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        n1 = len(calls)
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert len(calls) == n1                 # skipped within TTL
+    finally:
+        cm._run_cmd = orig
+
+
+def test_breaker_expires_after_ttl_allows_call():
+    clock = _FakeClock()
+    eng = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (1, "", "login required")
+
+    orig = _install_run(fake_run)
+    now = datetime.now(timezone.utc)
+    try:
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        n1 = len(calls)
+        clock.t += 60.0                         # TTL 到期
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert len(calls) == n1 + 1             # 允许再次调用
+    finally:
+        cm._run_cmd = orig
+
+
+def test_breaker_cleared_on_ready_outcome():
+    clock = _FakeClock()
+    eng = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+    state = {"mode": "block"}
+
+    async def fake_run(cli, timeout):
+        if state["mode"] == "block":
+            return (1, "", "login required")
+        return (0, json.dumps(_REDDIT), "")
+
+    orig = _install_run(fake_run)
+    now = datetime.now(timezone.utc)
+    try:
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert eng._breaker_open_until.get("reddit") is not None
+        clock.t += 60.0                         # 到期允许调用
+        state["mode"] = "ready"
+        r = run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert r                                 # 拿到结果
+        assert eng._breaker_open_until.get("reddit") is None   # ready 清除
+    finally:
+        cm._run_cmd = orig
+
+
+def test_breaker_not_opened_on_empty_outcome():
+    clock = _FakeClock()
+    eng = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+    calls = []
+
+    async def fake_run(cli, timeout):
+        calls.append(cli)
+        return (0, "[]", "")
+
+    orig = _install_run(fake_run)
+    now = datetime.now(timezone.utc)
+    try:
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert "reddit" not in eng._breaker_open_until
+        # empty 不开闸：第二次仍会实际调用
+        run(eng._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert len(calls) == 2
+    finally:
+        cm._run_cmd = orig
+
+
+def test_breaker_isolated_per_source_and_per_engine():
+    clock = _FakeClock()
+    engA = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+
+    async def fake_run(cli, timeout):
+        joined = " ".join(cli)
+        if "reddit" in joined:
+            return (1, "", "AUTH_REQUIRED")
+        return (0, json.dumps(_TWITTER), "")
+
+    orig = _install_run(fake_run)
+    now = datetime.now(timezone.utc)
+    try:
+        run(engA._fetch_source("reddit", SearchOptions("python", count=5), now))
+        assert engA._breaker_open_until.get("reddit") is not None
+        # 同一 engine 的其它 source 不受影响
+        r_tw = run(engA._fetch_source("twitter", SearchOptions("python", count=5), now))
+        assert r_tw
+        assert "twitter" not in engA._breaker_open_until
+        # 另一 engine 实例 breaker 独立，无全局污染
+        engB = cm.CommunityEngine(clock=clock, breaker_ttl=60.0)
+        assert engB._breaker_should_skip("reddit") is False
+        assert engB._breaker_open_until == {}
+    finally:
+        cm._run_cmd = orig
+
+
+def test_engine_default_clock_is_monotonic_and_no_kwargs_ok():
+    eng = cm.CommunityEngine()
+    assert callable(eng._clock)
+    assert isinstance(eng._clock(), float)
+    assert eng._breaker_open_until == {}
+
+
+# ── P0 reliability slice：_run_cmd timeout kill + reaping ───────────
+def test_run_cmd_timeout_kills_then_reaps_process():
+    events = []
+
+    class FakeProc:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)             # 会被 wait_for 超时取消
+            return (b"", b"")
+
+        def kill(self):
+            events.append("kill")
+
+        async def wait(self):
+            events.append("wait")
+            return -9
+
+    async def fake_exec(*args, **kwargs):
+        return FakeProc()
+
+    orig = asyncio.create_subprocess_exec
+    asyncio.create_subprocess_exec = fake_exec
+    try:
+        rc, out, err = run(cm._run_cmd(["opencli", "reddit", "search"], 0.01))
+    finally:
+        asyncio.create_subprocess_exec = orig
+    assert (rc, out, err) == (None, "", "")      # 外部契约不变
+    assert events == ["kill", "wait"]            # kill 之后 await 回收
+
+
 def test_health_check_uses_probe_opencli_status():
     """health_check() 仍然调用 _probe_opencli_status 进行健康检查。"""
     probe_called = []

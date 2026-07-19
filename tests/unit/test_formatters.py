@@ -135,6 +135,112 @@ def test_format_error_exposes_failed_quality():
     assert quality["reasons"] == ["no_valid_results"]
 
 
+# ── policy-sensitive 信号 + source_map 输出契约（加法式 details）──────
+def _sr(url, *, source_tag="", fusion_sources=None):
+    from wrr.schemas import SearchResult
+    return SearchResult(title="t", url=url, snippet="s", source_tag=source_tag,
+                        fusion_sources=list(fusion_sources or []))
+
+
+def _search_out(items, query="q"):
+    rr = RouterResult("exa", items, [FallbackStep("exa", True, len(items))])
+    return json.loads(format_search(rr, query))
+
+
+def test_format_search_policy_sensitive_flag():
+    """details.policy_sensitive 对政策查询为 True，普通查询为 False。"""
+    policy = _search_out(mk_results(1), "EU AI regulation policy")
+    plain = _search_out(mk_results(1), "how to center a div in css")
+    assert policy["details"]["policy_sensitive"] is True
+    assert plain["details"]["policy_sensitive"] is False
+
+
+def test_source_map_covers_five_source_types():
+    """gov.uk official / 普通 public / reddit community / academic / local。"""
+    items = [
+        _sr("https://www.gov.uk/guidance/data-protection"),
+        _sr("https://example.com/blog/post"),
+        _sr("https://reddit.com/r/x/abc", source_tag="reddit"),
+        _sr("https://api.openalex.org/W123", source_tag="academic:openalex"),
+        _sr("obsidian://note/x", source_tag="local:qmd"),
+    ]
+    smap = _search_out(items)["details"]["source_map"]
+    assert [e["index"] for e in smap] == [1, 2, 3, 4, 5]
+    assert [e["source_type"] for e in smap] == [
+        "official", "public", "community", "academic", "local"]
+    assert smap[0]["url"] == "https://www.gov.uk/guidance/data-protection"
+    assert smap[2]["source_tag"] == "reddit"
+
+
+def test_source_map_providers_preserved_not_mislabeled_official():
+    """fusion_sources=[academic,exa] → providers 保留、归类 academic 而非 official。"""
+    items = [_sr("https://example.com/x", fusion_sources=["academic", "exa"])]
+    entry = _search_out(items)["details"]["source_map"][0]
+    assert entry["providers"] == ["academic", "exa"]
+    assert entry["source_type"] == "academic"
+
+
+def test_source_map_empty_and_malformed_url_stable_public():
+    """空 tag / 空 URL / 畸形 URL 稳定归 public，providers 排序去重。"""
+    items = [
+        _sr("", fusion_sources=["exa", "exa", "brave"]),
+        _sr("not-a-valid-url"),
+    ]
+    smap = _search_out(items)["details"]["source_map"]
+    assert smap[0]["source_type"] == "public"
+    assert smap[0]["providers"] == ["brave", "exa"]      # 排序去重
+    assert smap[1]["source_type"] == "public"
+
+
+@pytest.mark.parametrize("tag", [
+    # 既有已覆盖的 community tags（回归保护）
+    "reddit", "twitter", "xiaohongshu", "v2ex", "hackernews",
+    "last30days", "aihot", "wechat",
+    # CommunityEngine 实测输出的真实 tags（此前被误归 public）
+    "aihot_rss", "wechat_rss", "last30days_en", "last30days_cn",
+])
+def test_source_map_real_community_tags_classified_community(tag):
+    """CommunityEngine 实际 source_tag 均应归 community，不因大小写差异漏判。"""
+    items = [_sr("https://example.com/thread", source_tag=tag)]
+    entry = _search_out(items)["details"]["source_map"][0]
+    assert entry["source_type"] == "community"
+    assert entry["source_tag"] == tag
+
+
+@pytest.mark.parametrize("tag", ["aihot_rss", "wechat_rss", "last30days_en", "last30days_cn"])
+def test_source_map_new_community_tags_case_insensitive(tag):
+    """新增 community tags 大小写不敏感（formatter 内部 lower 规整）。"""
+    items = [_sr("https://example.com/x", source_tag=tag.upper())]
+    entry = _search_out(items)["details"]["source_map"][0]
+    assert entry["source_type"] == "community"
+
+
+def test_source_map_community_tags_do_not_leak_to_public_or_priority():
+    """普通 public 与优先级 local/academic 归类不受新增 community tags 影响。"""
+    items = [
+        _sr("https://example.com/blog/post"),                         # public
+        _sr("https://api.openalex.org/W1", source_tag="academic:x"),  # academic
+        _sr("obsidian://note/y", source_tag="local:qmd"),             # local
+        _sr("https://example.com/z", source_tag="aihot_rss"),         # community
+    ]
+    smap = _search_out(items)["details"]["source_map"]
+    assert [e["source_type"] for e in smap] == [
+        "public", "academic", "local", "community"]
+
+
+def test_format_search_core_fields_unchanged_with_new_details():
+    """新增字段为加法式：既有关键字段保持不变。"""
+    out = _search_out(mk_results(2), "q")
+    d = out["details"]
+    assert out["success"] is True
+    assert d["provider"] == "exa"
+    assert d["result_count"] == 2
+    assert d["query"] == "q"
+    assert d["backup_hint"] == config.BACKUP_HINT
+    assert "quality" in d and "fallback_chain" in d
+    assert "policy_sensitive" in d and "source_map" in d
+
+
 def test_format_similar_warns_for_noncomplete_quality():
     result = _result_with_quality(
         "degraded_success", failed=["brave"], success=["exa"],

@@ -24,12 +24,14 @@ import math
 import os
 import re
 import shutil
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import SearchEngine
 from . import _fusion
-from .community_sources import SOURCE_ADAPTERS as _SOURCE_ADAPTERS
+from .community_sources import (SOURCE_ADAPTERS as _SOURCE_ADAPTERS,
+                                SourceFetchResult, SourceOutcome)
 from .. import config
 from ..errors import EngineError
 from ..schemas import SearchOptions, SearchResult, EngineCheckResult
@@ -277,6 +279,11 @@ async def _run_cmd(cli: List[str], timeout: float) -> Tuple[Optional[int], str, 
             proc.kill()
         except ProcessLookupError:
             pass
+        # kill 后必须 await 进程回收，避免遗留僵尸/未回收的 transport 资源。
+        try:
+            await proc.wait()
+        except Exception:
+            pass
         return (None, "", "")
     return (proc.returncode,
             out.decode("utf-8", errors="ignore"),
@@ -300,9 +307,43 @@ async def _probe_opencli_status(timeout: float = 2.0) -> Tuple[bool, str]:
     return (False, f"opencli status unknown: {(out + err)[:200]}")
 
 
+# source-local TTL breaker 默认冷却时长（秒）。仅对 unauthenticated/soft_blocked
+# 开闸——在人工重新登录 / 软封锁解除前的短窗口内跳过该源，避免热路径反复撞墙。
+_BREAKER_TTL_DEFAULT = 300.0
+
+
 class CommunityEngine(SearchEngine):
     name = "community"
     tier = 2  # 本地 CLI 依赖
+
+    def __init__(self, *, clock: Optional[Callable[[], float]] = None,
+                 breaker_ttl: Optional[float] = None):
+        # 可注入的单调时钟接缝（默认 time.monotonic）；便于单测且不依赖 wall clock。
+        self._clock: Callable[[], float] = clock or time.monotonic
+        self._breaker_ttl: float = (
+            _BREAKER_TTL_DEFAULT if breaker_ttl is None else breaker_ttl)
+        # 实例级、source-local breaker：source -> 冷却到期的 monotonic 时刻。
+        # 每个 engine 实例独立，无跨实例/全局共享，避免污染。
+        self._breaker_open_until: Dict[str, float] = {}
+
+    # ── source-local TTL breaker ─────────────────────────────────────
+    def _breaker_should_skip(self, source: str) -> bool:
+        """TTL 未过 → True（跳过调用）；到期 → 清除并允许调用。"""
+        until = self._breaker_open_until.get(source)
+        if until is None:
+            return False
+        if self._clock() >= until:
+            self._breaker_open_until.pop(source, None)   # 到期，允许重试
+            return False
+        return True
+
+    def _breaker_record(self, source: str, outcome: SourceOutcome) -> None:
+        """按 outcome 更新 breaker：unauth/soft_blocked 开闸，ready 清除，empty 不动。"""
+        if outcome in (SourceOutcome.UNAUTHENTICATED, SourceOutcome.SOFT_BLOCKED):
+            self._breaker_open_until[source] = self._clock() + self._breaker_ttl
+        elif outcome is SourceOutcome.READY:
+            self._breaker_open_until.pop(source, None)
+        # EMPTY：不开闸，也不清除既有状态。
 
     async def search(self, options: SearchOptions) -> List[SearchResult]:
         # H3 (v6.1): 搜索热路径不再预检/重启 OpenCLI daemon。daemon/extension
@@ -426,20 +467,40 @@ class CommunityEngine(SearchEngine):
         adapter = _SOURCE_ADAPTERS.get(cfg["kind"])
         if adapter is None:
             return []
+        # source-local breaker：冷却窗口内直接跳过（不 probe、不重启任何 daemon）。
+        if self._breaker_should_skip(source):
+            return []
         # H3 refactor: opencli preflight removed from search hot path.
         # Daemon/extension health is checked by health_check() only.
         try:
-            # 在调用点解析模块级 _run_cmd，保留单测 monkeypatch 语义。
-            items = await adapter.fetch(
-                cfg, options, _run_cmd, config.COMMUNITY_SOURCE_TIMEOUT)
+            result = await self._fetch_via_adapter(adapter, cfg, options)
         except Exception:
             return []
+        self._breaker_record(source, result.outcome)
         out: List[_Scored] = []
-        for it in items:
+        for it in result.items:
             scored = self._item_to_result(it, source, cfg, now)
             if scored:
                 out.append(scored)
         return out
+
+    async def _fetch_via_adapter(self, adapter, cfg, options) -> SourceFetchResult:
+        """统一取回 SourceFetchResult。
+
+        opencli 适配器提供带分类的 `fetch_result`；last30days/RSS 等无分类适配器
+        （及测试注入的裸 `fetch` 适配器）沿用既有 `fetch` 语义，包装为 READY/EMPTY，
+        从不触发 breaker，语义保持不变。在调用点解析模块级 `_run_cmd`，保留单测
+        monkeypatch 语义。
+        """
+        fetch_result = getattr(adapter, "fetch_result", None)
+        if fetch_result is not None:
+            return await fetch_result(
+                cfg, options, _run_cmd, config.COMMUNITY_SOURCE_TIMEOUT)
+        items = await adapter.fetch(
+            cfg, options, _run_cmd, config.COMMUNITY_SOURCE_TIMEOUT)
+        return SourceFetchResult(
+            items=items,
+            outcome=SourceOutcome.READY if items else SourceOutcome.EMPTY)
 
     def _item_to_result(self, item, source, cfg, now) -> Optional[_Scored]:
         title = str(item.get(cfg.get("title", "title")) or item.get("title")

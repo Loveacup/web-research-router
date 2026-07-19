@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .registry import EngineRegistry
 from .schemas import EngineCheckResult
@@ -617,3 +619,335 @@ def doctor_profile_matrix(
         profiles=profile_results,
         summary=summary,
     )
+
+
+# ── P1 OpenCLI Chrome restart control-plane (opt-in, never in search hot path) ──
+#
+# This is a *control-plane* remediation, invoked only by an operator running
+# doctor with an explicit ``user_confirmed=True``. It is NEVER called from
+# search()/route() and never auto-runs. Every side effect is a small injectable
+# callable so the whole flow is unit-testable without touching a real Chrome,
+# a real OpenCLI daemon, or the wall clock. Real production defaults live at the
+# bottom of this section and are only reached when the caller injects nothing.
+
+_RECOVER_TIMEOUT_SEC = 5.0
+_RECOVER_MAX_RETRIES = 1  # hard cap: at most one bounded retry per step
+
+
+class RecoveryStepError(RuntimeError):
+    """A single recovery step failed after its bounded retries (fail-closed)."""
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """Outcome of one opt-in OpenCLI Chrome recovery attempt."""
+
+    attempted: bool
+    before: Dict[str, Any]
+    actions: List[str]
+    after: Dict[str, Any]
+    outcome: str  # "recovered" | "still_disconnected" | "skipped_because_safe" | "error"
+    evidence: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attempted": self.attempted,
+            "before": dict(self.before),
+            "actions": list(self.actions),
+            "after": dict(self.after),
+            "outcome": self.outcome,
+            "evidence": dict(self.evidence),
+        }
+
+
+def _empty_status() -> Dict[str, Any]:
+    return {"bridge_status": "unknown", "source_status_summary": {}}
+
+
+def _normalize_status(raw: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Project a raw probe payload onto the reported {bridge, sources} shape."""
+    raw = raw or {}
+    return {
+        "bridge_status": raw.get("bridge_status", "unknown"),
+        "source_status_summary": dict(raw.get("source_status_summary", {})),
+    }
+
+
+def _call_step(
+    fn: Callable[..., Any],
+    *,
+    timeout_sec: float,
+    retries: int,
+    clock: Callable[[], float],
+) -> Any:
+    """Run one recovery step with bounded retries (<=1), fail-closed on exhaust.
+
+    A step is considered failed if it raises OR returns a dict with ok=False.
+    After ``retries`` bounded retries it raises ``RecoveryStepError``.
+    """
+    attempts = retries + 1
+    last_err: Optional[BaseException] = None
+    for i in range(attempts):
+        started = clock()
+        try:
+            result = fn(timeout_sec=timeout_sec)
+        except Exception as exc:  # retry within budget, then fail-closed
+            last_err = exc
+            continue
+        if isinstance(result, Mapping):
+            annotated = dict(result)
+            annotated["_attempt"] = i + 1
+            annotated["_elapsed_sec"] = round(clock() - started, 4)
+            if annotated.get("ok", True) is False:
+                last_err = RecoveryStepError(annotated.get("detail", "step reported ok=False"))
+                continue
+            return annotated
+        return result
+    raise RecoveryStepError(str(last_err) if last_err else "step failed with no detail")
+
+
+def opencli_recover_once(
+    *,
+    user_confirmed: bool = False,
+    timeout_sec: float = _RECOVER_TIMEOUT_SEC,
+    max_retries: int = _RECOVER_MAX_RETRIES,
+    probe_status: Optional[Callable[..., Mapping[str, Any]]] = None,
+    run_chrome_quit: Optional[Callable[..., Any]] = None,
+    run_opencli_daemon_restart: Optional[Callable[..., Any]] = None,
+    count_open_tabs: Optional[Callable[..., int]] = None,
+    now: Optional[Callable[[], float]] = None,
+) -> RecoveryResult:
+    """One-shot, opt-in OpenCLI browser-bridge recovery.
+
+    Flow:
+      diagnose → if bridge already connected: skipped_because_safe (touch nothing)
+               → if disconnected but user_confirmed is False: skipped_because_safe
+               → if disconnected and user_confirmed is True:
+                     one-time Chrome quit+reopen (OpenCLI-owned profile only)
+                     → opencli daemon restart
+                     → re-probe → recovered | still_disconnected
+      Any step failing after its bounded retry (<=1) → fail-closed ("error").
+
+    Every side effect is injectable so this is unit-testable without a real
+    Chrome or daemon. NEVER call this from search()/route(); it is default-off
+    and requires an explicit ``user_confirmed=True``.
+    """
+    probe = probe_status or _probe_opencli_bridge_status
+    quit_chrome = run_chrome_quit or _run_chrome_quit
+    restart_daemon = run_opencli_daemon_restart or _run_opencli_daemon_restart
+    tabs_fn = count_open_tabs or _count_open_tabs
+    clock = now or _now
+    retries = min(max(int(max_retries), 0), _RECOVER_MAX_RETRIES)
+
+    evidence: Dict[str, Any] = {
+        "timeout_sec": timeout_sec,
+        "max_retries": retries,
+        "user_confirmed": user_confirmed,
+    }
+
+    # Best-effort open-tab count for report reclamation. Failure here must never
+    # affect the recovery decision — swallow and record only.
+    try:
+        evidence["open_tabs"] = int(tabs_fn(timeout_sec=timeout_sec))
+    except Exception as exc:
+        evidence["open_tabs"] = None
+        evidence["open_tabs_error"] = f"{type(exc).__name__}: {exc}"
+
+    # ── diagnose ──
+    try:
+        before_raw = _call_step(probe, timeout_sec=timeout_sec, retries=retries, clock=clock)
+    except Exception as exc:
+        evidence["diagnose_error"] = f"{type(exc).__name__}: {exc}"
+        empty = _empty_status()
+        return RecoveryResult(False, empty, [], empty, "error", evidence)
+    before = _normalize_status(before_raw)
+    evidence["before_probe"] = dict(before_raw) if isinstance(before_raw, Mapping) else before_raw
+
+    if before["bridge_status"] == "connected":
+        evidence["reason"] = "already_connected"
+        return RecoveryResult(False, before, [], before, "skipped_because_safe", evidence)
+
+    if not user_confirmed:
+        evidence["reason"] = "user_not_confirmed"
+        return RecoveryResult(False, before, [], before, "skipped_because_safe", evidence)
+
+    # Fail-closed on anything that is not *definitely* disconnected. An
+    # "unknown" bridge (opencli missing, probe timeout, or any non-disconnected
+    # token) is NOT a mandate to restart Chrome — treat it as safe and skip,
+    # even under an explicit user_confirmed=True.
+    if before["bridge_status"] != "disconnected":
+        evidence["reason"] = "status_not_disconnected"
+        return RecoveryResult(False, before, [], before, "skipped_because_safe", evidence)
+
+    # ── disconnected + confirmed → one-time restart (Chrome then daemon) ──
+    actions: List[str] = []
+    try:
+        r_chrome = _call_step(quit_chrome, timeout_sec=timeout_sec, retries=retries, clock=clock)
+        actions.append("chrome_quit_reopen")
+        evidence["chrome_quit_reopen"] = dict(r_chrome) if isinstance(r_chrome, Mapping) else r_chrome
+        r_daemon = _call_step(restart_daemon, timeout_sec=timeout_sec, retries=retries, clock=clock)
+        actions.append("opencli_daemon_restart")
+        evidence["opencli_daemon_restart"] = dict(r_daemon) if isinstance(r_daemon, Mapping) else r_daemon
+    except Exception as exc:
+        evidence["recovery_error"] = f"{type(exc).__name__}: {exc}"
+        return RecoveryResult(True, before, actions, before, "error", evidence)
+
+    # ── re-probe ──
+    try:
+        after_raw = _call_step(probe, timeout_sec=timeout_sec, retries=retries, clock=clock)
+    except Exception as exc:
+        evidence["reprobe_error"] = f"{type(exc).__name__}: {exc}"
+        return RecoveryResult(True, before, actions, _empty_status(), "error", evidence)
+    after = _normalize_status(after_raw)
+    evidence["after_probe"] = dict(after_raw) if isinstance(after_raw, Mapping) else after_raw
+
+    outcome = "recovered" if after["bridge_status"] == "connected" else "still_disconnected"
+    return RecoveryResult(True, before, actions, after, outcome, evidence)
+
+
+# ── production defaults (subprocess-backed; injected fakes replace them in tests) ──
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _probe_opencli_bridge_status(*, timeout_sec: float = _RECOVER_TIMEOUT_SEC) -> Dict[str, Any]:
+    """Read-only probe of the OpenCLI daemon + browser-bridge extension.
+
+    Production default; unit tests inject a fake and never reach here.
+    """
+    try:
+        proc = subprocess.run(
+            ["opencli", "daemon", "status"],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+    except (FileNotFoundError, OSError):
+        return {"bridge_status": "unknown", "source_status_summary": {}, "detail": "opencli not found"}
+    except subprocess.TimeoutExpired:
+        return {"bridge_status": "unknown", "source_status_summary": {}, "detail": "probe timeout"}
+    # A nonzero exit means the probe itself is broken — its stdout/stderr can no
+    # longer be trusted to describe the bridge (it may still print "disconnected"
+    # or even "extension: connected" noise). Returning "disconnected" here would
+    # license a destructive Chrome restart under user_confirmed=True, so we
+    # fail-closed to "unknown" WITHOUT parsing the output. The detail is a stable,
+    # non-sensitive token; raw stdout/stderr is never surfaced.
+    if proc.returncode != 0:
+        return {
+            "bridge_status": "unknown",
+            "source_status_summary": {"exit_code": proc.returncode},
+            "detail": f"probe failed (exit_code={proc.returncode})",
+        }
+    # A clean exit is necessary but NOT sufficient to trust the text. We parse
+    # stdout and stderr *independently*, line by line, and only a line whose
+    # whitespace-stripped, case-folded content is EXACTLY "extension: connected"
+    # or "extension: disconnected" counts as a marker. This deliberately rejects
+    # two spoofing shapes the old (stdout + stderr) substring parse accepted:
+    #   * cross-stream stitching — stdout="extension:" + stderr=" disconnected"
+    #     can no longer be glued into a marker (streams are never concatenated);
+    #   * substring bleed — "not extension: disconnected" or
+    #     "extension: disconnected-ish" are whole lines that do not equal a
+    #     marker, so they are ignored.
+    # Then: exactly one connected marker (and no disconnected) -> connected;
+    # exactly one disconnected (and no connected) -> disconnected. Zero markers,
+    # a duplicate marker, or both kinds present is NOT a mandate to restart
+    # Chrome — it fails-closed to "unknown" so recovery skips safely under
+    # user_confirmed=True. The detail is a stable, non-sensitive token; raw
+    # stdout/stderr is never surfaced.
+    connected = 0
+    disconnected = 0
+    for stream in (proc.stdout, proc.stderr):
+        for line in (stream or "").splitlines():
+            marker = line.strip().lower()
+            if marker == "extension: connected":
+                connected += 1
+            elif marker == "extension: disconnected":
+                disconnected += 1
+    if connected == 1 and disconnected == 0:
+        status = "connected"
+    elif disconnected == 1 and connected == 0:
+        status = "disconnected"
+    else:
+        return {
+            "bridge_status": "unknown",
+            "source_status_summary": {"exit_code": proc.returncode},
+            "detail": "probe output unrecognized (exit_code=0)",
+        }
+    return {
+        "bridge_status": status,
+        "source_status_summary": {"exit_code": proc.returncode},
+        "detail": f"bridge {status} (exit_code=0)",
+    }
+
+
+def _run_chrome_quit(*, timeout_sec: float = _RECOVER_TIMEOUT_SEC) -> Dict[str, Any]:
+    """One-time quit+reopen of the *OpenCLI-owned* Chrome profile only.
+
+    Safety: this must never close the user's default Chrome. The OpenCLI-owned
+    profile directory must be declared via ``WRR_OPENCLI_CHROME_PROFILE``; when
+    it is absent we fail-closed (ok=False) rather than risk killing user tabs.
+    Production default; unit tests inject a fake and never reach here.
+    """
+    profile = os.environ.get("WRR_OPENCLI_CHROME_PROFILE", "").strip()
+    if not profile:
+        return {
+            "ok": False,
+            "detail": "no OpenCLI-owned Chrome profile configured; refusing to touch user Chrome",
+        }
+    try:
+        # Quit only the process bound to the OpenCLI-owned user-data-dir.
+        # pkill exit status: 0 = one or more processes signalled, 1 = no match
+        # (fine — nothing to kill, we can still reopen). Anything else (2 = usage
+        # error, 3 = fatal) means we cannot trust the process state, so fail-closed
+        # and do NOT reopen. We record only the returncode + profile — never the
+        # subprocess stdout/stderr, which may carry unrelated sensitive output.
+        killed = subprocess.run(
+            ["pkill", "-f", f"user-data-dir={profile}"],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+        if killed.returncode not in (0, 1):
+            return {
+                "ok": False,
+                "detail": f"pkill failed (rc={killed.returncode}) for owned profile: {profile}",
+            }
+        # Relaunch a fresh instance for that same owned profile.
+        opened = subprocess.run(
+            ["open", "-na", "Google Chrome", "--args", f"--user-data-dir={profile}"],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+        if opened.returncode != 0:
+            return {
+                "ok": False,
+                "detail": f"chrome reopen failed (rc={opened.returncode}) for owned profile: {profile}",
+            }
+    except (FileNotFoundError, OSError) as exc:
+        return {"ok": False, "detail": f"chrome restart failed: {type(exc).__name__}"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "detail": "chrome restart timeout"}
+    return {"ok": True, "detail": f"restarted OpenCLI-owned Chrome profile: {profile}"}
+
+
+def _run_opencli_daemon_restart(*, timeout_sec: float = _RECOVER_TIMEOUT_SEC) -> Dict[str, Any]:
+    """Restart the OpenCLI daemon once. Production default; faked in tests."""
+    try:
+        proc = subprocess.run(
+            ["opencli", "daemon", "restart"],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return {"ok": False, "detail": f"daemon restart failed: {type(exc).__name__}"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "detail": "daemon restart timeout"}
+    return {"ok": proc.returncode == 0, "detail": (proc.stdout + proc.stderr)[:200]}
+
+
+def _count_open_tabs(*, timeout_sec: float = _RECOVER_TIMEOUT_SEC) -> int:
+    """Best-effort count of OpenCLI-owned browser tabs for report reclamation.
+
+    May raise; the orchestrator treats any failure as non-fatal.
+    """
+    proc = subprocess.run(
+        ["opencli", "browser", "tabs", "--count"],
+        capture_output=True, text=True, timeout=timeout_sec,
+    )
+    return int((proc.stdout or "0").strip() or 0)

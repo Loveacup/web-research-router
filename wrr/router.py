@@ -11,12 +11,13 @@ import datetime as _dt
 import os
 import time
 import uuid as _uuid
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 
 from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
-from .errors import EngineError, AllEnginesFailedError
+from .errors import EngineError, EngineTimeoutError, RateLimitError, AllEnginesFailedError
 from .schemas import (DecisionContext, DecisionEvidence, DecisionSnapshot, DiagnosticEvent,
                       FallbackStep, RouteQuality, RouteTrace, RouterResult, SearchResult)
 
@@ -234,6 +235,9 @@ def _route_quality(mode, selected_engines, steps, has_results: bool) -> RouteQua
     elif len(successful) < min_required:
         verdict = "insufficient"
         reasons = [f"successful_sources_below_minimum:{len(successful)}<{min_required}"]
+        # 稳定 token（非新 verdict）：多源要求下恰剩单一独立成功来源。
+        if min_required >= 2 and len(successful) == 1:
+            reasons.append("single_source_only")
     elif failed:
         verdict = "degraded_success"
         reasons = ["expected_sources_failed"]
@@ -353,6 +357,22 @@ async def _run_engine(registry, name, options, budget):
             elapsed_ms=elapsed, timeout_ms=engine.timeout * 1000.0, count=0, message="timeout"
         )
         return name, None, step, event
+    except RateLimitError:                        # 归一为稳定 token，供 diversity tripwire 判定
+        elapsed = _elapsed_ms(start)
+        step = FallbackStep(name, False, 0, "rate_limit")
+        event = DiagnosticEvent(
+            engine=name, ok=False, category="search",
+            elapsed_ms=elapsed, count=0, message="rate_limit"
+        )
+        return name, None, step, event
+    except EngineTimeoutError:                    # 引擎级超时同 asyncio timeout 归一为 timeout
+        elapsed = _elapsed_ms(start)
+        step = FallbackStep(name, False, 0, "timeout")
+        event = DiagnosticEvent(
+            engine=name, ok=False, category="search",
+            elapsed_ms=elapsed, count=0, message="timeout"
+        )
+        return name, None, step, event
     except Exception as e:                       # 单引擎异常不拖垮整组
         elapsed = _elapsed_ms(start)
         step = FallbackStep(name, False, 0, str(e) or type(e).__name__)
@@ -381,6 +401,59 @@ async def _dispatch(registry, engine_names, options, weights, mode, budget):
     deduped = _fusion.dedup_cluster([f["doc"] for f in fused],
                                     config.COMMUNITY_DEDUP_THRESHOLD)
     return deduped[:options.count], steps, events
+
+
+# ── Diversity backfill：Brave 失败 → Tavily 条件性独立补源（不入常规路由）──
+_DIVERSITY_BACKFILL_TRIGGER_ERRORS = ("rate_limit", "timeout", "empty result")
+
+
+def _should_diversity_backfill(mode, payload, quality, steps) -> bool:
+    """纯决策 helper：是否触发一次 Tavily 独立补源。
+
+    仅当 ① mode ∈ config.DIVERSITY_BACKFILL_MODES；② 初次 payload 非空；
+    ③ quality 恰为 insufficient 且独立成功来源数 == 1；④ 某 brave 步骤因
+    rate_limit / timeout / empty result 失败；⑤ tavily 尚未尝试 → True。
+    绝不重跑 brave / _dispatch。"""
+    if mode not in config.DIVERSITY_BACKFILL_MODES:
+        return False
+    if not payload:
+        return False
+    if quality is None or quality.verdict != "insufficient":
+        return False
+    if quality.independent_source_count != 1:
+        return False
+    provider = config.DIVERSITY_BACKFILL_PROVIDER
+    if any(step.provider == provider for step in steps):
+        return False
+    return any(
+        step.provider == "brave" and not step.ok
+        and step.error in _DIVERSITY_BACKFILL_TRIGGER_ERRORS
+        for step in steps
+    )
+
+
+def _merge_diversity_backfill(primary, backfill, count):
+    """把 Tavily 结果作为独立来源与已融合的 primary payload 合并。
+
+    经 RRF 重排让非重叠 Tavily 结果按秩交错（不因 primary 简单截断被抹掉），再
+    canonical/标题去重，最后重新套用 count 上限。primary 原始 fusion_sources
+    保留；Tavily 独有结果标记 fusion_sources=[provider]。"""
+    provider = config.DIVERSITY_BACKFILL_PROVIDER
+    orig_sources: Dict[str, List[str]] = {}
+    for doc in primary:
+        key = _fusion.canonical_url(doc.url) or doc.title
+        orig_sources[key] = list(doc.fusion_sources)
+    fused = _fusion.rrf_fuse({"__primary__": primary, provider: backfill}, k=config.RRF_K)
+    deduped = _fusion.dedup_cluster([f["doc"] for f in fused],
+                                    config.COMMUNITY_DEDUP_THRESHOLD)
+    restored: List[SearchResult] = []
+    for doc in deduped:
+        key = _fusion.canonical_url(doc.url) or doc.title
+        sources = set(orig_sources.get(key, []))
+        if provider in doc.fusion_sources:
+            sources.add(provider)
+        restored.append(replace(doc, fusion_sources=sorted(sources)))
+    return restored[:count]
 
 
 def _v6_router_enabled(env: Optional[Dict[str, str]] = None) -> bool:
@@ -596,6 +669,22 @@ async def _route_search_v5_execute(
     engine_names = list(plan.engine_names)
 
     payload, steps, events = await _dispatch(registry, engine_names, options, weights, mode, budget)
+
+    # Diversity backfill：Brave 因 rate_limit/timeout/empty 失败、仅剩单一独立来源时，
+    # 条件性调用一次 Tavily 作为独立补源（不入常规路由；永不重跑 brave/_dispatch，
+    # 不触碰 OpenCLI/browser）。放在 local stale / recovery 之前。
+    if payload is not None:
+        pre_quality = _route_quality(mode, engine_names, steps, True)
+        if _should_diversity_backfill(mode, payload, pre_quality, steps):
+            provider = config.DIVERSITY_BACKFILL_PROVIDER
+            engine_names.append(provider)          # selected_engines 真实记录 tavily 被尝试
+            _, bf_res, bf_step, bf_event = await _run_engine(
+                registry, provider, options, config.DIVERSITY_BACKFILL_TIMEOUT_SECONDS)
+            steps.append(bf_step)
+            events.append(bf_event)
+            if bf_res:
+                payload = _merge_diversity_backfill(payload, bf_res, options.count)
+            # 失败/unknown：保留 primary payload；quality 在末尾按 steps 重算。
 
     # v5.3 全量陈旧门控：local mode 下所有结果 freshness < 0.8 → 追加外网交叉
     if mode == "local" and payload is not None:

@@ -44,6 +44,13 @@ ENGINE_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
         "endpoints": [],
         "description": "Brave Search API（主用或备用 key）",
     },
+    "tavily": {
+        "tier": 1,
+        "env": ["TAVILY_API_KEY"],
+        "commands": [],
+        "endpoints": ["https://api.tavily.com/search"],
+        "description": "Tavily Web Search API（native 搜索适配器，fail-closed）",
+    },
     "github": {
         "tier": 1,
         "env": ["GITHUB_TOKEN"],

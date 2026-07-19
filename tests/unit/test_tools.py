@@ -72,7 +72,7 @@ def test_registry_singleton_and_names():
     r1 = get_registry()
     r2 = get_registry()
     assert r1 is r2                          # 单例
-    assert set(default_registry().names()) == {"exa", "brave", "searxng", "github",
+    assert set(default_registry().names()) == {"exa", "brave", "tavily", "searxng", "github",
                                                 "community", "academic", "skill",
                                                 "local_supermemory", "local_session",
-                                                "local_qmd", "local_obsidian"}  # v5.2：+4 本地引擎
+                                                "local_qmd", "local_obsidian"}  # v5.2：+4 本地引擎；tavily native adapter
