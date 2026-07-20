@@ -1,6 +1,7 @@
 """Router v6 shadow consumption tests."""
 
 import asyncio
+import os
 import json
 import sys
 
@@ -46,6 +47,21 @@ def _registry(names):
 
 def _selected(result):
     return [step.provider for step in result.fallback_chain]
+
+
+def test_unit_default_isolates_live_v6_router_env(monkeypatch):
+    """Unit tests must consume their fake registry, not a live inherited v6 registry."""
+    assert os.environ["WRR_V6_ROUTER"] == "0"
+
+    def fail_if_descriptor_registry_is_built():
+        raise AssertionError("unit default must not build descriptor-backed registry")
+
+    monkeypatch.setattr("wrr.router._descriptor_backed_registry", fail_if_descriptor_registry_is_built)
+
+    result = run(route_search_v5(SearchOptions("what is python"), _registry(("exa",))))
+
+    assert result.actual_provider == "rrf:grounding"
+    assert _selected(result) == ["exa", "brave"]
 
 
 @pytest.mark.parametrize(

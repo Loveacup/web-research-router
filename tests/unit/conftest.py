@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 # 让 `import wrr` 生效（plugin 根目录入 sys.path）
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -10,6 +12,12 @@ if str(ROOT) not in sys.path:
 from wrr.engines.base import SearchEngine  # noqa: E402
 from wrr.errors import EngineError  # noqa: E402
 from wrr.schemas import SearchResult, ExtractResult  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_v6_router_env(monkeypatch):
+    """Unit tests must not inherit the live gateway's descriptor-router switch."""
+    monkeypatch.setenv("WRR_V6_ROUTER", "0")
 
 
 class FakeEngine(SearchEngine):
