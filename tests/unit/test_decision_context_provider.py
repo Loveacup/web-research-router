@@ -10,6 +10,7 @@ import ast
 import pathlib
 import threading
 import time
+import uuid
 
 import pytest
 
@@ -65,6 +66,20 @@ def test_get_before_refresh_does_not_call_builder_and_returns_none():
     assert builder.calls == 0
 
 
+def test_observe_before_refresh_is_immutable_cold_without_cohort():
+    builder = _CountingBuilder(_context())
+    provider = CachedDecisionContextProvider(builder)
+
+    observation = provider.observe()
+
+    assert observation.context is None
+    assert observation.status == "cold"
+    assert observation.cohort_id is None
+    assert builder.calls == 0
+    with pytest.raises(AttributeError):
+        observation.status = "available"
+
+
 # ── refresh publishes; get reads last published ─────────────────────────
 
 def test_refresh_calls_builder_once_and_publishes():
@@ -77,6 +92,21 @@ def test_refresh_calls_builder_once_and_publishes():
     assert builder.calls == 1
     assert published is context
     assert provider.get() is context
+
+
+def test_refresh_success_publishes_available_with_internal_uuid4_cohort():
+    context = _context()
+    provider = CachedDecisionContextProvider(lambda: context)
+
+    provider.refresh()
+    observation = provider.observe()
+
+    assert observation.context is context
+    assert observation.status == "available"
+    assert observation.cohort_id is not None
+    parsed = uuid.UUID(observation.cohort_id)
+    assert parsed.version == 4
+    assert str(parsed) == observation.cohort_id
 
 
 def test_get_does_not_call_builder_after_publish():
@@ -114,12 +144,17 @@ def test_refresh_exception_propagates_and_retains_last_good():
     provider = CachedDecisionContextProvider(builder)
     provider.refresh()
     assert provider.get() is good
+    before = provider.observe()
 
     state["fail"] = True
     with pytest.raises(RuntimeError, match="build boom"):
         provider.refresh()
     # last-good snapshot survives the failed refresh.
     assert provider.get() is good
+    after = provider.observe()
+    assert after.context is good
+    assert after.status == "refresh_failed"
+    assert after.cohort_id == before.cohort_id
 
 
 def test_refresh_wrong_return_type_retains_last_good_and_raises():
@@ -146,6 +181,60 @@ def test_first_refresh_failure_leaves_no_snapshot():
     with pytest.raises(RuntimeError):
         provider.refresh()
     assert provider.get() is None
+    observation = provider.observe()
+    assert observation.context is None
+    assert observation.status == "refresh_failed"
+    assert observation.cohort_id is None
+
+
+def test_success_after_failure_mints_new_cohort_and_clears_failure():
+    first = _context(snapshot_version="first")
+    second = _context(snapshot_version="second")
+    state = {"step": 0}
+
+    def builder():
+        state["step"] += 1
+        if state["step"] == 2:
+            raise RuntimeError("transient")
+        return first if state["step"] == 1 else second
+
+    provider = CachedDecisionContextProvider(builder)
+    provider.refresh()
+    first_observation = provider.observe()
+    with pytest.raises(RuntimeError):
+        provider.refresh()
+    assert provider.observe().status == "refresh_failed"
+
+    provider.refresh()
+    recovered = provider.observe()
+
+    assert recovered.context is second
+    assert recovered.status == "available"
+    assert recovered.cohort_id != first_observation.cohort_id
+
+
+def test_cohort_id_is_internal_and_uuid_mint_failure_retains_last_good(monkeypatch):
+    constructor = getattr(provider_module, "CachedDecisionContextProvider")
+    with pytest.raises(TypeError):
+        constructor(lambda: _context(), cohort_id="caller")
+
+    context = _context()
+    provider = CachedDecisionContextProvider(lambda: context)
+    provider.refresh()
+    before = provider.observe()
+    monkeypatch.setattr(
+        provider_module.uuid,
+        "uuid4",
+        lambda: (_ for _ in ()).throw(RuntimeError("uuid unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="uuid unavailable"):
+        provider.refresh()
+
+    after = provider.observe()
+    assert after.context is context
+    assert after.status == "refresh_failed"
+    assert after.cohort_id == before.cohort_id
 
 
 # ── TTL is not a read filter ────────────────────────────────────────────
@@ -204,6 +293,7 @@ def test_get_returns_old_snapshot_while_refresh_builds():
 
     provider = CachedDecisionContextProvider(builder)
     provider.refresh()  # publish `old`
+    old_observation = provider.observe()
 
     worker = threading.Thread(target=provider.refresh)
     worker.start()
@@ -212,11 +302,19 @@ def test_get_returns_old_snapshot_while_refresh_builds():
     # While the second build is in flight, get() must not block and must
     # still return the previously published snapshot.
     assert provider.get() is old
+    during = provider.observe()
+    assert during.context is old
+    assert during.status == "available"
+    assert during.cohort_id == old_observation.cohort_id
 
     release.set()
     worker.join(timeout=2.0)
     assert not worker.is_alive()
     assert provider.get() is new
+    after = provider.observe()
+    assert after.context is new
+    assert after.status == "available"
+    assert after.cohort_id != old_observation.cohort_id
 
 
 # ── source purity: no hot-path / I/O dependencies ───────────────────────
@@ -244,8 +342,8 @@ def _provider_source_tree():
 
 def test_provider_only_imports_stdlib_and_schemas():
     # The only permitted imports are stdlib plumbing and the DecisionContext schema.
-    allowed_roots = {"__future__", "threading", "typing", "wrr"}
-    allowed_modules = {"__future__", "threading", "typing", "wrr.schemas"}
+    allowed_roots = {"__future__", "threading", "typing", "uuid", "wrr"}
+    allowed_modules = {"__future__", "threading", "typing", "uuid", "wrr.schemas"}
     for node in ast.walk(_provider_source_tree()):
         if isinstance(node, ast.Import):
             for alias in node.names:
