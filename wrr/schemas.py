@@ -386,6 +386,260 @@ class DecisionEvidence:
         return d
 
 
+DECISION_EVIDENCE_V2_SCHEMA_VERSION = 2
+_V2_CONTEXT_STATUSES = frozenset({"available", "cold", "refresh_failed"})
+_V2_COMPARISON_STATUSES = frozenset({
+    "compared", "context_unavailable", "context_build_failed",
+    "context_expired", "context_mismatch", "comparison_failed",
+})
+_V2_PROTECTIONS = frozenset({
+    "not_required", "protected_by_legacy", "unprotected_empty",
+    "unprotected_error", "unobservable",
+})
+_V2_SHADOW_CODES = frozenset({"E0", "E1", "E2", "U1", "U2", "U3"})
+_V2_PROJECTION_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class ShadowComparisonEvidenceV2:
+    """Privacy-bounded v2 wire summary with no provider IDs or raw reasons."""
+
+    code: str
+    safe: bool
+    legacy_provider_count: int
+    descriptor_provider_count: int
+    omitted_provider_count: int = 0
+    added_provider_count: int = 0
+    reasons_complete: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.code) is not str or self.code not in _V2_SHADOW_CODES:
+            raise ValueError("v2 shadow code must be one of E0-E2|U1-U3")
+        if type(self.safe) is not bool:
+            raise ValueError("v2 shadow safe must be bool")
+        for field_name in (
+            "legacy_provider_count", "descriptor_provider_count",
+            "omitted_provider_count", "added_provider_count",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"v2 shadow {field_name} must be non-negative int")
+        if type(self.reasons_complete) is not bool:
+            raise ValueError("v2 shadow reasons_complete must be bool")
+        self._validate_semantics()
+
+    def _validate_semantics(self) -> None:
+        if self.safe != self.code.startswith("E"):
+            raise ValueError("invalid v2 shadow semantics")
+        if self.omitted_provider_count > self.legacy_provider_count:
+            raise ValueError("invalid v2 shadow semantics")
+        if self.added_provider_count > self.descriptor_provider_count:
+            raise ValueError("invalid v2 shadow semantics")
+        if self.descriptor_provider_count != (
+            self.legacy_provider_count
+            - self.omitted_provider_count
+            + self.added_provider_count
+        ):
+            raise ValueError("invalid v2 shadow semantics")
+
+        if self.code == "E0":
+            valid = (
+                self.legacy_provider_count == self.descriptor_provider_count
+                and self.omitted_provider_count == 0
+                and self.added_provider_count == 0
+            )
+        elif self.code == "E1":
+            valid = (
+                self.descriptor_provider_count < self.legacy_provider_count
+                and self.omitted_provider_count
+                == self.legacy_provider_count - self.descriptor_provider_count
+                and self.added_provider_count == 0
+                and self.reasons_complete
+            )
+        elif self.code == "E2":
+            valid = (
+                self.legacy_provider_count == self.descriptor_provider_count
+                and self.omitted_provider_count == 0
+                and self.added_provider_count == 0
+            )
+        elif self.code == "U1":
+            valid = self.added_provider_count == 0 and self.omitted_provider_count > 0
+        elif self.code == "U2":
+            valid = self.added_provider_count > 0
+        else:
+            valid = True
+        if not valid:
+            raise ValueError("invalid v2 shadow semantics")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "code": self.code,
+            "safe": self.safe,
+            "legacy_provider_count": self.legacy_provider_count,
+            "descriptor_provider_count": self.descriptor_provider_count,
+            "omitted_provider_count": self.omitted_provider_count,
+            "added_provider_count": self.added_provider_count,
+            "reasons_complete": self.reasons_complete,
+        }
+
+
+@dataclass(frozen=True)
+class DecisionEvidenceV2:
+    """Schema-v2 persisted evidence; not the live emitter default."""
+
+    request_key: str
+    recorded_at: str
+    context_status: str
+    comparison_status: str
+    execution_protection: str
+    context_cohort_id: Optional[str]
+    schema_version: int = DECISION_EVIDENCE_V2_SCHEMA_VERSION
+    stage: str = _DECISION_STAGE
+    mode: Optional[str] = None
+    terminal: Optional[str] = None
+    outcome: str = "success"
+    actual_provider: Optional[str] = None
+    result_count: int = 0
+    quality_verdict: Optional[str] = None
+    route_elapsed_ms: float = 0.0
+    shadow_comparison: Optional[ShadowComparisonEvidenceV2] = None
+    _projection_token: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._projection_token is not _V2_PROJECTION_TOKEN:
+            raise ValueError("DecisionEvidenceV2 must be a factory-owned projection")
+        if type(self.schema_version) is not int or self.schema_version != DECISION_EVIDENCE_V2_SCHEMA_VERSION:
+            raise ValueError("unsupported v2 decision evidence schema_version")
+        if type(self.request_key) is not str or not _is_uuid4(self.request_key):
+            raise ValueError("request_key must be a random UUIDv4 string")
+        if type(self.recorded_at) is not str or not _is_rfc3339_utc_z(self.recorded_at):
+            raise ValueError("recorded_at must be an RFC3339 UTC timestamp ending in 'Z'")
+        if type(self.stage) is not str or self.stage != _DECISION_STAGE:
+            raise ValueError("stage must be 'S'")
+        if self.mode is not None and type(self.mode) is not str:
+            raise ValueError("mode must be exact str or None")
+        if self.mode is not None and self.mode not in _DECISION_MODES:
+            raise ValueError("mode must be a current Stage-S mode")
+        if self.terminal is not None and type(self.terminal) is not str:
+            raise ValueError("terminal must be exact str or None")
+        if self.terminal is not None and self.terminal not in _DECISION_TERMINALS:
+            raise ValueError("terminal must be a current Stage-S terminal")
+        if type(self.outcome) is not str or self.outcome not in _DECISION_OUTCOMES:
+            raise ValueError("outcome must be one of success|empty|error")
+        if self.actual_provider is not None and type(self.actual_provider) is not str:
+            raise ValueError("actual_provider must be exact str or None")
+        if self.actual_provider is not None and not _is_provider_token(self.actual_provider):
+            raise ValueError("actual_provider must be a bounded machine token")
+        if type(self.result_count) is not int or self.result_count < 0:
+            raise ValueError("result_count must be a non-negative int")
+        if self.quality_verdict is not None and type(self.quality_verdict) is not str:
+            raise ValueError("quality_verdict must be exact str or None")
+        if self.quality_verdict is not None and self.quality_verdict not in _DECISION_VERDICTS:
+            raise ValueError("quality_verdict must be a current verdict")
+        if isinstance(self.route_elapsed_ms, bool) or not isinstance(
+            self.route_elapsed_ms, (int, float)
+        ) or not _math.isfinite(self.route_elapsed_ms) or self.route_elapsed_ms < 0:
+            raise ValueError("route_elapsed_ms must be finite and non-negative")
+        if type(self.context_status) is not str or self.context_status not in _V2_CONTEXT_STATUSES:
+            raise ValueError("invalid v2 context_status")
+        if type(self.comparison_status) is not str or self.comparison_status not in _V2_COMPARISON_STATUSES:
+            raise ValueError("invalid v2 comparison_status")
+        if type(self.execution_protection) is not str or self.execution_protection not in _V2_PROTECTIONS:
+            raise ValueError("invalid v2 execution_protection")
+        if self.context_cohort_id is not None and (
+            type(self.context_cohort_id) is not str
+            or not _is_uuid4(self.context_cohort_id)
+            or self.context_cohort_id != self.context_cohort_id.lower()
+        ):
+            raise ValueError("context_cohort_id must be a canonical UUIDv4")
+        if self.shadow_comparison is not None and type(
+            self.shadow_comparison
+        ) is not ShadowComparisonEvidenceV2:
+            raise ValueError("shadow_comparison must be an exact v2 shadow projection")
+        self._validate_cross_fields()
+
+    def _validate_cross_fields(self) -> None:
+        compared = self.comparison_status == "compared"
+        if compared != (self.shadow_comparison is not None):
+            raise ValueError("compared iff shadow_comparison is present")
+        if self.context_status == "cold":
+            if self.context_cohort_id is not None or self.comparison_status != "context_unavailable":
+                raise ValueError("cold context must be unavailable without cohort")
+        elif self.context_status == "available":
+            if self.context_cohort_id is None or self.comparison_status in {
+                "context_unavailable", "context_build_failed",
+            }:
+                raise ValueError("available context requires cohort and valid comparison state")
+        elif self.context_cohort_id is None:
+            if self.comparison_status != "context_build_failed":
+                raise ValueError("failed context without last-good must be context_build_failed")
+        elif self.comparison_status not in {
+            "compared", "context_expired", "context_mismatch", "comparison_failed",
+        }:
+            raise ValueError("failed context with last-good has invalid comparison state")
+
+        if self.outcome == "success":
+            if self.result_count <= 0 or self.actual_provider is None:
+                raise ValueError("success requires provider and positive result_count")
+        elif self.outcome == "empty":
+            if self.result_count != 0 or self.actual_provider is None:
+                raise ValueError("empty requires provider and zero result_count")
+        elif self.result_count != 0 or self.actual_provider is not None:
+            raise ValueError("error requires null provider and zero result_count")
+
+        if not compared:
+            if self.execution_protection != "unobservable":
+                raise ValueError("non-compared evidence protection must be unobservable")
+            return
+        shadow = self.shadow_comparison
+        assert shadow is not None  # established by the compared iff invariant above
+        if shadow.descriptor_provider_count > 0:
+            if self.execution_protection != "not_required":
+                raise ValueError("descriptor selection requires not_required protection")
+        elif self.outcome == "success":
+            if self.execution_protection != "protected_by_legacy":
+                raise ValueError("successful legacy protection must be recorded")
+        elif self.outcome == "empty":
+            if self.execution_protection != "unprotected_empty":
+                raise ValueError("empty legacy protection must be unprotected_empty")
+        elif self.execution_protection != "unprotected_error":
+            raise ValueError("error legacy protection must be unprotected_error")
+
+    def to_dict(self) -> Dict[str, Any]:
+        # Treat serialization as a second trust boundary: frozen dataclasses can
+        # still be tampered with via object.__setattr__ in-process.
+        DecisionEvidenceV2.__post_init__(self)
+        data: Dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "request_key": self.request_key,
+            "recorded_at": self.recorded_at,
+            "stage": self.stage,
+            "mode": self.mode,
+            "terminal": self.terminal,
+            "outcome": self.outcome,
+            "result_count": self.result_count,
+            "quality_verdict": self.quality_verdict,
+            "route_elapsed_ms": round(float(self.route_elapsed_ms), 2),
+            "context_status": self.context_status,
+            "comparison_status": self.comparison_status,
+            "execution_protection": self.execution_protection,
+            "context_cohort_id": self.context_cohort_id,
+        }
+        if self.shadow_comparison is not None:
+            shadow = self.shadow_comparison
+            ShadowComparisonEvidenceV2.__post_init__(shadow)
+            data["shadow_comparison"] = {
+                "code": shadow.code,
+                "safe": shadow.safe,
+                "legacy_provider_count": shadow.legacy_provider_count,
+                "descriptor_provider_count": shadow.descriptor_provider_count,
+                "omitted_provider_count": shadow.omitted_provider_count,
+                "added_provider_count": shadow.added_provider_count,
+                "reasons_complete": shadow.reasons_complete,
+            }
+        return data
+
+
 def _canonical_unique_mapping(
     entries: Tuple[Tuple[str, str], ...], label: str
 ) -> Tuple[Tuple[str, str], ...]:
