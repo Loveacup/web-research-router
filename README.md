@@ -203,11 +203,15 @@ Run `wrr-cli.py doctor` for self-check.
 # Default environment uses v6 descriptor router.
 # Use WRR_V6_ROUTER=0 for legacy registry tests with FakeEngine.
 WRR_V6_ROUTER=0 PYTHONPATH=. pytest tests/unit -q
+
+# Live OpenAlex integration is explicit and does not affect the unit verdict.
+WRR_LIVE=1 PYTHONPATH=. pytest tests/integration/test_academic_live.py -q
 ```
 
 | Gate | Command |
 |---|---|
-| Unit tests | `WRR_V6_ROUTER=0 pytest tests/unit -k 'not openalex_live_single_source' -q` |
+| Unit tests | `WRR_V6_ROUTER=0 pytest tests/unit -q` |
+| OpenAlex live integration | `WRR_LIVE=1 pytest tests/integration/test_academic_live.py -q` |
 | Installed CLI smoke | `wrr doctor --v6 --json --runtime standalone` |
 | Deep health | `wrr doctor --v6 --deep --json --runtime standalone` |
 

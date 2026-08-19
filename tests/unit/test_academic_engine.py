@@ -7,8 +7,6 @@ import asyncio
 import math
 from datetime import datetime, timezone
 
-import pytest
-
 from wrr.engines import academic as ac
 from wrr.engines._fusion import recency_decay
 from wrr.schemas import SearchOptions
@@ -222,11 +220,3 @@ def test_parse_s2_paper_preprint_and_tldr():
     assert p["tldr"] == "a language model"
     assert p["arxiv_id"] == "2005.14165"
     assert p["landing_url"] == "https://arxiv.org/abs/2005.14165"
-
-
-# ── 可选 live 集成（无网络默认 deselect）────────────────────────────
-@pytest.mark.integration
-def test_openalex_live_single_source():
-    out = run(ac._fetch_openalex(SearchOptions("transformer attention", count=3)))
-    assert out and any(_p.get("cited_by_count", 0) >= 0 for _p in out)
-    assert all(_p.get("title") for _p in out)

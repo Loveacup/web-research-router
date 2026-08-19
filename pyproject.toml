@@ -40,3 +40,6 @@ wrr = ["engines/builtin/*/engine.yaml"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 addopts = "-q"
+markers = [
+    "integration: live external integration tests; run explicitly with required credentials or WRR_LIVE=1",
+]
