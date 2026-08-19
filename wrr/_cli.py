@@ -26,6 +26,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import stat
 import sys
 
 # ── 作为包内模块运行时，wrr 包由 pip 安装保证可 import；不需要手动 sys.path 注入 ──
@@ -78,6 +79,46 @@ def _eprint(*a) -> None:
 
 def _emit_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def cmd_evidence_gate(ns) -> int:
+    """Evaluate an explicit evidence JSONL path without loading runtime env."""
+    from .evidence_gate import MAX_FILE_BYTES, evaluate_jsonl
+
+    fd = None
+    try:
+        fd = os.open(ns.path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            _eprint("evidence-gate: --path must reference a regular file")
+            return 2
+        if metadata.st_size > MAX_FILE_BYTES:
+            _eprint("evidence-gate: input exceeds the supported size limit")
+            return 2
+        with os.fdopen(fd, "rb") as stream:
+            fd = None  # fdopen owns and closes the descriptor.
+            report = evaluate_jsonl(stream, requested_modes=ns.mode).to_dict()
+    except OSError:
+        _eprint("evidence-gate: unable to read --path")
+        return 2
+    except Exception:
+        _eprint("evidence-gate: evaluation failed")
+        return 2
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    try:
+        if ns.json:
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        else:
+            print(f"{report['gate']}: {report['status']}")
+            for mode in report["modes"]:
+                reasons = ",".join(mode["reasons"]) or "none"
+                print(f"  {mode['mode']}: {mode['status']} (selection={mode['selection_status']}; {reasons})")
+    except (BrokenPipeError, OSError):
+        return 2
+    return 0 if report["status"] == "READY" else 1
 
 
 def _result_to_payload(operation: str, result) -> object:
@@ -595,6 +636,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="测试类型：smoke（默认）或 unit")
     tp.set_defaults(func=cmd_test)
 
+    from .evidence_gate import MODES
+
+    ep = sub.add_parser(
+        "evidence-gate",
+        help="离线只读聚合 Stage-S decision evidence；不会改 rollout/config",
+    )
+    ep.add_argument("--path", required=True, metavar="FILE", help="显式 JSONL 文件路径（无默认 live path）")
+    ep.add_argument("--mode", action="append", choices=MODES, help="仅评估指定 mode；可重复")
+    ep.add_argument("--json", action="store_true", help="输出稳定机器可读 JSON")
+    ep.set_defaults(func=cmd_evidence_gate)
+
     ip = sub.add_parser(
         "install",
         help="生成 v6 install 报告；当前必须显式 --dry-run，默认不写文件",
@@ -692,6 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
+
+    if ns.cmd == "evidence-gate":
+        return ns.func(ns)
 
     use_v6_env = ns.cmd == "install" or (ns.cmd == "doctor" and getattr(ns, "v6", False))
     loaded = None if use_v6_env else load_env(getattr(ns, "env", None))

@@ -199,6 +199,27 @@ Run `wrr-cli.py doctor` for self-check.
 
 ## Testing
 
+### Offline Stage-S evidence gate
+
+```bash
+wrr evidence-gate --path /path/to/decision-evidence.jsonl --json
+wrr evidence-gate --path /path/to/decision-evidence.jsonl --mode grounding --json
+```
+
+The command is offline and read-only: `--path` is required, there is no default
+live path, and it does not load `.env`, providers, runtime configuration, or
+network clients. Exit codes are `0` for full readiness, `1` for a valid
+`NOT_READY` report, and `2` for usage or file/output failure.
+
+Input is bounded and fail-closed: regular files only, 64 MiB per file, 64 KiB
+per line, 100,000 rows, and 128 items per provider/reason list. FIFO/socket
+paths are opened non-blocking and rejected before evaluation.
+
+Schema-v1 evidence cannot prove execution/fallback protection (`U4`), so its
+full Stage-C `status` remains `NOT_READY` even when the observable
+`selection_status` passes. The report is evidence for review, never an automatic
+rollout authorization.
+
 ```bash
 # Default environment uses v6 descriptor router.
 # Use WRR_V6_ROUTER=0 for legacy registry tests with FakeEngine.
