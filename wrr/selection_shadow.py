@@ -16,6 +16,14 @@ from .selection import descriptor_selection_plan
 class ShadowComparisonUnavailable(ValueError):
     """Raised when the supplied observation cannot produce a valid comparison."""
 
+    _REASONS = frozenset({"context_expired", "context_mismatch"})
+
+    def __init__(self, reason: str) -> None:
+        if reason not in self._REASONS:
+            raise ValueError("unsupported shadow unavailable reason")
+        self.reason = reason
+        super().__init__(reason)
+
 
 def compare_shadow_selection(
     options,
@@ -27,11 +35,13 @@ def compare_shadow_selection(
     """Evaluate twice and compare without changing execution."""
 
     decision = descriptor_selection_plan(options, context, evaluated_at=evaluated_at)
-    if decision.status == "expired" or any(
+    if any(
         blocked_code == "legacy_plan_mismatch"
         for _, blocked_code, _ in decision.blocked
     ):
-        raise ShadowComparisonUnavailable(decision.status)
+        raise ShadowComparisonUnavailable("context_mismatch")
+    if decision.status == "expired":
+        raise ShadowComparisonUnavailable("context_expired")
     repeated = descriptor_selection_plan(options, context, evaluated_at=evaluated_at)
     return compare_shadow_decisions(
         decision,

@@ -1,9 +1,16 @@
 """P1 Slice 3a: pure descriptor-selection shadow comparison contracts."""
 from dataclasses import replace
 
+import pytest
+
+import wrr.selection_shadow as shadow_module
 from wrr.schemas import DecisionContext, SearchOptions
 from wrr.selection import descriptor_selection_plan
-from wrr.selection_shadow import compare_shadow_decisions, compare_shadow_selection
+from wrr.selection_shadow import (
+    ShadowComparisonUnavailable,
+    compare_shadow_decisions,
+    compare_shadow_selection,
+)
 
 
 def _context(**overrides):
@@ -122,6 +129,51 @@ def test_repeated_evaluation_mismatch_is_u3():
         expected_legacy_plan=changed_route_plan,
     )
     assert route_drift.code == "U3"
+
+
+def test_expired_context_raises_closed_reason():
+    with pytest.raises(ShadowComparisonUnavailable) as exc:
+        compare_shadow_selection(
+            SearchOptions("what is python"),
+            _context(expires_at=149.0),
+            evaluated_at=150.0,
+        )
+
+    assert exc.value.reason == "context_expired"
+    assert str(exc.value) == "context_expired"
+
+
+def test_legacy_plan_mismatch_raises_distinct_closed_reason(monkeypatch):
+    decision = descriptor_selection_plan(
+        SearchOptions("what is python"),
+        _context(),
+        evaluated_at=150.0,
+    )
+    mismatched = replace(
+        decision,
+        status="blocked",
+        blocked=(("exa", "legacy_plan_mismatch", ("requested:brave",)),),
+    )
+    monkeypatch.setattr(
+        shadow_module,
+        "descriptor_selection_plan",
+        lambda *_args, **_kwargs: mismatched,
+    )
+
+    with pytest.raises(ShadowComparisonUnavailable) as exc:
+        compare_shadow_selection(
+            SearchOptions("what is python"),
+            _context(),
+            evaluated_at=150.0,
+        )
+
+    assert exc.value.reason == "context_mismatch"
+    assert str(exc.value) == "context_mismatch"
+
+
+def test_shadow_unavailable_reason_vocabulary_is_closed():
+    with pytest.raises(ValueError, match="unsupported shadow unavailable reason"):
+        ShadowComparisonUnavailable("secret_exception_text")
 
 
 def test_shadow_comparator_has_no_control_plane_or_io_dependencies():
