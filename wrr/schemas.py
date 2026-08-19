@@ -426,7 +426,7 @@ class ShadowComparisonEvidenceV2:
                 raise ValueError(f"v2 shadow {field_name} must be non-negative int")
         if type(self.reasons_complete) is not bool:
             raise ValueError("v2 shadow reasons_complete must be bool")
-        self._validate_semantics()
+        ShadowComparisonEvidenceV2._validate_semantics(self)
 
     def _validate_semantics(self) -> None:
         if self.safe != self.code.startswith("E"):
@@ -556,7 +556,7 @@ class DecisionEvidenceV2:
             self.shadow_comparison
         ) is not ShadowComparisonEvidenceV2:
             raise ValueError("shadow_comparison must be an exact v2 shadow projection")
-        self._validate_cross_fields()
+        DecisionEvidenceV2._validate_cross_fields(self)
 
     def _validate_cross_fields(self) -> None:
         compared = self.comparison_status == "compared"

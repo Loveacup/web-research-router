@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, runtime_checkable
 
-from ..schemas import DecisionEvidence
+from ..schemas import DecisionEvidence, DecisionEvidenceV2
 from .detect import RuntimeInfo, detect_runtime
 
 
@@ -36,13 +36,13 @@ _REGISTRY_LOCK = threading.Lock()
 class DecisionEvidenceSink(Protocol):
     """Accepts one immutable decision evidence record; must never raise."""
 
-    def record(self, evidence: DecisionEvidence) -> None: ...
+    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> None: ...
 
 
 class NoopDecisionEvidenceSink:
     """Discards every record. The safe default when persistence is disabled."""
 
-    def record(self, evidence: DecisionEvidence) -> None:  # noqa: D401 - trivial
+    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> None:  # noqa: D401 - trivial
         return None
 
 
@@ -72,13 +72,17 @@ def _lock_for(canonical: str) -> threading.Lock:
         return lock
 
 
-def _whitelist_record(evidence: DecisionEvidence) -> dict:
+def _whitelist_record(evidence: DecisionEvidence | DecisionEvidenceV2) -> dict:
     """Build the explicit whitelist projection to serialize."""
     # Exact-type boundary: reject duck-typed objects and subclasses that could
     # override ``to_dict`` to smuggle unapproved fields into the JSONL record.
-    if type(evidence) is not DecisionEvidence:
-        raise TypeError("decision evidence sink accepts exact DecisionEvidence only")
-    return DecisionEvidence.to_dict(evidence)
+    if type(evidence) is DecisionEvidence:
+        return DecisionEvidence.to_dict(evidence)
+    if type(evidence) is DecisionEvidenceV2:
+        # Re-run the exact class serializer: it revalidates every field and emits
+        # a fixed whitelist without invoking nested polymorphic methods.
+        return DecisionEvidenceV2.to_dict(evidence)
+    raise TypeError("decision evidence sink accepts exact v1/v2 evidence only")
 
 
 class JsonlDecisionEvidenceSink:
@@ -100,7 +104,7 @@ class JsonlDecisionEvidenceSink:
     def path(self) -> Path:
         return self._path
 
-    def record(self, evidence: DecisionEvidence) -> None:
+    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> None:
         try:
             line = json.dumps(
                 _whitelist_record(evidence), ensure_ascii=False, sort_keys=True
