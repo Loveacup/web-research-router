@@ -9,6 +9,7 @@ RED-first. Fake engines/registry only; no network, no live engines.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import inspect
 import json
 import uuid
@@ -24,9 +25,12 @@ from wrr.schemas import (
     SearchOptions,
     DecisionContext,
     DecisionEvidence,
+    DecisionEvidenceV2,
     ShadowComparison,
 )
+from wrr.runtime.decision_context_provider import CachedDecisionContextProvider
 from wrr.errors import AllEnginesFailedError
+from wrr.selection_shadow import ShadowComparisonUnavailable
 
 
 def run(coro):
@@ -62,6 +66,10 @@ def _shadow_context(expires_at=200.0):
         descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
         config_fingerprint="cfg-v1",
     )
+
+
+def _empty_descriptor_context():
+    return replace(_shadow_context(), routable_descriptor_ids=())
 
 
 class SpySink:
@@ -122,6 +130,375 @@ def test_warm_success_records_exact_object_uuid4_e0_no_query():
     assert result.payload
     # privacy: no query text anywhere in the serialized record
     assert "what is python" not in json.dumps(ev.to_dict())
+
+
+def test_opt_in_v2_with_complete_observation_records_v2_e0():
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert sink.records == [evidence]
+    assert evidence.context_status == "available"
+    assert evidence.comparison_status == "compared"
+    assert evidence.execution_protection == "not_required"
+    assert evidence.shadow_comparison is not None
+    assert evidence.shadow_comparison.code == "E0"
+
+
+def test_v2_route_trace_ignores_instance_serializer_override():
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+    ))
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    object.__setattr__(evidence, "to_dict", lambda: {"secret": "credential"})
+
+    payload = result.diagnostics.to_dict()["decision_evidence"]
+
+    assert payload["schema_version"] == 2
+    assert "secret" not in payload
+
+
+@pytest.mark.parametrize("reason", ["context_expired", "context_mismatch"])
+def test_opt_in_v2_maps_closed_comparison_unavailable_reason(monkeypatch, reason):
+    def unavailable(*_args, **_kwargs):
+        raise ShadowComparisonUnavailable(reason)
+
+    monkeypatch.setattr("wrr.selection_shadow.compare_shadow_selection", unavailable)
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.context_status == "available"
+    assert evidence.comparison_status == reason
+    assert evidence.execution_protection == "unobservable"
+    assert evidence.shadow_comparison is None
+
+
+def test_comparison_exception_reason_property_cannot_break_legacy_execution(monkeypatch):
+    class HostileComparisonError(RuntimeError):
+        @property
+        def reason(self):
+            raise RuntimeError("reason property boom")
+
+    def unavailable(*_args, **_kwargs):
+        raise HostileComparisonError("comparison boom")
+
+    monkeypatch.setattr("wrr.selection_shadow.compare_shadow_selection", unavailable)
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+    ))
+
+    assert result.payload
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.comparison_status == "comparison_failed"
+
+
+@pytest.mark.parametrize(
+    ("code", "descriptor", "omitted", "added", "reasons"),
+    [
+        ("E2", ("brave", "exa"), (), (), ("order_only_mismatch",)),
+        ("U1", ("exa",), ("brave",), (), ("unexplained_omission",)),
+        ("U2", ("exa", "brave", "rogue"), (), ("rogue",), ("unsafe_addition",)),
+        ("U3", ("exa", "brave"), (), (), ("nondeterministic_selection",)),
+    ],
+)
+def test_opt_in_v2_preserves_all_remaining_comparison_codes(
+    monkeypatch, code, descriptor, omitted, added, reasons
+):
+    comparison = ShadowComparison(
+        code=code,
+        safe=code.startswith("E"),
+        legacy_provider_ids=("exa", "brave"),
+        descriptor_provider_ids=descriptor,
+        omitted_provider_ids=omitted,
+        added_provider_ids=added,
+        reasons=reasons,
+        context_snapshot_version="ctx-v1",
+        config_fingerprint="cfg-v1",
+    )
+    monkeypatch.setattr(
+        "wrr.selection_shadow.compare_shadow_selection",
+        lambda *_args, **_kwargs: comparison,
+    )
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.comparison_status == "compared"
+    assert evidence.shadow_comparison.code == code
+
+
+def test_v2_request_without_observation_falls_back_to_v1():
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    assert type(result.diagnostics.decision_evidence) is DecisionEvidence
+    assert sink.records == [result.diagnostics.decision_evidence]
+
+
+def test_v2_request_with_partial_observation_falls_back_to_v1():
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=object(),
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    assert type(result.diagnostics.decision_evidence) is DecisionEvidence
+    assert sink.records == [result.diagnostics.decision_evidence]
+
+
+def test_v2_request_with_hostile_observation_status_falls_back_to_v1():
+    class HostileStatus:
+        def __eq__(self, _other):
+            raise RuntimeError("hostile equality")
+
+    observation = router_mod.DecisionContextObservation(None, HostileStatus(), None)
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=observation,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    assert result.payload
+    assert type(result.diagnostics.decision_evidence) is DecisionEvidence
+    assert sink.records == [result.diagnostics.decision_evidence]
+
+
+def test_complete_observation_keeps_v1_when_version_not_opted_in():
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_sink=sink,
+    ))
+
+    assert type(result.diagnostics.decision_evidence) is DecisionEvidence
+    assert sink.records == [result.diagnostics.decision_evidence]
+
+
+def test_opt_in_v2_cold_observation_records_context_unavailable():
+    provider = CachedDecisionContextProvider(_shadow_context)
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.context_status == "cold"
+    assert evidence.comparison_status == "context_unavailable"
+    assert evidence.execution_protection == "unobservable"
+
+
+def test_opt_in_v2_failed_observation_without_last_good_records_build_failed():
+    def fail_builder():
+        raise RuntimeError("builder failed")
+
+    provider = CachedDecisionContextProvider(fail_builder)
+    with pytest.raises(RuntimeError, match="builder failed"):
+        provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.context_status == "refresh_failed"
+    assert evidence.comparison_status == "context_build_failed"
+    assert evidence.execution_protection == "unobservable"
+
+
+def test_opt_in_v2_refresh_failed_with_last_good_still_compares():
+    should_fail = False
+
+    def builder():
+        if should_fail:
+            raise RuntimeError("refresh failed")
+        return _shadow_context()
+
+    provider = CachedDecisionContextProvider(builder)
+    provider.refresh()
+    should_fail = True
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.context_status == "refresh_failed"
+    assert evidence.comparison_status == "compared"
+    assert evidence.context_cohort_id is not None
+
+
+def test_opt_in_v2_records_successful_legacy_protection_for_empty_descriptor():
+    provider = CachedDecisionContextProvider(_empty_descriptor_context)
+    provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.shadow_comparison.code == "E1"
+    assert evidence.shadow_comparison.descriptor_provider_count == 0
+    assert evidence.outcome == "success"
+    assert evidence.execution_protection == "protected_by_legacy"
+
+
+def test_opt_in_v2_records_unprotected_empty_for_empty_descriptor(monkeypatch):
+    async def empty_dispatch(*_args, **_kwargs):
+        return [], [], []
+
+    monkeypatch.setattr("wrr.router._dispatch", empty_dispatch)
+    provider = CachedDecisionContextProvider(_empty_descriptor_context)
+    provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.outcome == "empty"
+    assert evidence.execution_protection == "unprotected_empty"
+
+
+def test_opt_in_v2_keeps_not_required_for_empty_outcome_with_descriptor(monkeypatch):
+    async def empty_dispatch(*_args, **_kwargs):
+        return [], [], []
+
+    monkeypatch.setattr("wrr.router._dispatch", empty_dispatch)
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        decision_context_observation=provider.observe(),
+        shadow_evaluated_at=150.0,
+        stage_s_enabled=True,
+        decision_evidence_version=2,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.outcome == "empty"
+    assert evidence.shadow_comparison.descriptor_provider_count > 0
+    assert evidence.execution_protection == "not_required"
 
 
 # ── cold success (no context) → evidence attached, shadow None ───────
@@ -303,6 +680,67 @@ def test_all_fail_records_one_error_all_engines_failed(monkeypatch):
     assert ev.result_count == 0
 
 
+def test_opt_in_v2_records_error_without_changing_raised_exception(monkeypatch):
+    monkeypatch.setattr("wrr.router.config.recovery_allowed", lambda *a, **k: True)
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    sink = SpySink()
+    reg = _reg(
+        FakeEngine("exa", error="down"),
+        FakeEngine("brave", error="down"),
+        FakeEngine("searxng", error="down"),
+    )
+
+    with pytest.raises(AllEnginesFailedError) as excinfo:
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            reg,
+            decision_context_observation=provider.observe(),
+            shadow_evaluated_at=150.0,
+            stage_s_enabled=True,
+            decision_evidence_version=2,
+            decision_evidence_sink=sink,
+        ))
+
+    assert "down" in str(excinfo.value)
+    assert len(sink.records) == 1
+    evidence = sink.records[0]
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.outcome == "error"
+    assert evidence.terminal == "all_engines_failed"
+    assert evidence.comparison_status == "compared"
+    assert evidence.execution_protection == "not_required"
+
+
+def test_opt_in_v2_records_unprotected_error_for_empty_descriptor(monkeypatch):
+    monkeypatch.setattr("wrr.router.config.recovery_allowed", lambda *a, **k: True)
+    provider = CachedDecisionContextProvider(_empty_descriptor_context)
+    provider.refresh()
+    sink = SpySink()
+    reg = _reg(
+        FakeEngine("exa", error="down"),
+        FakeEngine("brave", error="down"),
+        FakeEngine("searxng", error="down"),
+    )
+
+    with pytest.raises(AllEnginesFailedError):
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            reg,
+            decision_context_observation=provider.observe(),
+            shadow_evaluated_at=150.0,
+            stage_s_enabled=True,
+            decision_evidence_version=2,
+            decision_evidence_sink=sink,
+        ))
+
+    evidence = sink.records[0]
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.shadow_comparison.descriptor_provider_count == 0
+    assert evidence.outcome == "error"
+    assert evidence.execution_protection == "unprotected_error"
+
+
 # ── unexpected _dispatch exception: identity re-raise + execution_error
 def test_unexpected_dispatch_exception_reraised_by_identity(monkeypatch):
     boom = RuntimeError("dispatch boom")
@@ -392,6 +830,36 @@ def test_planning_exception_reraised_one_execution_error_mode_shadow_none(monkey
     assert ev.mode is None                              # no plan → mode None
     assert ev.shadow_comparison is None                # comparison never reached
     assert ev.quality_verdict == "failed"
+
+
+def test_opt_in_v2_planning_error_records_comparison_failed(monkeypatch):
+    boom = RuntimeError("planning boom")
+
+    def fake_plan(_options):
+        raise boom
+
+    monkeypatch.setattr("wrr.router.legacy_selection_plan", fake_plan)
+    provider = CachedDecisionContextProvider(_shadow_context)
+    provider.refresh()
+    sink = SpySink()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            _full_reg(),
+            decision_context_observation=provider.observe(),
+            stage_s_enabled=True,
+            decision_evidence_version=2,
+            decision_evidence_sink=sink,
+        ))
+
+    assert excinfo.value is boom
+    evidence = sink.records[0]
+    assert type(evidence) is DecisionEvidenceV2
+    assert evidence.context_status == "available"
+    assert evidence.comparison_status == "comparison_failed"
+    assert evidence.execution_protection == "unobservable"
+    assert evidence.shadow_comparison is None
 
 
 def test_planning_all_engines_error_is_execution_error(monkeypatch):

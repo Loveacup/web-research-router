@@ -740,7 +740,7 @@ class RouteTrace:
     health_cache_age_ms: Optional[float] = None
     quality: Optional[RouteQuality] = None
     # P1 3b.1：selection-only privacy-bounded decision evidence；不授权执行。
-    decision_evidence: Optional[DecisionEvidence] = None
+    decision_evidence: Optional[DecisionEvidence | DecisionEvidenceV2] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -760,7 +760,16 @@ class RouteTrace:
         if self.quality is not None:
             d["quality"] = self.quality.to_dict()
         if self.decision_evidence is not None:
-            d["decision_evidence"] = self.decision_evidence.to_dict()
+            if type(self.decision_evidence) is DecisionEvidence:
+                d["decision_evidence"] = DecisionEvidence.to_dict(
+                    self.decision_evidence
+                )
+            elif type(self.decision_evidence) is DecisionEvidenceV2:
+                d["decision_evidence"] = DecisionEvidenceV2.to_dict(
+                    self.decision_evidence
+                )
+            else:
+                raise ValueError("RouteTrace accepts exact v1/v2 decision evidence only")
         return d
 
 

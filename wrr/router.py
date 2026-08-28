@@ -18,7 +18,10 @@ from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
 from .errors import EngineError, EngineTimeoutError, RateLimitError, AllEnginesFailedError
-from .schemas import (DecisionContext, DecisionEvidence, DecisionSnapshot, DiagnosticEvent,
+from .evidence_v2 import project_decision_evidence_v2
+from .runtime.decision_context_provider import DecisionContextObservation
+from .schemas import (DecisionContext, DecisionEvidence, DecisionEvidenceV2,
+                      DecisionSnapshot, DiagnosticEvent,
                       FallbackStep, RouteQuality, RouteTrace, RouterResult, SearchResult)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -579,7 +582,7 @@ def _build_error_evidence(
     )
 
 
-def _safe_record(sink, evidence: DecisionEvidence) -> None:
+def _safe_record(sink, evidence: DecisionEvidence | DecisionEvidenceV2) -> None:
     """Best-effort sink record; never raises. No-op when sink is None."""
     if sink is None:
         return
@@ -589,6 +592,63 @@ def _safe_record(sink, evidence: DecisionEvidence) -> None:
         return
 
 
+def _project_v2_or_keep_v1(
+    evidence: DecisionEvidence,
+    observation: Optional[DecisionContextObservation],
+    version: int,
+    comparison_status: str,
+    execution_protection: str,
+) -> DecisionEvidence | DecisionEvidenceV2:
+    """Opt-in v2 projection; incomplete/invalid input preserves the v1 row."""
+    if type(version) is not int or version != 2 or observation is None:
+        return evidence
+    try:
+        return project_decision_evidence_v2(
+            evidence,
+            observation,
+            comparison_status=comparison_status,
+            execution_protection=execution_protection,
+        )
+    except Exception:
+        return evidence
+
+
+def _normalize_decision_context_observation(observation):
+    """Return one exact coherent observation, otherwise the v1 fallback sentinel."""
+    if type(observation) is not DecisionContextObservation:
+        return None
+    context = observation.context
+    status = observation.status
+    cohort_id = observation.cohort_id
+    if type(status) is not str:
+        return None
+    if context is not None and type(context) is not DecisionContext:
+        return None
+    if cohort_id is not None and type(cohort_id) is not str:
+        return None
+    has_context = context is not None
+    has_cohort = cohort_id is not None
+    coherent = (
+        (status == "cold" and not has_context and not has_cohort)
+        or (status == "available" and has_context and has_cohort)
+        or (status == "refresh_failed" and has_context == has_cohort)
+    )
+    return observation if coherent else None
+
+
+def _execution_protection(shadow_comparison, outcome: str) -> str:
+    """Project the router-observed U4 protection state from execution outcome."""
+    if shadow_comparison is None:
+        return "unobservable"
+    if shadow_comparison.descriptor_provider_ids:
+        return "not_required"
+    return {
+        "success": "protected_by_legacy",
+        "empty": "unprotected_empty",
+        "error": "unprotected_error",
+    }[outcome]
+
+
 def _attach_success_evidence(
     result: RouterResult,
     sink,
@@ -596,6 +656,9 @@ def _attach_success_evidence(
     plan: DecisionSnapshot,
     shadow_comparison,
     route_start: float,
+    observation=None,
+    evidence_version: int = 1,
+    comparison_status: str = "comparison_failed",
 ) -> None:
     """Build → attach to RouteTrace → record. Fully fault-swallowing.
 
@@ -607,6 +670,14 @@ def _attach_success_evidence(
     try:
         evidence = _build_success_evidence(
             request_key, plan, result, shadow_comparison, route_start
+        )
+        protection = _execution_protection(shadow_comparison, evidence.outcome)
+        evidence = _project_v2_or_keep_v1(
+            evidence,
+            observation,
+            evidence_version,
+            comparison_status,
+            protection,
         )
     except Exception:
         return
@@ -625,6 +696,9 @@ def _record_error_evidence(
     terminal: str,
     shadow_comparison,
     route_start: float,
+    observation=None,
+    evidence_version: int = 1,
+    comparison_status: str = "comparison_failed",
 ) -> None:
     """Best-effort error-evidence record; never raises (never masks re-raise)."""
     if request_key is None:
@@ -632,6 +706,14 @@ def _record_error_evidence(
     try:
         evidence = _build_error_evidence(
             request_key, plan, terminal, shadow_comparison, route_start
+        )
+        protection = _execution_protection(shadow_comparison, evidence.outcome)
+        evidence = _project_v2_or_keep_v1(
+            evidence,
+            observation,
+            evidence_version,
+            comparison_status,
+            protection,
         )
     except Exception:
         return
@@ -766,8 +848,10 @@ async def route_search_v5(
     *,
     descriptor_registry_factory=None,
     decision_context: Optional[DecisionContext] = None,
+    decision_context_observation: Optional[DecisionContextObservation] = None,
     shadow_evaluated_at: Optional[float] = None,
     stage_s_enabled: Optional[bool] = None,
+    decision_evidence_version: int = 1,
     decision_evidence_sink: "Optional[DecisionEvidenceSink]" = None,
 ) -> RouterResult:
     """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
@@ -781,9 +865,18 @@ async def route_search_v5(
       - ``False`` → Stage S disabled：保持旧 ``_route_registry`` 行为。
     ``False`` 与注入 ``decision_context`` 互斥（语义矛盾）→ ``ValueError``，
     且在触碰 registry factory 之前抛出。
+    ``decision_evidence_version=2`` 仅在 exact、原子一致的 observation 可用时
+    投影 v2；缺失/partial/incoherent observation 回退 v1，避免半启用。
     """
+    decision_context_observation = _normalize_decision_context_observation(
+        decision_context_observation
+    )
+    if decision_context_observation is not None:
+        decision_context = decision_context_observation.context
     # 合同校验先于任何 registry factory 执行：False + context 语义矛盾。
-    if stage_s_enabled is False and decision_context is not None:
+    if stage_s_enabled is False and (
+        decision_context is not None or decision_context_observation is not None
+    ):
         raise ValueError(
             "stage_s_enabled=False is incompatible with an injected decision_context"
         )
@@ -813,6 +906,15 @@ async def route_search_v5(
     error_state = _ExecErrorState()
     plan: Optional[DecisionSnapshot] = None
     shadow_comparison = None
+    if decision_context is not None:
+        comparison_status = "comparison_failed"
+    elif (
+        decision_context_observation is not None
+        and decision_context_observation.status == "refresh_failed"
+    ):
+        comparison_status = "context_build_failed"
+    else:
+        comparison_status = "context_unavailable"
     try:
         # P1 S1：纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）。
         plan = legacy_selection_plan(options)
@@ -830,8 +932,19 @@ async def route_search_v5(
                     ),
                     legacy_plan=plan,
                 )
-            except Exception:
+                comparison_status = "compared"
+            except Exception as exc:
                 shadow_comparison = None
+                try:
+                    reason = getattr(exc, "reason", None)
+                except Exception:
+                    reason = None
+                comparison_status = (
+                    reason
+                    if type(reason) is str
+                    and reason in {"context_expired", "context_mismatch"}
+                    else "comparison_failed"
+                )
 
         result = await _route_search_v5_execute(
             options, registry, plan, shadow_comparison, route_start, error_state
@@ -841,20 +954,43 @@ async def route_search_v5(
         # execute() sets the private state before any expected execution terminal.
         terminal = error_state.terminal or "execution_error"
         _record_error_evidence(
-            decision_evidence_sink, request_key, plan, terminal, shadow_comparison, route_start
+            decision_evidence_sink,
+            request_key,
+            plan,
+            terminal,
+            shadow_comparison,
+            route_start,
+            observation=decision_context_observation,
+            evidence_version=decision_evidence_version,
+            comparison_status=comparison_status,
         )
         raise
     except Exception:
         # 非预期异常（含 planning 意外抛出）：execution_error，best-effort 记录后
         # 原样 re-raise（identity 不变）。
         _record_error_evidence(
-            decision_evidence_sink, request_key, plan, "execution_error",
-            shadow_comparison, route_start,
+            decision_evidence_sink,
+            request_key,
+            plan,
+            "execution_error",
+            shadow_comparison,
+            route_start,
+            observation=decision_context_observation,
+            evidence_version=decision_evidence_version,
+            comparison_status=comparison_status,
         )
         raise
 
     # 成功：构造 evidence → 附着到 RouteTrace（先于记录）→ best-effort 记录同一对象。
     _attach_success_evidence(
-        result, decision_evidence_sink, request_key, plan, shadow_comparison, route_start
+        result,
+        decision_evidence_sink,
+        request_key,
+        plan,
+        shadow_comparison,
+        route_start,
+        observation=decision_context_observation,
+        evidence_version=decision_evidence_version,
+        comparison_status=comparison_status,
     )
     return result
