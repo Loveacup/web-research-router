@@ -1,5 +1,8 @@
 """本地搜索层路由单测：classify_intent local / dispatch / weights / RRF / web 补位。"""
 import asyncio
+import json
+
+import pytest
 
 from conftest import FakeEngine, mk_results
 from wrr.registry import EngineRegistry
@@ -120,3 +123,54 @@ def test_v5_local_engines_fail_web_fallback_in_dispatch():
     assert len(rr.payload) >= 1                            # web 补位成功
     failed = [s.provider for s in rr.fallback_chain if not s.ok]
     assert "local_qmd" in failed                           # 本地失败被记录、隔离
+
+
+@pytest.mark.parametrize("count", [1, 3, 5])
+def test_stale_local_append_respects_final_count(monkeypatch, count):
+    from wrr.tools.web_search import execute_web_search
+
+    local = [SearchResult(title=f"本地资料{i}", url=f"qmd://note/{i}",
+                          freshness_score=0.7) for i in range(5)]
+    web = [SearchResult(title=f"官方文件{i}", url=f"https://example.org/{i}")
+           for i in range(5)]
+    monkeypatch.setattr(config, "mode_engines", lambda mode, q="":
+                        ["local_qmd"] if mode == "local" else ["exa"])
+    reg = _reg(FakeEngine("local_qmd", search_results=local),
+               FakeEngine("exa", search_results=web))
+    result = json.loads(run(execute_web_search(
+        {"query": "WRR", "mode": "local", "max_results": count},
+        registry=reg, stage_s_enabled=False)))
+    assert result["details"]["result_count"] == count
+    assert all(row["url"].startswith("https://example.org/")
+               for row in result["details"]["results"])
+
+
+def test_stale_local_append_dedups_before_count_and_keeps_provenance(monkeypatch):
+    monkeypatch.setattr(config, "mode_engines", lambda mode, q="":
+                        ["local_qmd"] if mode == "local" else ["exa"])
+    reg = _reg(FakeEngine("local_qmd", search_results=[
+        SearchResult(title="旧版", url="https://example.org/doc?utm_source=x", freshness_score=0.7),
+        SearchResult(title="本地独有", url="qmd://unique", freshness_score=0.7)]),
+        FakeEngine("exa", search_results=[SearchResult(title="新版", url="https://example.org/doc")]))
+    result = run(route_search_v5(SearchOptions("WRR", mode="local", count=2), reg,
+                                 stage_s_enabled=False))
+    assert [r.title for r in result.payload] == ["新版", "本地独有"]
+    assert result.payload[0].fusion_sources == ["exa", "local_qmd"]
+
+
+@pytest.mark.parametrize("freshness,web_failed", [(0.8, False), (0.7, True)])
+def test_local_append_boundary_and_failure_preserve_local(monkeypatch, freshness, web_failed):
+    calls = []
+    def names(mode, q=""):
+        calls.append(mode)
+        return ["local_qmd"] if mode == "local" else ["exa"]
+    monkeypatch.setattr(config, "mode_engines", names)
+    local = SearchResult(title="本地", url="qmd://one", freshness_score=freshness)
+    reg = _reg(FakeEngine("local_qmd", search_results=[local]),
+               FakeEngine("exa", error="unavailable" if web_failed else None,
+                          search_results=mk_results(3)))
+    result = run(route_search_v5(SearchOptions("WRR", mode="local", count=2), reg,
+                                 stage_s_enabled=False))
+    assert [r.url for r in result.payload] == ["qmd://one"]
+    if freshness == 0.8:
+        assert calls == ["local"]

@@ -10,6 +10,43 @@ from wrr.formatters import format_search, format_extract, format_similar, format
 from wrr import config
 
 
+def test_search_excerpt_budget_preserves_sources_quality_and_input():
+    from copy import deepcopy
+    from wrr.schemas import SearchResult
+    item = SearchResult("Original title", "https://example.com/original", "中" * 900,
+                        ["证" * 3000, "据" * 2000, "third"],
+                        fusion_sources=["exa", "brave"], rrf_score=0.1)
+    before = deepcopy(item.to_dict())
+    result = RouterResult("exa", [item], [FallbackStep("exa", True, 1)])
+    output = json.loads(format_search(result, "query"))
+    row = output["details"]["results"][0]
+    assert len(row["snippet"]) <= 600
+    assert len(row["highlights"]) == 2
+    assert all(len(text) <= 800 for text in row["highlights"])
+    assert row["snippet"].endswith("…")
+    assert row["url"] == before["url"] and row["title"] == before["title"]
+    assert row["fusion_sources"] == before["fusion_sources"]
+    assert row["rrf_score"] == before["rrf_score"]
+    assert output["details"]["excerpt_budget"]["truncated_result_count"] == 1
+    assert "截断" in output["content"]
+    assert "证" * 801 not in output["content"]
+    assert item.to_dict() == before
+
+
+@pytest.mark.parametrize("length", [0, 599, 600, 601])
+def test_search_excerpt_budget_boundary(length):
+    from wrr.schemas import SearchResult
+    item = SearchResult("t", "https://example.com", "s" * length, ["h" * 800])
+    result = RouterResult("exa", [item], [FallbackStep("exa", True, 1)])
+    output = json.loads(format_search(result, "q"))
+    row = output["details"]["results"][0]
+    assert len(row["snippet"]) == min(length, 600)
+    assert row["highlights"] == item.highlights
+    if length <= 600:
+        assert row == item.to_dict()
+        assert "excerpt_budget" not in output["details"]
+
+
 def test_format_search_keys_and_backup_hint():
     rr = RouterResult("exa", mk_results(2), [FallbackStep("exa", True, 2)])
     out = json.loads(format_search(rr, "q"))

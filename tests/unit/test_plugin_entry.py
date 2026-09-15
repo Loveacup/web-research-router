@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 ENTRY = Path(__file__).resolve().parents[2] / "__init__.py"
@@ -275,6 +276,33 @@ def test_execute_web_search_seam_passes_explicit_deps(monkeypatch):
     assert calls[-1]["decision_evidence_sink"] is sink
 
 
+def test_execute_web_search_forwards_atomic_observation_and_version(monkeypatch):
+    import wrr.tools.web_search as ws
+    from wrr.runtime.decision_context_provider import DecisionContextObservation
+
+    observation = DecisionContextObservation(None, "cold", None)
+    registry, sink, result = object(), object(), object()
+    calls = []
+
+    async def route(options, actual_registry, **kwargs):
+        calls.append((actual_registry, kwargs))
+        return result
+
+    monkeypatch.setattr(ws, "route_search_v5", route)
+    monkeypatch.setattr(ws, "format_search", lambda actual, query: (actual, query))
+    assert asyncio.run(ws.execute_web_search(
+        {"query": "atomic"}, registry=registry, stage_s_enabled=True,
+        decision_evidence_sink=sink, decision_context_observation=observation,
+        decision_evidence_version=2,
+    )) == (result, "atomic")
+    assert len(calls) == 1
+    assert calls[0][0] is registry
+    assert calls[0][1]["decision_context_observation"] is observation
+    assert calls[0][1]["decision_evidence_version"] == 2
+    assert calls[0][1]["decision_evidence_sink"] is sink
+    assert calls[0][1]["stage_s_enabled"] is True
+
+
 def test_handle_web_search_defaults_to_get_registry_and_legacy(monkeypatch):
     """兼容入口默认 get_registry()，不注入 Stage S 依赖（context None / stage None）。"""
     import wrr.tools.web_search as ws
@@ -333,7 +361,7 @@ def test_handle_web_search_ignores_magic_kwargs_as_deps(monkeypatch):
 # ── root register wiring：同源 legacy registry / provider / hook ──────────
 
 _SENTINEL_REGISTRY = object()
-_SENTINEL_CONTEXT = object()
+_SENTINEL_CONTEXT = SimpleNamespace(expires_at=float("inf"))
 _RAISE = object()
 
 
@@ -343,9 +371,24 @@ class _FakeProvider:
     def __init__(self, builder):
         self.builder = builder
         self.get_calls = 0
+        self.observe_calls = 0
         self.refresh_calls = 0
         self.snapshot = None
         self.refresh_result = None
+        self.failed = False
+        self.observations = []
+
+    def observe(self):
+        from wrr.runtime.decision_context_provider import DecisionContextObservation
+
+        self.observe_calls += 1
+        status = "refresh_failed" if self.failed else (
+            "available" if self.snapshot is not None else "cold")
+        observation = DecisionContextObservation(
+            self.snapshot, status,
+            "12345678-1234-4234-8234-123456789abc" if self.snapshot is not None else None)
+        self.observations.append(observation)
+        return observation
 
     def get(self):
         self.get_calls += 1
@@ -354,7 +397,9 @@ class _FakeProvider:
     def refresh(self):
         self.refresh_calls += 1
         if self.refresh_result is _RAISE:
+            self.failed = True
             raise RuntimeError("assembly boom")
+        self.failed = False
         self.snapshot = self.refresh_result
         return self.snapshot
 
@@ -389,8 +434,11 @@ def _install_exec_spy(monkeypatch):
     import wrr.tools.web_search as ws
     exec_calls = []
     async def _fake_exec(args, *, registry, decision_context=None, stage_s_enabled=None,
-                         decision_evidence_sink=None):
+                         decision_evidence_sink=None, decision_context_observation=None,
+                         decision_evidence_version=1):
         exec_calls.append({"registry": registry, "decision_context": decision_context,
+                           "decision_context_observation": decision_context_observation,
+                           "decision_evidence_version": decision_evidence_version,
                            "stage_s_enabled": stage_s_enabled,
                            "decision_evidence_sink": decision_evidence_sink})
         return "OK"
@@ -513,12 +561,21 @@ def test_bound_handler_cold_passes_none_and_stage_s_true(monkeypatch):
     provider = created[0]
 
     get_before = provider.get_calls
+    observe_before = provider.observe_calls
     refresh_before = provider.refresh_calls
     asyncio.run(ctx.tools["web_search"]["handler"]({"query": "x"}))
 
-    assert provider.get_calls - get_before == 1          # exactly one get() per request
+    assert provider.observe_calls - observe_before == 1
+    assert provider.get_calls == get_before  # no separate read can tear the tuple
     assert provider.refresh_calls == refresh_before       # handler never refreshes
+    observation = exec_calls[-1]["decision_context_observation"]
+    assert observation is provider.observations[-1]
+    assert observation.context is None
+    assert observation.status == "refresh_failed"
+    assert observation.cohort_id is None
     assert exec_calls[-1]["decision_context"] is None
+    assert exec_calls[-1]["decision_evidence_version"] == 2
+    assert exec_calls[-1]["registry"] is _SENTINEL_REGISTRY
     assert exec_calls[-1]["stage_s_enabled"] is True
 
 
@@ -535,11 +592,20 @@ def test_bound_handler_warm_passes_context_and_stage_s_true(monkeypatch):
 
     assert provider.refresh_calls == 0  # warm at register: eager get() short-circuits
     get_before = provider.get_calls
+    observe_before = provider.observe_calls
     asyncio.run(ctx.tools["web_search"]["handler"]({"query": "x"}))
 
-    assert provider.get_calls - get_before == 1
+    assert provider.observe_calls - observe_before == 1
+    assert provider.get_calls == get_before
     assert provider.refresh_calls == 0
-    assert exec_calls[-1]["decision_context"] is _SENTINEL_CONTEXT
+    observation = exec_calls[-1]["decision_context_observation"]
+    assert observation is provider.observations[-1]
+    assert observation.context is _SENTINEL_CONTEXT
+    assert observation.status == "available"
+    assert observation.cohort_id == "12345678-1234-4234-8234-123456789abc"
+    assert exec_calls[-1]["decision_context"] is None  # snapshot travels only atomically
+    assert exec_calls[-1]["decision_evidence_version"] == 2
+    assert exec_calls[-1]["registry"] is _SENTINEL_REGISTRY
     assert exec_calls[-1]["stage_s_enabled"] is True
 
 
@@ -555,6 +621,122 @@ def test_register_hook_returns_none(monkeypatch):
     assert hook() is None
 
 
+def _r3_context():
+    import time
+    from wrr.schemas import DecisionContext
+
+    now = time.time()
+    return DecisionContext(
+        snapshot_version="r3-test", built_at=now, expires_at=now + 300,
+        runtime="standalone", profile="default", registry_source="test",
+        routable_descriptor_ids=("exa", "brave"),
+        bridged_provider_ids=("exa", "brave"), missing_provider_ids=(),
+        adapter_errors=(), descriptor_reasons=(),
+        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        config_fingerprint="r3-test",
+    )
+
+
+def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
+    import json
+    import pytest
+    from conftest import FakeEngine, mk_results
+    import wrr.registry as registry_mod
+    import wrr.runtime.decision_context_assembly as assembly
+    import wrr.runtime.decision_context_provider as providers
+    import wrr.runtime.decision_evidence as evidence
+    from wrr.evidence_gate import evaluate_jsonl
+
+    registry = registry_mod.EngineRegistry()
+    searches = []
+
+    class Engine(FakeEngine):
+        async def search(self, options):
+            searches.append(self.name)
+            return await super().search(options)
+
+    for name in ("exa", "brave"):
+        registry.register(Engine(name, search_results=mk_results(2)))
+    registry_calls, builds, created, sinks = [], [], [], []
+    fail = [False]
+
+    def get_registry():
+        registry_calls.append(registry)
+        return registry
+
+    def build(actual):
+        assert actual is registry
+        builds.append(actual)
+        if fail[0]:
+            raise RuntimeError("offline build failure")
+        return _r3_context()
+
+    real_provider = providers.CachedDecisionContextProvider
+    def provider_factory(builder):
+        provider = real_provider(builder)
+        created.append(provider)
+        return provider
+
+    real_sink = evidence.JsonlDecisionEvidenceSink
+    def sink_factory():
+        sink = real_sink(tmp_path / "events.jsonl")
+        sinks.append(sink)
+        return sink
+
+    monkeypatch.setattr(registry_mod, "get_registry", get_registry)
+    monkeypatch.setattr(assembly, "build_control_plane_decision_context", build)
+    monkeypatch.setattr(providers, "CachedDecisionContextProvider", provider_factory)
+    monkeypatch.setattr(evidence, "JsonlDecisionEvidenceSink", sink_factory)
+    monkeypatch.setenv("WRR_V6_ROUTER", "1")
+    import wrr.router as router
+    def forbidden_registry(*args, **kwargs):
+        raise AssertionError("Stage S must not replace the caller registry")
+    monkeypatch.setattr(router, "_route_registry", forbidden_registry)
+
+    mod, ctx = _load_entry(), MockCtx()
+    # Exercise the handler during registration, before eager activation publishes.
+    # The provider itself, router, formatter and sink are not mocked.
+    def register_hook(event, handler):
+        ctx.hooks.append({"event": event, "handler": handler})
+        assert created[0].observe().status == "cold"
+        asyncio.run(ctx.tools["web_search"]["handler"]({"query": "atomic", "mode": "grounding"}))
+        assert builds == []  # cold handler cannot refresh
+    ctx.register_hook = register_hook
+    mod.register(ctx)
+    provider = created[0]
+    good = provider.observe()
+    assert good.status == "available"
+    assert len(builds) == 1
+    handler = ctx.tools["web_search"]["handler"]
+    asyncio.run(handler({"query": "atomic", "mode": "grounding"}))
+    assert len(builds) == 1  # warm handler cannot refresh
+    fail[0] = True
+    with pytest.raises(RuntimeError, match="offline build failure"):
+        provider.refresh()
+    failed = provider.observe()
+    assert failed.context is good.context
+    assert failed.cohort_id == good.cohort_id
+    asyncio.run(handler({"query": "atomic", "mode": "grounding"}))
+    assert len(builds) == 2  # failed handler cannot refresh
+    assert registry_calls == [registry]
+    assert len(sinks) == 1
+    assert len(searches) == 6
+    assert searches.count("exa") == searches.count("brave") == 3
+    lines = sinks[0].path.read_bytes().splitlines(keepends=True)
+    rows = [json.loads(line) for line in lines]
+    assert len(rows) == 3
+    assert [row["schema_version"] for row in rows] == [2, 2, 2]
+    assert [row["context_status"] for row in rows] == ["cold", "available", "refresh_failed"]
+    assert [row["comparison_status"] for row in rows] == ["context_unavailable", "compared", "compared"]
+    assert all("actual_provider" not in row and "query" not in row for row in rows)
+    assert rows[1]["shadow_comparison"]["code"] == "E0"
+    report = evaluate_jsonl(lines, requested_modes=("grounding",)).to_dict()
+    assert report["input"]["valid_rows"] == 3
+    assert report["input"]["invalid_rows"] == 0
+    assert report["modes"][0]["status"] == "NOT_READY"
+    assert report["modes"][0]["selection_status"] == "NOT_READY"
+
+
 # ── cold activator 合同（fake monotonic / 并发 / 二次 get）────────────────
 
 class _Clock:
@@ -563,6 +745,169 @@ class _Clock:
 
     def __call__(self):
         return self.t
+
+
+def test_warm_expiry_refreshes_context_without_search_io():
+    from wrr.runtime.decision_context_provider import CachedDecisionContextProvider
+    from wrr.schemas import DecisionContext
+
+    wall = _Clock(1000.0)
+    mono = _Clock(0.0)
+    builds = []
+
+    def build():
+        builds.append(wall.t)
+        return DecisionContext(
+            snapshot_version="test", built_at=wall.t, expires_at=wall.t + 300,
+            runtime="hermes", profile="default", registry_source="builtin",
+            routable_descriptor_ids=(), bridged_provider_ids=(),
+            missing_provider_ids=(), adapter_errors=(), descriptor_reasons=(),
+            descriptor_provider_aliases=(), config_fingerprint="test",
+        )
+
+    provider = CachedDecisionContextProvider(build)
+    mod = _load_entry()
+    act = mod._ColdDecisionContextActivator(provider, clock=mono, wall_clock=wall)
+    act.activate()
+    first = provider.observe()
+    wall.t = 1299.0
+    act.pre_llm_call()
+    assert builds == [1000.0]
+    wall.t = 1300.0
+    act.pre_llm_call()
+    assert builds == [1000.0, 1300.0]
+    assert provider.observe().cohort_id != first.cohort_id
+    snapshot = provider.get()
+    assert snapshot is not None
+    assert snapshot.expires_at == 1600.0
+
+
+def test_warm_retry_preserves_last_good_and_resets_after_success():
+    from wrr.runtime.decision_context_provider import CachedDecisionContextProvider
+    from wrr.schemas import DecisionContext
+
+    wall, mono = _Clock(1000.0), _Clock(10.0)
+    fail = [False]
+    calls = []
+
+    def build():
+        calls.append(wall.t)
+        if fail[0]:
+            mono.t += 5.0
+            raise RuntimeError("bounded test failure")
+        return DecisionContext(
+            snapshot_version="test", built_at=wall.t, expires_at=wall.t + 300,
+            runtime="hermes", profile="default", registry_source="builtin",
+            routable_descriptor_ids=(), bridged_provider_ids=(),
+            missing_provider_ids=(), adapter_errors=(), descriptor_reasons=(),
+            descriptor_provider_aliases=(), config_fingerprint="test",
+        )
+
+    provider = CachedDecisionContextProvider(build)
+    act = _load_entry()._ColdDecisionContextActivator(provider, clock=mono, wall_clock=wall)
+    act.activate()
+    good = provider.observe()
+    wall.t = 1300.0
+    fail[0] = True
+    act.activate()
+    assert provider.get() is good.context
+    assert provider.observe().status == "refresh_failed"
+    assert provider.observe().cohort_id == good.cohort_id
+    assert act._next_attempt_at == 16.0
+    wall.t = 9999.0  # wall jumps cannot bypass monotonic retry budget
+    act.activate()
+    assert len(calls) == 2
+    mono.t = 16.0
+    act.activate()
+    assert act._next_attempt_at == 23.0
+    fail[0] = False
+    mono.t = 23.0
+    act.activate()
+    assert act._next_attempt_at is None
+    assert act._backoff_sec == 1.0
+    assert provider.observe().status == "available"
+    assert provider.observe().cohort_id != good.cohort_id
+    wall.t = 10299.0
+    fail[0] = True
+    act.activate()
+    assert act._next_attempt_at == mono.t + 1.0
+
+
+def test_delayed_lock_winner_rechecks_new_failure_deadline():
+    # Force the exact interleaving: A passes the optimistic check, B fails and
+    # releases the lock, then A acquires it before the new deadline.
+    for snapshot in (None, SimpleNamespace(expires_at=0.0)):
+        mono = _Clock(100.0)
+        paused, resume = threading.Event(), threading.Event()
+        calls = []
+        class P:
+            def get(self):
+                return snapshot
+            def refresh(self):
+                calls.append(mono.t)
+                raise RuntimeError("failure")
+        act = _load_entry()._ColdDecisionContextActivator(
+            P(), clock=mono, wall_clock=lambda: 1000.0)
+        lock = threading.Lock()
+        class PausingLock:
+            def acquire(self, blocking=False):
+                if threading.current_thread().name == "delayed-refresh":
+                    paused.set()
+                    assert resume.wait(5)
+                return lock.acquire(blocking=blocking)
+            def release(self):
+                lock.release()
+        act._attempt_lock = PausingLock()
+        delayed = threading.Thread(target=act.activate, name="delayed-refresh")
+        delayed.start()
+        try:
+            assert paused.wait(5)
+            act.activate()
+            assert calls == [100.0]
+            assert act._next_attempt_at == 101.0
+        finally:
+            resume.set()
+            delayed.join(5)
+        assert not delayed.is_alive()
+        assert calls == [100.0], "delayed caller bypassed newly published backoff"
+        mono.t = 101.0
+        act.activate()
+        assert calls == [100.0, 101.0]
+
+
+def test_successful_concurrent_refresh_cannot_tear_deadline_read():
+    mod = _load_entry()
+    mono = _Clock(100.0)
+    for initial in (None, SimpleNamespace(expires_at=0.0)):
+        class P:
+            snapshot = initial
+            calls = 0
+            def get(self):
+                return self.snapshot
+            def refresh(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("initial failure")
+                self.snapshot = SimpleNamespace(expires_at=float("inf"))
+        class InterleavedActivator(mod._ColdDecisionContextActivator):
+            armed = False
+            def __getattribute__(self, name):
+                value = super().__getattribute__(name)
+                if name == "_next_attempt_at" and self.armed:
+                    self.armed = False
+                    winner = threading.Thread(target=self.activate)
+                    winner.start()
+                    winner.join(5)
+                    assert not winner.is_alive()
+                return value
+        p = P()
+        act = InterleavedActivator(p, clock=mono, wall_clock=lambda: 1000.0)
+        act.activate()
+        mono.t = act._next_attempt_at
+        act.armed = True
+        act.activate()  # B clears deadline after A reads non-None; A must not raise.
+        assert p.calls == 2
+        assert act._next_attempt_at is None
 
 
 def test_cold_activator_backoff_deadline_and_cap():
@@ -655,7 +1000,7 @@ def test_cold_activator_success_stops_cold_retries():
     """成功 refresh 后 warm fast path 只 get()，不再冷态重试。"""
     mod = _load_entry()
     clock = _Clock(0.0)
-    published = object()
+    published = SimpleNamespace(expires_at=float("inf"))
 
     class P:
         def __init__(self):
@@ -704,7 +1049,7 @@ def test_cold_activator_concurrent_single_refresh_no_wait():
             self.refresh_calls += 1
             started.set()
             assert release.wait(5)
-            self.snapshot = object()
+            self.snapshot = SimpleNamespace(expires_at=float("inf"))
 
     p = P()
     act = mod._ColdDecisionContextActivator(p)  # real monotonic; next_attempt None
@@ -736,7 +1081,7 @@ def test_cold_activator_winner_second_get_skips_duplicate_refresh():
         def __init__(self):
             self.get_calls = 0
             self.refresh_calls = 0
-            self._published = object()
+            self._published = SimpleNamespace(expires_at=float("inf"))
         def get(self):
             self.get_calls += 1
             # 顶层 get 返回 None；抢锁后二次 get 已见到发布的快照。

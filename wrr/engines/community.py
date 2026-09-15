@@ -274,7 +274,7 @@ async def _run_cmd(cli: List[str], timeout: float) -> Tuple[Optional[int], str, 
         return (None, "", "")
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         try:
             proc.kill()
         except ProcessLookupError:
@@ -284,6 +284,8 @@ async def _run_cmd(cli: List[str], timeout: float) -> Tuple[Optional[int], str, 
             await proc.wait()
         except Exception:
             pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return (None, "", "")
     return (proc.returncode,
             out.decode("utf-8", errors="ignore"),

@@ -13,7 +13,7 @@ __version__ = "6.1.1"
 
 logger = logging.getLogger("wrr.plugin")
 
-# Bounded exponential backoff for cold DecisionContext activation retries.
+# Bounded exponential backoff for cold/expired DecisionContext refresh retries.
 # These constants are part of the tested contract — keep them stable.
 _COLD_ACTIVATE_INITIAL_BACKOFF_SEC = 1.0
 _COLD_ACTIVATE_MAX_BACKOFF_SEC = 30.0
@@ -21,7 +21,7 @@ _COLD_ACTIVATE_BACKOFF_MULTIPLIER = 2.0
 
 
 class _ColdDecisionContextActivator:
-    """Best-effort warmer for a CachedDecisionContextProvider.
+    """Best-effort cold/expired refresher for a CachedDecisionContextProvider.
 
     Wired as the plugin ``pre_llm_call`` hook and invoked eagerly once at
     register time. It never spawns threads/timers, never holds cross-call
@@ -34,9 +34,10 @@ class _ColdDecisionContextActivator:
     bounded exponential backoff measured from failure completion.
     """
 
-    def __init__(self, provider, *, clock=time.monotonic):
+    def __init__(self, provider, *, clock=time.monotonic, wall_clock=time.time):
         self._provider = provider
         self._clock = clock
+        self._wall_clock = wall_clock
         # Non-blocking attempt lock: a thread that cannot take it returns
         # immediately rather than waiting behind an in-flight refresh.
         self._attempt_lock = threading.Lock()
@@ -53,23 +54,32 @@ class _ColdDecisionContextActivator:
     activate = pre_llm_call
 
     def _maybe_activate(self):
-        # Warm fast path: a single get(); once a snapshot is published this is
-        # the only work every subsequent call does.
-        if self._provider.get() is not None:
+        # Fresh snapshots are reusable; expired snapshots need a control-plane
+        # refresh. The search handler itself never invokes this path.
+        snapshot = self._provider.get()
+        if snapshot is not None and self._wall_clock() < snapshot.expires_at:
             return
         now = self._clock()
-        if self._next_attempt_at is not None and now < self._next_attempt_at:
+        deadline = self._next_attempt_at
+        if deadline is not None and now < deadline:
             return  # backoff deadline not reached yet
         # Non-blocking: if another thread already holds the attempt, do not wait.
         if not self._attempt_lock.acquire(blocking=False):
             return
         try:
+            # Another caller may have failed between our optimistic deadline
+            # check and acquisition. The latest deadline is authoritative here.
+            if self._next_attempt_at is not None and self._clock() < self._next_attempt_at:
+                return
             # Re-read after winning the lock: a concurrent winner may have just
             # published, in which case skip the duplicate refresh.
-            if self._provider.get() is not None:
+            snapshot = self._provider.get()
+            if snapshot is not None and self._wall_clock() < snapshot.expires_at:
                 return
             try:
                 self._provider.refresh()  # winner refreshes at most once
+                self._next_attempt_at = None
+                self._backoff_sec = _COLD_ACTIVATE_INITIAL_BACKOFF_SEC
             except Exception as exc:  # noqa: BLE001 - best-effort warmer
                 # 退避基准必须是失败*完成*时刻（重读 monotonic），而非 refresh 开始前的
                 # ``now``：慢失败（refresh 耗时 > backoff）下用旧 now 会让 deadline 一返回
@@ -79,7 +89,7 @@ class _ColdDecisionContextActivator:
             self._attempt_lock.release()
 
     def _schedule_retry(self, now, exc):
-        logger.warning("cold DecisionContext activation failed: %s", exc)
+        logger.warning("DecisionContext activation failed: %s", exc)
         if self._next_attempt_at is None:
             self._backoff_sec = _COLD_ACTIVATE_INITIAL_BACKOFF_SEC
         else:
@@ -224,14 +234,15 @@ def register(ctx) -> None:
         decision_evidence_sink = NoopDecisionEvidenceSink()
 
     async def _bound_web_search(args, **kwargs):
-        # 每请求只 get() 一次，直接读快照（冷态 None / 暖态 context）；不 refresh /
+        # 每请求只 observe() 一次，原子拿 (context, status, cohort_id)；不 refresh /
         # discovery / report / bridge。Stage S 恒开，强制 caller legacy registry 执行。
         # 复用组合层拥有的同一个 sink 对象（显式注入，不 per-request 构造）。
-        decision_context = provider.get()
+        observation = provider.observe()
         return await execute_web_search(
             args,
             registry=legacy_registry,
-            decision_context=decision_context,
+            decision_context_observation=observation,
+            decision_evidence_version=2,
             stage_s_enabled=True,
             decision_evidence_sink=decision_evidence_sink,
         )

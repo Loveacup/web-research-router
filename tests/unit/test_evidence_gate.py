@@ -193,7 +193,7 @@ def test_e0_with_different_provider_order_is_invalid_shadow_semantics():
     ("mutate", "reason"),
     [
         (lambda row: row.pop("terminal"), "MISSING_FIELDS"),
-        (lambda row: row.__setitem__("schema_version", 2), "UNSUPPORTED_SCHEMA_VERSION"),
+        (lambda row: row.__setitem__("schema_version", 3), "UNSUPPORTED_SCHEMA_VERSION"),
         (lambda row: row.__setitem__("stage", "C"), "INVALID_STAGE"),
         (lambda row: row.__setitem__("request_key", "not-a-uuid"), "INVALID_REQUEST_KEY"),
         (lambda row: row.__setitem__("recorded_at", "20260819T000000Z"), "INVALID_RECORDED_AT"),
@@ -446,3 +446,313 @@ def test_gate_report_to_dict_is_a_defensive_copy():
     first["status"] = "READY"
 
     assert report.to_dict()["status"] == "NOT_READY"
+
+
+def _valid_v2_row() -> dict:
+    row = _valid_e0_row()
+    row.pop("actual_provider")
+    row.update(
+        schema_version=2,
+        context_status="available",
+        comparison_status="compared",
+        execution_protection="not_required",
+        context_cohort_id="abcdefab-cdef-4abc-8def-abcdefabcdef",
+        shadow_comparison={
+            "code": "E0", "safe": True,
+            "legacy_provider_count": 2, "descriptor_provider_count": 2,
+            "omitted_provider_count": 0, "added_provider_count": 0,
+            "reasons_complete": True,
+        },
+    )
+    return row
+
+
+def test_v2_tracer_decodes_counts_only_cohort_without_claiming_readiness():
+    row = _valid_v2_row()
+    report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+    assert report["input"]["valid_rows"] == 1
+    assert report["input"]["invalid_rows"] == 0
+    mode = report["modes"][0]
+    assert mode["comparable_rows"] == 1
+    cohort = mode["cohorts"][0]
+    assert cohort["schema_version"] == 2
+    assert cohort["context_cohort_id"] == row["context_cohort_id"]
+    assert cohort["sample_count"] == 1
+    assert cohort["codes"]["E0"] == 1
+    assert report["status"] == mode["status"] == cohort["status"] == "NOT_READY"
+    assert {"D5_COHORT_WINDOW_UNRESOLVED", "D6_DURABLE_COVERAGE_UNRESOLVED"} <= set(report["reasons"])
+
+
+def _v2_state(context, comparison, protection="unobservable", cohort=None):
+    row = _valid_v2_row()
+    row.update(context_status=context, comparison_status=comparison,
+               execution_protection=protection, context_cohort_id=cohort)
+    if comparison != "compared":
+        row.pop("shadow_comparison")
+    return row
+
+
+def test_v2_distributions_include_noncompared_unscoped_and_unrequested_rows():
+    cohort_id = _valid_v2_row()["context_cohort_id"]
+    rows = [
+        _valid_v2_row(),
+        _v2_state("cold", "context_unavailable"),
+        _v2_state("refresh_failed", "context_build_failed"),
+        _v2_state("refresh_failed", "context_expired", cohort=cohort_id),
+        _v2_state("available", "context_mismatch", cohort=cohort_id),
+        _v2_state("available", "comparison_failed", cohort=cohort_id),
+    ]
+    rows[1]["mode"] = None
+    rows[2]["mode"] = "research"
+    for index, row in enumerate(rows):
+        row["request_key"] = f"00000000-0000-4000-8000-{index + 1:012d}"
+    lines = list(map(_line, rows))
+    report = evaluate_jsonl(lines, ("grounding",)).to_dict()
+    assert report == evaluate_jsonl(reversed(lines), ("grounding",)).to_dict()
+    summary = report["persisted_v2"]
+    assert summary["population"] == "validated_persisted_rows_not_request_attempts"
+    assert summary["valid_rows"] == 6
+    assert summary["comparable_rows"] == 1
+    assert summary["noncomparable_rows"] == 5
+    assert summary["context_status_counts"] == {"available": 3, "cold": 1, "refresh_failed": 2}
+    assert summary["comparison_status_counts"] == {key: 1 for key in (
+        "compared", "context_unavailable", "context_build_failed",
+        "context_expired", "context_mismatch", "comparison_failed")}
+    assert summary["execution_protection_counts"] == {"not_required": 1, "unobservable": 5}
+    assert summary["effective_u4_rows"] == 0
+    assert summary["u4_unobservable_rows"] == 5
+    mode = report["modes"][0]
+    assert (mode["valid_rows"], mode["comparable_rows"], mode["noncomparable_rows"]) == (4, 1, 3)
+    assert mode["cohorts"][0]["valid_rows"] == 4
+    assert mode["cohorts"][0]["sample_count"] == 1
+    assert mode["context_build_failure_count"] == 0
+    assert "U4_UNOBSERVABLE_V1" not in mode["reasons"]
+
+
+@pytest.mark.parametrize("outcome,protection,u4", [
+    ("success", "protected_by_legacy", 0),
+    ("empty", "unprotected_empty", 1),
+    ("error", "unprotected_error", 1),
+])
+def test_v2_effective_u4_is_derived_from_protection(outcome, protection, u4):
+    row = _valid_v2_row()
+    row.update(outcome=outcome, result_count=1 if outcome == "success" else 0,
+               execution_protection=protection)
+    row["shadow_comparison"].update(code="E1", descriptor_provider_count=0,
+                                    omitted_provider_count=2)
+    report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+    assert report["input"]["invalid_rows"] == 0
+    cohort = report["modes"][0]["cohorts"][0]
+    assert cohort["effective_u4_rows"] == u4
+    assert cohort["codes"]["E1"] == 1
+    assert cohort["codes"]["U4"] == 0  # never a nested v2 classification
+    assert ("U4_PRESENT" in cohort["reasons"]) == bool(u4)
+    assert report["modes"][0]["execution_protection_observable"] is True
+
+
+def test_mixed_versions_and_v2_cohorts_are_never_merged():
+    rows = [_valid_e0_row(), _valid_v2_row(), _valid_v2_row(),
+            _v2_state("cold", "context_unavailable")]
+    rows[2]["context_cohort_id"] = "00000000-0000-4000-8000-000000000999"
+    for index, row in enumerate(rows):
+        row["request_key"] = f"00000000-0000-4000-8000-{index + 1:012d}"
+    report = evaluate_jsonl(map(_line, rows), ("grounding",)).to_dict()
+    mode = report["modes"][0]
+    assert (mode["valid_rows"], mode["comparable_rows"], mode["noncomparable_rows"]) == (4, 3, 1)
+    assert len(mode["cohorts"]) == 4
+    assert [c["schema_version"] for c in mode["cohorts"]] == [1, 2, 2, 2]
+    assert [c["sample_count"] for c in mode["cohorts"]] == [1, 0, 1, 1]
+    assert mode["selection_status"] == "NOT_READY"
+    assert mode["execution_protection_observable"] is False
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("context_status", "private exception", "INVALID_CONTEXT_STATUS"),
+    ("context_status", [], "INVALID_CONTEXT_STATUS"),
+    ("comparison_status", {}, "INVALID_COMPARISON_STATUS"),
+    ("execution_protection", True, "INVALID_EXECUTION_PROTECTION"),
+    ("context_cohort_id", "private path", "INVALID_CONTEXT_COHORT_ID"),
+    ("context_cohort_id", "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF", "INVALID_CONTEXT_COHORT_ID"),
+    ("context_status", "cold", "INVALID_V2_CROSS_FIELDS"),
+    ("context_cohort_id", None, "INVALID_V2_CROSS_FIELDS"),
+    ("comparison_status", "comparison_failed", "INVALID_V2_CROSS_FIELDS"),
+    ("shadow_comparison", None, "INVALID_V2_CROSS_FIELDS"),
+    ("shadow_comparison", [], "INVALID_SHADOW_TYPE"),
+    ("shadow_comparison", {}, "INVALID_SHADOW_FIELDS"),
+    ("execution_protection", "protected_by_legacy", "INVALID_V2_CROSS_FIELDS"),
+    ("outcome", "empty", "INVALID_V2_OUTCOME"),
+    ("outcome", "error", "INVALID_V2_OUTCOME"),
+    ("result_count", 0, "INVALID_V2_OUTCOME"),
+    ("result_count", True, "INVALID_RESULT_COUNT"),
+    ("route_elapsed_ms", float("nan"), "INVALID_ROUTE_ELAPSED_MS"),
+    ("route_elapsed_ms", 10 ** 400, "INVALID_ROUTE_ELAPSED_MS"),
+    ("schema_version", True, "UNSUPPORTED_SCHEMA_VERSION"),
+    ("schema_version", 3, "UNSUPPORTED_SCHEMA_VERSION"),
+    ("actual_provider", "private provider", "UNKNOWN_FIELDS"),
+])
+def test_v2_invalid_wire_fields_fail_closed_without_raw_values(field, value, reason):
+    row = _valid_v2_row()
+    row[field] = value
+    report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+    assert report["input"]["invalid_rows_by_reason"] == {reason: 1}
+    assert report["input"]["valid_rows"] == 0
+    assert "private" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("code", "U4", "INVALID_SHADOW_CODE"),
+    ("code", "E3", "INVALID_SHADOW_CODE"),
+    ("code", [], "INVALID_SHADOW_CODE"),
+    ("safe", 1, "INVALID_SHADOW_SAFE"),
+    ("safe", False, "INVALID_SHADOW_SEMANTICS"),
+    ("legacy_provider_count", True, "INVALID_SHADOW_COUNTS"),
+    ("descriptor_provider_count", -1, "INVALID_SHADOW_COUNTS"),
+    ("omitted_provider_count", 0.0, "INVALID_SHADOW_COUNTS"),
+    ("added_provider_count", [], "INVALID_SHADOW_COUNTS"),
+    ("reasons_complete", 1, "INVALID_SHADOW_REASONS_COMPLETE"),
+    ("legacy_provider_count", 3, "INVALID_SHADOW_SEMANTICS"),
+    ("omitted_provider_count", 3, "INVALID_SHADOW_SEMANTICS"),
+    ("added_provider_count", 3, "INVALID_SHADOW_SEMANTICS"),
+    ("code", "E1", "INVALID_SHADOW_SEMANTICS"),
+    ("reasons", "private secret", "INVALID_SHADOW_FIELDS"),
+])
+def test_v2_invalid_nested_counts_and_taxonomy(field, value, reason):
+    row = _valid_v2_row()
+    row["shadow_comparison"][field] = value
+    report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+    assert report["input"]["invalid_rows_by_reason"] == {reason: 1}
+    assert report["input"]["valid_rows"] == 0
+    assert "private secret" not in json.dumps(report)
+
+
+def test_v2_wire_context_cross_product_matches_authoritative_serializer():
+    from itertools import product
+    from wrr.schemas import DecisionEvidenceV2, ShadowComparisonEvidenceV2, _V2_PROJECTION_TOKEN
+
+    for context, comparison, has_cohort, has_shadow in product(
+        ("available", "cold", "refresh_failed"),
+        ("compared", "context_unavailable", "context_build_failed", "context_expired",
+         "context_mismatch", "comparison_failed"), (False, True), (False, True),
+    ):
+        row = _valid_v2_row()
+        row.update(context_status=context, comparison_status=comparison,
+                   context_cohort_id=row["context_cohort_id"] if has_cohort else None,
+                   execution_protection="not_required" if has_shadow else "unobservable")
+        if not has_shadow:
+            row.pop("shadow_comparison")
+        kwargs = dict(row, actual_provider="exa", _projection_token=_V2_PROJECTION_TOKEN)
+        if has_shadow:
+            kwargs["shadow_comparison"] = ShadowComparisonEvidenceV2(**row["shadow_comparison"])
+        try:
+            wire = DecisionEvidenceV2(**kwargs).to_dict()
+        except ValueError:
+            valid = False
+        else:
+            valid = True
+            assert wire == row
+        report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+        assert report["input"]["valid_rows"] == int(valid), (context, comparison, has_cohort, has_shadow)
+
+
+def test_v2_wire_protection_outcome_cross_product_matches_serializer():
+    from itertools import product
+    from wrr.schemas import DecisionEvidenceV2, ShadowComparisonEvidenceV2, _V2_PROJECTION_TOKEN
+
+    for descriptor_count, outcome, count, protection in product(
+        (0, 2), ("success", "empty", "error"), (0, 1),
+        ("not_required", "protected_by_legacy", "unprotected_empty", "unprotected_error", "unobservable"),
+    ):
+        row = _valid_v2_row()
+        row.update(outcome=outcome, result_count=count, execution_protection=protection)
+        row["shadow_comparison"].update(
+            code="E0" if descriptor_count else "E1", descriptor_provider_count=descriptor_count,
+            omitted_provider_count=2 - descriptor_count)
+        kwargs = dict(row, actual_provider=None if outcome == "error" else "exa",
+                      _projection_token=_V2_PROJECTION_TOKEN)
+        kwargs["shadow_comparison"] = ShadowComparisonEvidenceV2(**row["shadow_comparison"])
+        try:
+            wire = DecisionEvidenceV2(**kwargs).to_dict()
+        except ValueError:
+            valid = False
+        else:
+            valid = True
+            assert wire == row
+        report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+        assert report["input"]["valid_rows"] == int(valid), (descriptor_count, outcome, count, protection)
+
+
+def test_v2_wire_shadow_cardinality_matches_serializer():
+    from itertools import product
+    from wrr.schemas import ShadowComparisonEvidenceV2
+
+    for code, legacy, descriptor, omitted, added, complete in product(
+        ("E0", "E1", "E2", "U1", "U2", "U3"), range(3), range(3), range(3), range(3), (False, True),
+    ):
+        row = _valid_v2_row()
+        shadow = dict(code=code, safe=code.startswith("E"), legacy_provider_count=legacy,
+                      descriptor_provider_count=descriptor, omitted_provider_count=omitted,
+                      added_provider_count=added, reasons_complete=complete)
+        row["shadow_comparison"] = shadow
+        row["execution_protection"] = "not_required" if descriptor else "protected_by_legacy"
+        try:
+            wire = ShadowComparisonEvidenceV2(**shadow).to_dict()
+        except ValueError:
+            valid = False
+        else:
+            valid = True
+            assert wire == shadow
+        report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+        assert report["input"]["valid_rows"] == int(valid), shadow
+
+
+def test_v1_shape_labeled_v2_is_not_a_valid_v2_wire():
+    row = _valid_e0_row()
+    row["schema_version"] = 2
+    report = evaluate_jsonl([_line(row)], ("grounding",)).to_dict()
+    assert report["input"]["valid_rows"] == 0
+    assert report["input"]["invalid_rows_by_reason"] == {"UNKNOWN_FIELDS": 1}
+
+
+@pytest.mark.parametrize("raw", [b"[" * 30000 + b"0" + b"]" * 30000,
+                                  b'{"huge":' + b"9" * 5000 + b"}"],
+                         ids=["deep-json", "huge-integer"])
+def test_bounded_pathological_json_is_rejected_without_crashing(raw):
+    report = evaluate_jsonl([raw], ("grounding",)).to_dict()
+    # Iterative JSON decoders may parse deep arrays successfully; they are
+    # still invalid evidence objects. Older decoders hit their recursion cap.
+    reasons = report["input"]["invalid_rows_by_reason"]
+    if raw.startswith(b"["):
+        assert reasons in ({"INVALID_JSON": 1}, {"ROW_NOT_OBJECT": 1})
+    else:
+        assert reasons == {"INVALID_JSON": 1}
+
+
+def test_cross_version_duplicate_invalidates_all_copies_before_mode_filter():
+    first, second = _valid_e0_row(), _valid_v2_row()
+    first["request_key"] = "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"
+    second["request_key"] = first["request_key"].lower()
+    second["mode"] = "research"
+    report = evaluate_jsonl([_line(first), _line(second)], ("grounding",)).to_dict()
+    assert report["input"]["invalid_rows_by_reason"] == {"DUPLICATE_REQUEST_KEY": 2}
+    assert report["input"]["valid_rows"] == 0
+
+
+@pytest.mark.parametrize("row,reason", [
+    ({"private": "SECRET"}, "UNKNOWN_FIELDS"),
+    ({"schema_version": 3, "private": "SECRET"}, "UNKNOWN_FIELDS"),
+    ({"schema_version": True}, "MISSING_FIELDS"),
+])
+def test_legacy_bad_row_reason_precedence(row, reason):
+    report = evaluate_jsonl([_line(row)]).to_dict()
+    assert report["input"]["invalid_rows_by_reason"] == {reason: 1}
+
+
+def test_unscoped_v2_failure_is_not_attributed_to_v1():
+    rows = _e0_lines(50)
+    v2 = _v2_state("cold", "context_unavailable")
+    v2.update(mode=None, request_key="abcdefab-cdef-4abc-8def-abcdefabcdef")
+    report = evaluate_jsonl(rows + [_line(v2)], ("grounding",)).to_dict()
+    reasons = report["modes"][0]["reasons"]
+    assert "UNSCOPED_EVIDENCE_V2" in reasons
+    assert "CONTEXT_FAILURE_UNOBSERVABLE_V1" not in reasons
+    assert report["selection_status"] == "NOT_READY"

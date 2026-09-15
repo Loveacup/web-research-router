@@ -15,6 +15,8 @@ async def execute_web_search(
     *,
     registry,
     decision_context=None,
+    decision_context_observation=None,
+    decision_evidence_version=1,
     stage_s_enabled=None,
     decision_evidence_sink=None,
 ) -> str:
@@ -35,10 +37,17 @@ async def execute_web_search(
     provider = args.get("provider")
     options = SearchOptions(query=query, count=count, provider=provider,
                             mode=args.get("mode"))
+    # Preserve the legacy router call shape for callers not opting in.
+    evidence_kwargs = {}
+    if decision_context_observation is not None:
+        evidence_kwargs["decision_context_observation"] = decision_context_observation
+    if decision_evidence_version != 1:
+        evidence_kwargs["decision_evidence_version"] = decision_evidence_version
     try:
         result = await route_search_v5(
             options,
             registry,
+            **evidence_kwargs,
             decision_context=decision_context,
             stage_s_enabled=stage_s_enabled,
             decision_evidence_sink=decision_evidence_sink,

@@ -335,6 +335,7 @@ async def _run_engine(registry, name, options, budget):
             elapsed_ms=_elapsed_ms(start), count=0, message=step.error
         )
         return name, None, step, event
+    per_engine = None
     try:
         per_engine = min(engine.timeout, max(0.1, budget))
         res = await asyncio.wait_for(engine.search(options), timeout=per_engine)
@@ -357,7 +358,9 @@ async def _run_engine(registry, name, options, budget):
         step = FallbackStep(name, False, 0, "timeout")
         event = DiagnosticEvent(
             engine=name, ok=False, category="search",
-            elapsed_ms=elapsed, timeout_ms=engine.timeout * 1000.0, count=0, message="timeout"
+            elapsed_ms=elapsed,
+            timeout_ms=per_engine * 1000.0 if per_engine is not None else None,
+            count=0, message="timeout"
         )
         return name, None, step, event
     except RateLimitError:                        # 归一为稳定 token，供 diversity tripwire 判定
@@ -782,7 +785,9 @@ async def _route_search_v5_execute(
             events.extend(wevents)
             if wpayload is not None:
                 # 合并：web 结果在前（更新），本地垫后
-                payload = wpayload + payload
+                payload = _fusion.dedup_cluster(
+                    wpayload + payload, config.COMMUNITY_DEDUP_THRESHOLD
+                )[:options.count]
 
     # 主 mode 空 → recovery 兜底（Brave + Exa + SearXNG）
     if payload is None and mode != "recovery":

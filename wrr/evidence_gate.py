@@ -1,6 +1,6 @@
 """Pure offline evaluator for Stage-S decision-evidence JSONL.
 
-This module owns the versioned wire decoder for persisted schema v1. It does
+This module owns versioned wire decoders for persisted schemas v1/v2. It does
 not import the live routing schema because that import reads runtime config.
 Bytes in, deterministic privacy-bounded report out; no file, env, clock, or
 network access.
@@ -45,6 +45,10 @@ _TOP_FIELDS = {
     "quality_verdict", "route_elapsed_ms", "shadow_comparison",
 }
 _TOP_REQUIRED_FIELDS = _TOP_FIELDS - {"shadow_comparison"}
+_V2_TOP_FIELDS = (_TOP_FIELDS - {"actual_provider"}) | {
+    "context_status", "comparison_status", "execution_protection", "context_cohort_id",
+}
+_V2_BLOCKERS = ["D5_COHORT_WINDOW_UNRESOLVED", "D6_DURABLE_COVERAGE_UNRESOLVED"]
 _SHADOW_FIELDS = {
     "code", "safe", "legacy_provider_ids", "descriptor_provider_ids",
     "omitted_provider_ids", "added_provider_ids", "reasons",
@@ -192,6 +196,89 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def _validate_v2(value: dict) -> None:
+    """Validate the persisted v2 wire independently of live runtime imports."""
+    for field, allowed, reason in (
+        ("context_status", {"available", "cold", "refresh_failed"}, "INVALID_CONTEXT_STATUS"),
+        ("comparison_status", {"compared", "context_unavailable", "context_build_failed",
+                               "context_expired", "context_mismatch", "comparison_failed"},
+         "INVALID_COMPARISON_STATUS"),
+        ("execution_protection", {"not_required", "protected_by_legacy", "unprotected_empty",
+                                  "unprotected_error", "unobservable"}, "INVALID_EXECUTION_PROTECTION"),
+    ):
+        if type(value[field]) is not str or value[field] not in allowed:
+            raise _InvalidRow(reason)
+    cohort = value["context_cohort_id"]
+    if cohort is not None:
+        try:
+            canonical = _parse_uuid4(cohort)
+        except _InvalidRow as exc:
+            raise _InvalidRow("INVALID_CONTEXT_COHORT_ID") from exc
+        if canonical != cohort:
+            raise _InvalidRow("INVALID_CONTEXT_COHORT_ID")
+    shadow = value["shadow_comparison"]
+    if shadow is not None:
+        _validate_v2_shadow(shadow)
+    context, comparison = value["context_status"], value["comparison_status"]
+    compared = comparison == "compared"
+    valid_context = (
+        (context == "cold" and cohort is None and comparison == "context_unavailable")
+        or (context == "available" and cohort is not None
+            and comparison not in {"context_unavailable", "context_build_failed"})
+        or (context == "refresh_failed" and (
+            (cohort is None and comparison == "context_build_failed")
+            or (cohort is not None and comparison in {
+                "compared", "context_expired", "context_mismatch", "comparison_failed"})))
+    )
+    if not valid_context or compared != (shadow is not None):
+        raise _InvalidRow("INVALID_V2_CROSS_FIELDS")
+    outcome, count = value["outcome"], value["result_count"]
+    # actual_provider is intentionally absent from the persisted v2 wire.
+    if (outcome == "success") != (count > 0):
+        raise _InvalidRow("INVALID_V2_OUTCOME")
+    if not compared:
+        expected = "unobservable"
+    elif shadow["descriptor_provider_count"] > 0:
+        expected = "not_required"
+    else:
+        expected = {"success": "protected_by_legacy", "empty": "unprotected_empty",
+                    "error": "unprotected_error"}[outcome]
+    if value["execution_protection"] != expected:
+        raise _InvalidRow("INVALID_V2_CROSS_FIELDS")
+
+
+def _validate_v2_shadow(shadow: object) -> None:
+    if not isinstance(shadow, dict):
+        raise _InvalidRow("INVALID_SHADOW_TYPE")
+    count_fields = ("legacy_provider_count", "descriptor_provider_count",
+                    "omitted_provider_count", "added_provider_count")
+    if set(shadow) != {"code", "safe", "reasons_complete", *count_fields}:
+        raise _InvalidRow("INVALID_SHADOW_FIELDS")
+    code = shadow["code"]
+    if type(code) is not str or code not in {"E0", "E1", "E2", "U1", "U2", "U3"}:
+        raise _InvalidRow("INVALID_SHADOW_CODE")
+    if type(shadow["safe"]) is not bool:
+        raise _InvalidRow("INVALID_SHADOW_SAFE")
+    if any(type(shadow[field]) is not int or shadow[field] < 0 for field in count_fields):
+        raise _InvalidRow("INVALID_SHADOW_COUNTS")
+    if type(shadow["reasons_complete"]) is not bool:
+        raise _InvalidRow("INVALID_SHADOW_REASONS_COMPLETE")
+    legacy, descriptor, omitted, added = (shadow[field] for field in count_fields)
+    valid = (shadow["safe"] == code.startswith("E") and omitted <= legacy
+             and added <= descriptor and descriptor == legacy - omitted + added)
+    if code in {"E0", "E2"}:
+        valid = valid and legacy == descriptor and omitted == added == 0
+    elif code == "E1":
+        valid = (valid and descriptor < legacy and omitted == legacy - descriptor
+                 and added == 0 and shadow["reasons_complete"])
+    elif code == "U1":
+        valid = valid and added == 0 and omitted > 0
+    elif code == "U2":
+        valid = valid and added > 0
+    if not valid:
+        raise _InvalidRow("INVALID_SHADOW_SEMANTICS")
+
+
 def _parse_row(raw: bytes) -> dict:
     if not raw.strip():
         raise _InvalidRow("EMPTY_LINE")
@@ -201,17 +288,30 @@ def _parse_row(raw: bytes) -> dict:
         raise _InvalidRow("INVALID_UTF8") from exc
     try:
         value = json.loads(text, object_pairs_hook=_unique_object)
-    except json.JSONDecodeError as exc:
+    except _InvalidRow:
+        raise
+    except (ValueError, RecursionError) as exc:
         raise _InvalidRow("INVALID_JSON") from exc
     if not isinstance(value, dict):
         raise _InvalidRow("ROW_NOT_OBJECT")
-    if set(value) - _TOP_FIELDS:
+    version = value.get("schema_version")
+    # Legacy-shaped bad rows retain their original keyset-first diagnostics.
+    # Recognizable v2 envelopes still dispatch unsupported versions explicitly.
+    if version != 2 and not (set(value) & (_V2_TOP_FIELDS - _TOP_FIELDS)):
+        if set(value) - _TOP_FIELDS:
+            raise _InvalidRow("UNKNOWN_FIELDS")
+        if _TOP_REQUIRED_FIELDS - set(value):
+            raise _InvalidRow("MISSING_FIELDS")
+    if "schema_version" not in value:
+        raise _InvalidRow("MISSING_FIELDS")
+    if type(version) is not int or version not in (1, 2):
+        raise _InvalidRow("UNSUPPORTED_SCHEMA_VERSION")
+    fields = _TOP_FIELDS if version == 1 else _V2_TOP_FIELDS
+    if set(value) - fields:
         raise _InvalidRow("UNKNOWN_FIELDS")
-    if _TOP_REQUIRED_FIELDS - set(value):
+    if (fields - {"shadow_comparison"}) - set(value):
         raise _InvalidRow("MISSING_FIELDS")
     value.setdefault("shadow_comparison", None)
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise _InvalidRow("UNSUPPORTED_SCHEMA_VERSION")
     if type(value["stage"]) is not str or value["stage"] != "S":
         raise _InvalidRow("INVALID_STAGE")
     value["request_key"] = _parse_uuid4(value["request_key"])
@@ -227,7 +327,7 @@ def _parse_row(raw: bytes) -> dict:
         raise _InvalidRow("INVALID_TERMINAL")
     if not isinstance(value["outcome"], str) or value["outcome"] not in _OUTCOMES:
         raise _InvalidRow("INVALID_OUTCOME")
-    provider = value["actual_provider"]
+    provider = value.get("actual_provider")
     if provider is not None and (
         not isinstance(provider, str) or not _PROVIDER_TOKEN.match(provider)
     ):
@@ -240,8 +340,15 @@ def _parse_row(raw: bytes) -> dict:
     ):
         raise _InvalidRow("INVALID_QUALITY_VERDICT")
     elapsed = value["route_elapsed_ms"]
-    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not isfinite(elapsed) or elapsed < 0:
+    try:
+        valid_elapsed = type(elapsed) in (int, float) and isfinite(elapsed) and elapsed >= 0
+    except OverflowError:
+        valid_elapsed = False
+    if not valid_elapsed:
         raise _InvalidRow("INVALID_ROUTE_ELAPSED_MS")
+    if version == 2:
+        _validate_v2(value)
+        return value
     shadow = value["shadow_comparison"]
     if shadow is not None:
         if not isinstance(shadow, dict):
@@ -294,6 +401,23 @@ def _empty_mode(mode: str) -> dict:
     }
 
 
+def _v2_summary(rows: list[dict]) -> dict:
+    """All validated persisted rows, never an authoritative request denominator."""
+    compared = sum(row["comparison_status"] == "compared" for row in rows)
+    protection = _stable_counts(row["execution_protection"] for row in rows)
+    return {
+        "population": "validated_persisted_rows_not_request_attempts",
+        "valid_rows": len(rows),
+        "comparable_rows": compared,
+        "noncomparable_rows": len(rows) - compared,
+        "context_status_counts": _stable_counts(row["context_status"] for row in rows),
+        "comparison_status_counts": _stable_counts(row["comparison_status"] for row in rows),
+        "execution_protection_counts": protection,
+        "effective_u4_rows": protection.get("unprotected_empty", 0) + protection.get("unprotected_error", 0),
+        "u4_unobservable_rows": protection.get("unobservable", 0),
+    }
+
+
 def evaluate_jsonl(
     lines: Iterable[bytes], requested_modes: Sequence[str] | None = None,
 ) -> GateReport:
@@ -334,16 +458,18 @@ def evaluate_jsonl(
 
     by_mode: dict[str, list[dict]] = defaultdict(list)
     unscoped = 0
+    unscoped_versions = Counter()
     for row in rows:
         if row["mode"] is None:
             unscoped += 1
+            unscoped_versions[row["schema_version"]] += 1
         else:
             by_mode[row["mode"]].append(row)
 
     mode_reports = []
     for mode in modes:
         report = _empty_mode(mode)
-        scoped = by_mode.get(mode, [])
+        scoped = [row for row in by_mode.get(mode, []) if row["schema_version"] == 1]
         report["valid_rows"] = len(scoped)
         comparable = [
             row for row in scoped
@@ -436,8 +562,10 @@ def evaluate_jsonl(
         global_reasons = []
         if invalid:
             global_reasons.append("INVALID_ROWS_PRESENT")
-        if unscoped:
+        if unscoped_versions[1]:
             global_reasons.append("CONTEXT_FAILURE_UNOBSERVABLE_V1")
+        if unscoped_versions[2]:
+            global_reasons.append("UNSCOPED_EVIDENCE_V2")
         if global_reasons:
             report["selection_status"] = "NOT_READY"
             report["reasons"] = sorted(set(report["reasons"] + global_reasons))
@@ -473,4 +601,54 @@ def evaluate_jsonl(
         },
         "modes": mode_reports,
     }
+    v2_rows = [row for row in rows if row["schema_version"] == 2]
+    if v2_rows:
+        payload["reasons"] = list(_V2_BLOCKERS)
+        payload["persisted_v2"] = _v2_summary(v2_rows)
+        for report in mode_reports:
+            scoped_v2 = [row for row in v2_rows if row["mode"] == report["mode"]]
+            if not scoped_v2:
+                continue
+            legacy_count = report["valid_rows"]
+            for cohort in report["cohorts"]:
+                cohort["schema_version"] = 1
+            grouped_v2 = defaultdict(list)
+            for row in scoped_v2:
+                grouped_v2[row["context_cohort_id"]].append(row)
+            for cohort_id, cohort_rows in sorted(grouped_v2.items(), key=lambda pair: pair[0] or ""):
+                summary = _v2_summary(cohort_rows)
+                codes = {code: 0 for code in _CODES}
+                for row in cohort_rows:
+                    if row["comparison_status"] == "compared":
+                        codes[row["shadow_comparison"]["code"]] += 1
+                reasons = list(_V2_BLOCKERS)
+                if summary["effective_u4_rows"]:
+                    reasons.append("U4_PRESENT")
+                if summary["u4_unobservable_rows"]:
+                    reasons.append("U4_UNOBSERVABLE_V2")
+                report["cohorts"].append({
+                    **summary,
+                    "schema_version": 2,
+                    "context_cohort_id": cohort_id,
+                    "status": "NOT_READY",
+                    "reasons": sorted(reasons),
+                    "sample_count": summary["comparable_rows"],
+                    "codes": codes,
+                })
+            summary = _v2_summary(scoped_v2)
+            report["persisted_v2"] = summary
+            report["valid_rows"] += summary["valid_rows"]
+            report["comparable_rows"] += summary["comparable_rows"]
+            report["noncomparable_rows"] += summary["noncomparable_rows"]
+            report["comparison_unavailable_rows"] += summary["noncomparable_rows"]
+            if report["context_build_failure_count"] is not None:
+                report["context_build_failure_count"] += summary["comparison_status_counts"].get("context_build_failed", 0)
+            report["execution_protection_observable"] = not legacy_count and not summary["u4_unobservable_rows"]
+            report["selection_status"] = "NOT_READY"
+            if not legacy_count:
+                report["reasons"] = [reason for reason in report["reasons"] if not reason.endswith("_V1")]
+            if report["comparable_rows"]:
+                report["reasons"] = [reason for reason in report["reasons"] if reason != "NO_COMPARABLE_SAMPLES"]
+            report["reasons"] = sorted(set(report["reasons"] + _V2_BLOCKERS))
+        payload["selection_status"] = "NOT_READY"
     return GateReport(payload)

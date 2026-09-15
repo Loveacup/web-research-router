@@ -5,6 +5,7 @@ fallback_chain 统一 snake_case（v3 web_fetch 曾用 camel 的 fallbackChain�
 v5.1: doctor 人类可读报告 + JSON 输出。
 """
 import json
+from dataclasses import replace
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -120,9 +121,26 @@ def _quality_banner(quality: dict) -> str:
             f"({quality['independent_source_count']}/{quality['min_required']} sources)\n\n")
 
 
+def _bounded_search_items(items: List[SearchResult]):
+    """Bound excerpts in both output projections without mutating route data.
+
+    Limits are Unicode code points (including the ellipsis), not bytes/tokens.
+    Titles, URLs, order, provenance and diagnostics remain untouched.
+    """
+    bounded, truncated = [], 0
+    for item in items:
+        snippet = item.snippet if len(item.snippet) <= 600 else item.snippet[:599] + "…"
+        highlights = [text if len(text) <= 800 else text[:799] + "…"
+                      for text in item.highlights[:2]]
+        changed = snippet != item.snippet or highlights != item.highlights
+        truncated += int(changed)
+        bounded.append(replace(item, snippet=snippet, highlights=highlights) if changed else item)
+    return bounded, truncated
+
+
 def format_search(result: RouterResult, query: str) -> str:
     primary = config.SEARCH_FALLBACK_ORDER[0]
-    items = result.payload
+    items, truncated = _bounded_search_items(result.payload)
     formatted = "\n\n".join(
         f"**{i + 1}. {r.title}**\n   {r.url}\n   {r.snippet}"
         + (("\n   ↳ " + " · ".join(r.highlights[:2])) if r.highlights else "")
@@ -151,6 +169,12 @@ def format_search(result: RouterResult, query: str) -> str:
         details["diagnostics"] = result.diagnostics.to_dict()
     banner = "" if result.mode is not None else _banner(result, primary)
     banner += _quality_banner(quality)
+    if truncated:
+        details["excerpt_budget"] = {
+            "snippet_chars": 600, "highlight_chars": 800,
+            "highlights_per_result": 2, "truncated_result_count": truncated,
+        }
+        banner += "> 搜索摘录已截断；需要完整证据时请用 web_fetch 读取原文。\n\n"
     return json.dumps({
         "success": True,
         "content": f'## web_search (provider: {result.actual_provider}, query: "{query}")\n\n'
