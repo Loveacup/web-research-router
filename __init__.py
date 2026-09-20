@@ -143,6 +143,13 @@ _SEARCH_SCHEMA = {
                 ),
             },
             "mode": {"type": "string", "description": "显式 mode 覆盖自动分类（可选）"},
+            "campaign_id": {
+                "type": "string",
+                "description": (
+                    "可选：显式 campaign 标签。仅当本插件启用了固定 evidence campaign 且"
+                    "该值与声明 campaign 完全匹配时才计入 admission；否则按普通搜索处理。"
+                ),
+            },
         },
         "required": ["query"],
     },
@@ -274,14 +281,35 @@ def register(ctx, *, campaign_ledger=None) -> None:
         JsonlDecisionEvidenceSink,
         NoopDecisionEvidenceSink,
     )
+    from wrr.runtime.campaign_activation import (
+        CampaignController,
+        parse_campaign_config,
+    )
+    from wrr.runtime.campaign_ledger import CampaignDeclaration, CampaignLedger
 
     # 唯一 execution legacy registry：冷态与暖态都用同一个对象执行，get_registry()
     # 恰好调用一次。
     legacy_registry = get_registry()
 
+    # 固定 evidence campaign 是显式 opt-in（默认关闭）。配置读取/校验失败只关闭
+    # campaign，绝不阻断三个工具的注册。
+    campaign_config = None
+    get_config = getattr(ctx, "get_config", None)
+    if callable(get_config):
+        try:
+            campaign_config = parse_campaign_config(get_config("campaign"))
+        except ValueError as exc:
+            logger.warning("campaign config rejected; campaign disabled: %s", exc)
+            campaign_config = None
+
     def _build_control_plane_context():
         # builder 闭包把同一个 legacy object 桥接进 assembly（内部不做第二次 discovery）。
-        return build_control_plane_decision_context(legacy_registry)
+        # 启用 campaign 时绑定一个长 TTL 的固定 snapshot，保证 24h 窗口内 cohort 不变。
+        if campaign_config is None:
+            return build_control_plane_decision_context(legacy_registry)
+        return build_control_plane_decision_context(
+            legacy_registry, ttl_sec=campaign_config.context_ttl_sec,
+        )
 
     provider = CachedDecisionContextProvider(_build_control_plane_context)
     activator = _ColdDecisionContextActivator(provider)
@@ -295,6 +323,10 @@ def register(ctx, *, campaign_ledger=None) -> None:
     except Exception as exc:  # noqa: BLE001 - 组合层降级，注册必须存活
         logger.warning("decision evidence sink construction failed: %s", exc)
         decision_evidence_sink = NoopDecisionEvidenceSink()
+
+    # 生产 campaign controller 在 register 末尾（eager 暖机之后）构建；此处先声明
+    # 以便 handler 闭包绑定该 cell（闭包按调用时解析，注册完成前 controller 已是终值）。
+    controller = None
 
     async def _bound_web_search(args, **kwargs):
         # 每请求只 observe() 一次，原子拿 (context, status, cohort_id)；不 refresh /
@@ -311,9 +343,38 @@ def register(ctx, *, campaign_ledger=None) -> None:
                     campaign_ledger.record_fault("identity_mint_failed")
                 except Exception:  # noqa: BLE001 - best-effort durable poison
                     pass
+            if controller is not None:
+                try:
+                    controller.record_fault("identity_mint_failed")
+                except Exception:  # noqa: BLE001 - best-effort durable poison
+                    pass
         request_sink = decision_evidence_sink
         campaign_sink = None
-        if campaign_ledger is not None and request_key is not None:
+        admitted_controller = None
+        if controller is not None and request_key is not None:
+            # 生产路径：只有显式 campaign 标签 + mode + 无 provider 的请求才准入；
+            # 不匹配时返回 None，该请求仍按普通搜索执行，不消耗额度。
+            admitted = controller.admit(
+                request_key,
+                campaign_id=args.get("campaign_id") if isinstance(args, dict) else None,
+                mode=args.get("mode") if isinstance(args, dict) else None,
+                provider=args.get("provider") if isinstance(args, dict) else None,
+                context_status=observation.status,
+                context_cohort_id=observation.cohort_id,
+                context_expires_at=(
+                    observation.context.expires_at
+                    if observation.context is not None
+                    else None
+                ),
+                context_now=time.time(),
+            )
+            if admitted is not None:
+                admitted_controller = controller
+                campaign_sink = _CampaignEvidenceSink(
+                    controller, admitted, decision_evidence_sink,
+                )
+                request_sink = campaign_sink
+        elif campaign_ledger is not None and request_key is not None:
             atomic_begin = getattr(campaign_ledger, "begin_or_fault", None)
             try:
                 begin = atomic_begin or campaign_ledger.begin
@@ -346,6 +407,10 @@ def register(ctx, *, campaign_ledger=None) -> None:
         finally:
             if campaign_sink is not None:
                 campaign_sink.drop_pending()
+            if admitted_controller is not None:
+                # 每个准入请求终态完成后递减 in-flight；达到容量与 24h 双门槛后
+                # 才允许 clean close。
+                admitted_controller.on_terminal()
 
     # web_search 与内建工具（toolset="web"）同名，Hermes registry 会拒绝跨
     # toolset 重名注册，必须显式 override=True 才能让插件版接管。
@@ -371,11 +436,48 @@ def register(ctx, *, campaign_ledger=None) -> None:
         toolset="wrr",
         is_async=True,
     )
-    ctx.register_hook("pre_llm_call", activator.pre_llm_call)
+    def _pre_llm_call():
+        activator.pre_llm_call()
+        if controller is not None:
+            observation = provider.observe()
+            controller.tick(
+                context_status=observation.status,
+                context_cohort_id=observation.cohort_id,
+            )
+        return None
 
-    # Eager best-effort 暖机：任何 assembly / refresh failure 都在此本地吞掉，
-    # 不得逃出 register（activator 内部已捕获 refresh 异常，这里再兜一层防御）。
+    ctx.register_hook("pre_llm_call", _pre_llm_call)
+
+    # Eager best-effort 暖机发生在 hook 注册之后，保留既有冷态注册语义。
+    # activation failure 不得阻断工具注册。
     try:
         activator.activate()
     except Exception:  # noqa: BLE001 - register 不因暖机失败而崩
         logger.warning("eager DecisionContext activation raised; continuing", exc_info=True)
+
+    # 仅在显式配置且暖机成功时创建生产 controller。绑定本次实际 cohort；
+    # ledger/open/config 任一失败都只关闭 campaign，不影响普通搜索。
+    if campaign_config is not None:
+        try:
+            observation = provider.observe()
+            if observation.status == "available" and observation.cohort_id is not None:
+                declaration = CampaignDeclaration(
+                    policy_version=campaign_config.policy_version,
+                    requested_modes=(campaign_config.mode,),
+                    accepted_context_cohort_id=observation.cohort_id,
+                    build_manifest_id=campaign_config.build_manifest_id,
+                )
+                ledger = CampaignLedger.open(
+                    campaign_config.ledger_path,
+                    campaign_id=campaign_config.campaign_id,
+                    capacity=campaign_config.capacity,
+                    declaration=declaration,
+                )
+                controller = CampaignController(
+                    campaign_config, ledger, observation.cohort_id,
+                )
+            else:
+                logger.warning("campaign activation skipped: decision context not available")
+        except Exception as exc:  # noqa: BLE001 - campaign is opt-in and fail-safe
+            logger.warning("campaign activation failed; campaign disabled: %s", exc)
+            controller = None

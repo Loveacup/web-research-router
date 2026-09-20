@@ -10,3 +10,9 @@ tools:
 dependencies:
   - httpx>=0.28
   - PyYAML>=6
+config_schema:
+  campaign:
+    type: dict
+    default:
+      enabled: false
+    description: "Opt-in fixed evidence campaign (D7-S4). Disabled by default; see README."

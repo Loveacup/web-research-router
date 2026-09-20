@@ -60,6 +60,7 @@ _EXTERNAL_FAULT_REASONS = frozenset({
     "evidence_finish_failed",
     "admission_drop_failed",
     "downstream_evidence_failed",
+    "context_changed",
 })
 
 
@@ -130,6 +131,7 @@ class CampaignDeclaration:
     policy_version: str
     requested_modes: tuple[str, ...]
     accepted_context_cohort_id: str
+    build_manifest_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if type(self.policy_version) is not str or not self.policy_version:
@@ -146,15 +148,24 @@ class CampaignDeclaration:
                 raise ValueError("requested_modes entries must be non-empty strings")
         if len(set(self.requested_modes)) != len(self.requested_modes):
             raise ValueError("requested_modes must not contain duplicates")
+        if self.build_manifest_id is not None and (
+            type(self.build_manifest_id) is not str
+            or not self.build_manifest_id
+            or len(self.build_manifest_id) > 128
+        ):
+            raise ValueError("build_manifest_id must be a bounded non-empty string")
 
 
 def _declaration_to_json(declaration: CampaignDeclaration) -> str:
+    obj = {
+        "policy_version": declaration.policy_version,
+        "requested_modes": list(declaration.requested_modes),
+        "accepted_context_cohort_id": declaration.accepted_context_cohort_id,
+    }
+    if declaration.build_manifest_id is not None:
+        obj["build_manifest_id"] = declaration.build_manifest_id
     return json.dumps(
-        {
-            "policy_version": declaration.policy_version,
-            "requested_modes": list(declaration.requested_modes),
-            "accepted_context_cohort_id": declaration.accepted_context_cohort_id,
-        },
+        obj,
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -168,6 +179,7 @@ def _declaration_from_json(raw: Optional[str]) -> Optional[CampaignDeclaration]:
         policy_version=obj["policy_version"],
         requested_modes=tuple(obj["requested_modes"]),
         accepted_context_cohort_id=obj["accepted_context_cohort_id"],
+        build_manifest_id=obj.get("build_manifest_id"),
     )
 
 

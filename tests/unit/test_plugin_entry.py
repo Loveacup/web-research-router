@@ -195,7 +195,7 @@ def test_schema_properties_align_with_handlers():
     ctx = MockCtx()
     mod.register(ctx)
     assert set(ctx.tools["web_search"]["schema"]["parameters"]["properties"]) == {
-        "query", "max_results", "provider", "mode",
+        "query", "max_results", "provider", "mode", "campaign_id",
     }
     assert set(ctx.tools["web_fetch"]["schema"]["parameters"]["properties"]) == {
         "url", "max_characters", "provider",
@@ -895,13 +895,13 @@ def test_register_hook_returns_none(monkeypatch):
     assert hook() is None
 
 
-def _r3_context():
+def _r3_context(ttl_sec=300):
     import time
     from wrr.schemas import DecisionContext
 
     now = time.time()
     return DecisionContext(
-        snapshot_version="r3-test", built_at=now, expires_at=now + 300,
+        snapshot_version="r3-test", built_at=now, expires_at=now + ttl_sec,
         runtime="standalone", profile="default", registry_source="test",
         routable_descriptor_ids=("exa", "brave"),
         bridged_provider_ids=("exa", "brave"), missing_provider_ids=(),
@@ -1037,6 +1037,75 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
     assert report["input"]["invalid_rows"] == 0
     assert report["modes"][0]["status"] == "NOT_READY"
     assert report["modes"][0]["selection_status"] == "NOT_READY"
+
+
+def test_register_opt_in_campaign_wires_real_admission_and_exact_join(monkeypatch, tmp_path):
+    import json
+    import sqlite3
+    from conftest import FakeEngine, mk_results
+    import wrr.registry as registry_mod
+    import wrr.runtime.decision_context_assembly as assembly
+    import wrr.runtime.decision_evidence as evidence
+
+    registry = registry_mod.EngineRegistry()
+    for name in ("exa", "brave"):
+        registry.register(FakeEngine(name, search_results=mk_results(2)))
+
+    ttl_seen = []
+
+    def build(actual, *, ttl_sec):
+        assert actual is registry
+        ttl_seen.append(ttl_sec)
+        return _r3_context(ttl_sec)
+
+    evidence_path = tmp_path / "events.jsonl"
+    ledger_path = tmp_path / "campaign.sqlite"
+    real_sink = evidence.JsonlDecisionEvidenceSink
+
+    class CampaignCtx(MockCtx):
+        def get_config(self, key, default=None):
+            assert key == "campaign"
+            return {
+                "enabled": True,
+                "id": "d7-s4-grounding-001",
+                "mode": "grounding",
+                "capacity": 50,
+                "policy_version": "EV-D5-v1",
+                "build_manifest_id": "a95fac3",
+                "ledger_path": str(ledger_path),
+                "context_ttl_sec": 93600,
+            }
+
+    monkeypatch.setattr(registry_mod, "get_registry", lambda: registry)
+    monkeypatch.setattr(assembly, "build_control_plane_decision_context", build)
+    monkeypatch.setattr(evidence, "JsonlDecisionEvidenceSink", lambda: real_sink(evidence_path))
+    monkeypatch.setenv("WRR_V6_ROUTER", "1")
+
+    mod, ctx = _load_entry(), CampaignCtx()
+    mod.register(ctx)
+    handler = ctx.tools["web_search"]["handler"]
+    asyncio.run(handler({
+        "query": "production campaign join",
+        "mode": "grounding",
+        "campaign_id": "d7-s4-grounding-001",
+    }))
+
+    assert ttl_seen == [93600.0]
+    evidence_rows = [
+        json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(evidence_rows) == 1
+    with sqlite3.connect(ledger_path) as conn:
+        admission = conn.execute(
+            "SELECT request_key, state, evidence FROM admissions"
+        ).fetchone()
+        declaration = conn.execute("SELECT declaration FROM meta WHERE id = 1").fetchone()[0]
+    assert admission[0] == evidence_rows[0]["request_key"]
+    assert admission[1] == "finished"
+    assert json.loads(admission[2])["request_key"] == evidence_rows[0]["request_key"]
+    declaration_obj = json.loads(declaration)
+    assert declaration_obj["policy_version"] == "EV-D5-v1"
+    assert declaration_obj["build_manifest_id"] == "a95fac3"
 
 
 # ── cold activator 合同（fake monotonic / 并发 / 二次 get）────────────────
