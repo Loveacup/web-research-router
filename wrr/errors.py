@@ -23,3 +23,7 @@ class EngineTimeoutError(EngineError):
 
 class AllEnginesFailedError(WRRError):
     """fallback 链全部 provider 失败。"""
+
+    def __init__(self, message: str, *, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics

@@ -780,6 +780,99 @@ def test_opencli_outcome_soft_blocked_captcha_and_403():
         assert res.items == []
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "expected"),
+    [
+        (None, "", "", "TIMEOUT"),
+        (1, "", "BROWSER_CONNECT: extension disconnected", "BRIDGE_DISCONNECTED"),
+        (1, "", "ECONNRESET while requesting upstream", "NETWORK_ERROR"),
+        (1, "", "selector not found after page redesign", "PLATFORM_ERROR"),
+        (0, "not-json", "", "SCHEMA_ERROR"),
+        (1, "", "unexpected command failure", "ERROR"),
+    ],
+)
+def test_opencli_outcome_preserves_failure_classification(
+        returncode, stdout, stderr, expected):
+    """请求级诊断不能把 timeout/network/schema/platform 全压成 EMPTY。"""
+    from wrr.engines import community_sources as cs
+
+    async def fake_run(cli, timeout):
+        return (returncode, stdout, stderr)
+
+    res = run(cs.OpenCliSourceAdapter().fetch_result(
+        _oc_cfg(), SearchOptions("python", count=5), fake_run, 1.0))
+    assert res.outcome is getattr(cs.SourceOutcome, expected)
+    assert res.items == []
+
+
+def test_search_exposes_request_scoped_subsource_diagnostics_and_partial_results(monkeypatch):
+    """一个子源成功、一个子源失败时，保留结果并暴露逐源诊断。"""
+    eng = cm.CommunityEngine()
+    monkeypatch.setattr(eng, "_detect_sources", lambda query: ["reddit", "twitter"])
+
+    async def fake_run(cli, timeout):
+        if cli[1] == "reddit":
+            return (0, json.dumps(_REDDIT[:1]), "")
+        return (1, "", "ECONNRESET while requesting upstream")
+
+    monkeypatch.setattr(cm, "_run_cmd", fake_run)
+    results = run(eng.search(SearchOptions("python", count=5)))
+
+    assert len(results) == 1
+    assert results.partial is True
+    assert results.cutoff_reason is None
+    diagnostics = {d.source: d.to_dict() for d in results.source_diagnostics}
+    assert diagnostics["reddit"]["outcome"] == "ready"
+    assert diagnostics["reddit"]["items_count"] == 1
+    assert diagnostics["twitter"]["outcome"] == "network_error"
+    assert diagnostics["twitter"]["items_count"] == 0
+
+
+def test_search_deadline_returns_completed_results_and_marks_cutoff(monkeypatch):
+    """总截止时间到达后取消慢源，但不得丢弃已完成源的结果。"""
+    eng = cm.CommunityEngine()
+    monkeypatch.setattr(eng, "_detect_sources", lambda query: ["reddit", "twitter"])
+    monkeypatch.setattr(config, "COMMUNITY_TOTAL_TIMEOUT", 0.02)
+
+    async def fake_run(cli, timeout):
+        if cli[1] == "reddit":
+            return (0, json.dumps(_REDDIT[:1]), "")
+        await asyncio.sleep(1)
+        return (0, json.dumps(_TWITTER), "")
+
+    monkeypatch.setattr(cm, "_run_cmd", fake_run)
+    started = time.monotonic()
+    results = run(eng.search(SearchOptions("python", count=5)))
+
+    assert time.monotonic() - started < 0.5
+    assert len(results) == 1
+    assert results.partial is True
+    assert results.cutoff_reason == "request_deadline"
+    diagnostics = {d.source: d.to_dict() for d in results.source_diagnostics}
+    assert diagnostics["reddit"]["outcome"] == "ready"
+    assert diagnostics["twitter"]["outcome"] == "cutoff"
+    assert diagnostics["twitter"]["cutoff_reason"] == "request_deadline"
+
+
+def test_search_all_cutoff_error_retains_request_diagnostics(monkeypatch):
+    """即使没有可返回结果，截止诊断也不能在异常边界丢失。"""
+    eng = cm.CommunityEngine()
+    monkeypatch.setattr(eng, "_detect_sources", lambda query: ["twitter"])
+    monkeypatch.setattr(config, "COMMUNITY_TOTAL_TIMEOUT", 0.01)
+
+    async def fake_run(cli, timeout):
+        await asyncio.sleep(1)
+        return (0, json.dumps(_TWITTER), "")
+
+    monkeypatch.setattr(cm, "_run_cmd", fake_run)
+    with pytest.raises(cm.CommunitySearchError) as caught:
+        run(eng.search(SearchOptions("python", count=5)))
+
+    assert caught.value.details["partial"] is False
+    assert caught.value.details["cutoff_reason"] == "request_deadline"
+    assert caught.value.details["sources"][0]["outcome"] == "cutoff"
+
+
 def test_opencli_ready_json_payload_not_misclassified_as_block():
     """成功 JSON 载荷即使内容含 403/forbidden 字样也不得误判为 soft_blocked。"""
     from wrr.engines import community_sources as cs

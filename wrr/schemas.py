@@ -687,6 +687,7 @@ class DiagnosticEvent:
     count: int = 0
     message: Optional[str] = None
     phase: Optional[str] = None  # "primary" | "fallback" | "recovery"
+    details: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -702,6 +703,8 @@ class DiagnosticEvent:
             d["message"] = self.message
         if self.phase:
             d["phase"] = self.phase
+        if self.details is not None:
+            d["details"] = self.details
         return d
 
 

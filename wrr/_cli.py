@@ -162,9 +162,12 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
         result = asyncio.run(_run(operation, options, provider))
     except AllEnginesFailedError as e:
         if as_json:
-            _emit_json({"operation": operation, "ok": False,
-                        "error": "all_engines_failed", "detail": str(e),
-                        "quality": failed_quality_payload()})
+            payload = {"operation": operation, "ok": False,
+                       "error": "all_engines_failed", "detail": str(e),
+                       "quality": failed_quality_payload()}
+            if e.diagnostics is not None:
+                payload["diagnostics"] = e.diagnostics.to_dict()
+            _emit_json(payload)
         else:
             _eprint(f"✗ 所有引擎失败（{operation}）：\n{e}")
             _eprint("  提示：检查 API key（EXA_API_KEY / BRAVE_API_KEY / SEARXNG_URL）、"
@@ -503,7 +506,7 @@ def cmd_doctor(ns) -> int:
     if ns.json:
         summary = summarize_checks(results)
         payload = {
-            "ok": summary["status"] != "fail",
+            "ok": summary["status"] == "ok",
             "status": summary["status"],
             "summary": {k: summary[k] for k in ("ok", "warn", "fail", "skip")},
             "engines": [r.to_dict() for r in results],

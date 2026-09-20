@@ -81,6 +81,75 @@ def _count(operation: str, result) -> int:
     return len(getattr(result, "text", "") or "")
 
 
+def _safe_diagnostic_token(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 80:
+        return None
+    if not all(char.isalnum() or char in "._-" for char in value):
+        return None
+    return value
+
+
+def _safe_request_diagnostic_details(details: Any) -> Optional[Dict[str, Any]]:
+    """Project engine-owned request diagnostics onto the public safe schema."""
+    if not isinstance(details, dict):
+        return None
+
+    projected: Dict[str, Any] = {}
+    if isinstance(details.get("partial"), bool):
+        projected["partial"] = details["partial"]
+    if "cutoff_reason" in details:
+        cutoff_reason = details["cutoff_reason"]
+        if cutoff_reason is None:
+            projected["cutoff_reason"] = None
+        else:
+            safe_cutoff = _safe_diagnostic_token(cutoff_reason)
+            if safe_cutoff is not None:
+                projected["cutoff_reason"] = safe_cutoff
+
+    sources = details.get("sources")
+    if isinstance(sources, list):
+        safe_sources = []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            safe_source: Dict[str, Any] = {}
+            for key in ("source", "outcome", "detail", "cutoff_reason"):
+                value = _safe_diagnostic_token(source.get(key))
+                if value is not None:
+                    safe_source[key] = value
+            elapsed_ms = source.get("elapsed_ms")
+            if (isinstance(elapsed_ms, (int, float))
+                    and not isinstance(elapsed_ms, bool) and elapsed_ms >= 0):
+                safe_source["elapsed_ms"] = round(float(elapsed_ms), 2)
+            items_count = source.get("items_count")
+            if type(items_count) is int and items_count >= 0:
+                safe_source["items_count"] = items_count
+            if safe_source:
+                safe_sources.append(safe_source)
+        projected["sources"] = safe_sources
+
+    return projected or None
+
+
+def _result_diagnostic_details(result) -> Optional[Dict[str, Any]]:
+    """提取引擎返回值上的加法式请求诊断；普通 list 保持无感。"""
+    source_diagnostics = getattr(result, "source_diagnostics", None)
+    if not source_diagnostics:
+        return None
+    sources = []
+    for diagnostic in source_diagnostics:
+        to_dict = getattr(diagnostic, "to_dict", None)
+        if callable(to_dict):
+            sources.append(to_dict())
+    if not sources:
+        return None
+    return _safe_request_diagnostic_details({
+        "partial": bool(getattr(result, "partial", False)),
+        "cutoff_reason": getattr(result, "cutoff_reason", None),
+        "sources": sources,
+    })
+
+
 async def route(operation: str, options, registry: SearchRegistry,
                 explicit_provider: Optional[str] = None) -> RouterResult:
     chain = build_chain(operation, explicit_provider, getattr(options, "query", None))
@@ -139,7 +208,7 @@ async def route(operation: str, options, registry: SearchRegistry,
             event = DiagnosticEvent(
                 engine=provider, ok=True, category=operation,
                 elapsed_ms=step_elapsed, timeout_ms=per_engine * 1000.0,
-                count=count
+                count=count, details=_result_diagnostic_details(result)
             )
             events.append(event)
             actual, payload = provider, result
@@ -160,7 +229,8 @@ async def route(operation: str, options, registry: SearchRegistry,
             steps.append(step)
             event = DiagnosticEvent(
                 engine=provider, ok=False, category=operation,
-                elapsed_ms=step_elapsed, count=0, message=step.error
+                elapsed_ms=step_elapsed, count=0, message=step.error,
+                details=_safe_request_diagnostic_details(getattr(e, "details", None)),
             )
             events.append(event)
         except Exception as e:  # 引擎内部未归一的异常也不该让整链崩
@@ -175,7 +245,20 @@ async def route(operation: str, options, registry: SearchRegistry,
 
     if actual is None:
         reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps)
-        raise AllEnginesFailedError(f"All engines failed for {operation}:\n{reasons}")
+        route_elapsed = _elapsed_ms(start)
+        trace = RouteTrace(
+            mode=None,
+            mode_reason="v4_fallback_chain",
+            selected_engines=chain,
+            events=events,
+            elapsed_ms=route_elapsed,
+            timeout_ms=budget * 1000.0,
+            quality=_route_quality(None, chain, steps, False),
+        )
+        raise AllEnginesFailedError(
+            f"All engines failed for {operation}:\n{reasons}",
+            diagnostics=trace,
+        )
 
     route_elapsed = _elapsed_ms(start)
     quality = _route_quality(
@@ -350,7 +433,8 @@ async def _run_engine(registry, name, options, budget):
         step = FallbackStep(name, True, len(res))
         event = DiagnosticEvent(
             engine=name, ok=True, category="search",
-            elapsed_ms=elapsed, timeout_ms=per_engine * 1000.0, count=len(res)
+            elapsed_ms=elapsed, timeout_ms=per_engine * 1000.0, count=len(res),
+            details=_result_diagnostic_details(res)
         )
         return name, res, step, event
     except asyncio.TimeoutError:
@@ -384,7 +468,8 @@ async def _run_engine(registry, name, options, budget):
         step = FallbackStep(name, False, 0, str(e) or type(e).__name__)
         event = DiagnosticEvent(
             engine=name, ok=False, category="search",
-            elapsed_ms=elapsed, count=0, message=step.error
+            elapsed_ms=elapsed, count=0, message=step.error,
+            details=_safe_request_diagnostic_details(getattr(e, "details", None)),
         )
         return name, None, step, event
 
@@ -794,8 +879,18 @@ async def _route_search_v5_execute(
         if not config.recovery_allowed():
             reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
             error_state.terminal = "recovery_blocked"
+            trace = RouteTrace(
+                mode=mode,
+                mode_reason=mode_reason,
+                selected_engines=[step.provider for step in steps],
+                events=events,
+                elapsed_ms=_elapsed_ms(route_start),
+                timeout_ms=budget * 1000.0,
+                quality=_route_quality(mode, engine_names, steps, False),
+            )
             raise AllEnginesFailedError(
-                f"All engines failed for search (mode={mode}) and recovery is blocked in this runtime:\n{reasons}"
+                f"All engines failed for search (mode={mode}) and recovery is blocked in this runtime:\n{reasons}",
+                diagnostics=trace,
             )
         rec_weights = config.MODE_WEIGHTS["recovery"]
         rec_names = config.mode_engines("recovery", getattr(options, "query", "") or "")
@@ -824,7 +919,19 @@ async def _route_search_v5_execute(
     if payload is None:
         reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
         error_state.terminal = "all_engines_failed"
-        raise AllEnginesFailedError(f"All engines failed for search (mode={mode}):\n{reasons}")
+        trace = RouteTrace(
+            mode=mode,
+            mode_reason=mode_reason,
+            selected_engines=[step.provider for step in steps],
+            events=events,
+            elapsed_ms=_elapsed_ms(route_start),
+            timeout_ms=budget * 1000.0,
+            quality=_route_quality(mode, [step.provider for step in steps], steps, False),
+        )
+        raise AllEnginesFailedError(
+            f"All engines failed for search (mode={mode}):\n{reasons}",
+            diagnostics=trace,
+        )
 
     route_elapsed = _elapsed_ms(route_start)
     quality = _route_quality(

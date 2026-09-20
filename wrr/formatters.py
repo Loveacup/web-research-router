@@ -240,6 +240,11 @@ def format_error(operation: str, identifier: str, error: Exception,
     }
     if fallback_chain is not None:
         payload["details"]["fallback_chain"] = _chain_dicts(fallback_chain)
+    diagnostics = getattr(error, "diagnostics", None)
+    if diagnostics is not None:
+        payload["details"]["diagnostics"] = (
+            diagnostics.to_dict() if hasattr(diagnostics, "to_dict") else diagnostics
+        )
     return json.dumps(payload, ensure_ascii=False)
 
 

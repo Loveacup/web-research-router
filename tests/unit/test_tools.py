@@ -7,6 +7,7 @@ from wrr.registry import EngineRegistry, get_registry, default_registry
 from wrr.tools import web_search as ws_mod
 from wrr.tools import web_fetch as wf_mod
 from wrr.tools import web_similar as wsim_mod
+from wrr.errors import EngineError
 
 
 def run(coro):
@@ -40,6 +41,65 @@ def test_handle_web_search_all_fail():
             FakeEngine("searxng", error="down"))
     out = json.loads(run(ws_mod.handle_web_search({"query": "q"})))
     assert "web_search failed" in out["error"]
+
+
+def test_handle_web_search_all_fail_preserves_request_diagnostics():
+    class DiagnosticFailEngine(FakeEngine):
+        async def search(self, options):
+            error = EngineError("community: no completed sources")
+            setattr(error, "details", {
+                "partial": False,
+                "cutoff_reason": "request_deadline",
+                "sources": [{
+                    "source": "twitter",
+                    "outcome": "cutoff",
+                    "token": "nested-secret",
+                }],
+                "stderr": "raw subprocess output",
+                "command": ["opencli", "twitter", "search"],
+                "cookie": "session-secret",
+                "token": "top-level-secret",
+            })
+            raise error
+
+    _inject(ws_mod, DiagnosticFailEngine("community", timeout=20.0))
+    out = json.loads(run(ws_mod.handle_web_search({
+        "query": "q",
+        "provider": "community",
+    })))
+
+    details = out["details"]["diagnostics"]["events"][0]["details"]
+    assert details["partial"] is False
+    assert details["cutoff_reason"] == "request_deadline"
+    assert details["sources"][0]["outcome"] == "cutoff"
+    serialized = json.dumps(out)
+    for secret in ("nested-secret", "raw subprocess output", "opencli",
+                   "session-secret", "top-level-secret"):
+        assert secret not in serialized
+
+
+def test_handle_web_search_recovery_blocked_preserves_safe_diagnostics(monkeypatch):
+    class DiagnosticFailEngine(FakeEngine):
+        async def search(self, options):
+            error = EngineError("community: no completed sources")
+            setattr(error, "details", {
+                "partial": False,
+                "cutoff_reason": "request_deadline",
+                "sources": [{"source": "reddit", "outcome": "timeout"}],
+                "credential": "must-not-leak",
+            })
+            raise error
+
+    monkeypatch.setattr(ws_mod.config, "recovery_allowed", lambda runtime_name=None: False)
+    _inject(ws_mod, DiagnosticFailEngine("community", timeout=20.0))
+    out = json.loads(run(ws_mod.handle_web_search({
+        "query": "q",
+        "provider": "community",
+    })))
+
+    details = out["details"]["diagnostics"]["events"][0]["details"]
+    assert details["sources"][0] == {"source": "reddit", "outcome": "timeout"}
+    assert "must-not-leak" not in json.dumps(out)
 
 
 # ── web_fetch ────────────────────────────────────────────────────────

@@ -73,6 +73,22 @@ def test_cli_failed_json_keeps_exit_one_and_failed_quality(monkeypatch, capsys):
     assert payload["quality"]["independent_source_count"] == 0
 
 
+def test_cli_failed_json_preserves_route_diagnostics(monkeypatch, capsys):
+    trace = RouteTrace(events=[], elapsed_ms=12.0)
+
+    async def fake_run(*_args):
+        raise AllEnginesFailedError("down", diagnostics=trace)
+
+    monkeypatch.setattr(_cli, "_run", fake_run)
+    rc = _cli._dispatch(
+        "search", SearchOptions("q"), None, "q", True, False, format_search,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["diagnostics"] == trace.to_dict()
+
+
 def test_cli_omits_only_empty_additive_provenance(monkeypatch, capsys):
     async def fake_run(*_args):
         item = SearchResult(title="plain", url="https://plain")

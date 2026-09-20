@@ -79,8 +79,17 @@ def summarize_checks(results: List[EngineCheckResult]) -> Dict:
         }
     """
     counts = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
+    status_aliases = {
+        "healthy": "ok",
+        "degraded": "warn",
+        "unhealthy": "fail",
+        "disabled": "skip",
+    }
     for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
+        status = status_aliases.get(r.status, r.status)
+        if status not in counts:
+            status = "fail"
+        counts[status] += 1
 
     # 聚合状态：有 fail 则 fail，有 warn 则 warn，否则 ok
     if counts["fail"] > 0:
@@ -105,8 +114,8 @@ def doctor_exit_code(results: List[EngineCheckResult], *, strict: bool = False) 
         0: 通过（无 fail，或 strict=False 且仅有 warn）
         1: 失败（有 fail，或 strict=True 且有 warn）
     """
-    has_fail = any(r.status == "fail" for r in results)
-    has_warn = any(r.status == "warn" for r in results)
+    has_fail = any(r.status in ("fail", "unhealthy") for r in results)
+    has_warn = any(r.status in ("warn", "degraded") for r in results)
 
     if has_fail:
         return 1

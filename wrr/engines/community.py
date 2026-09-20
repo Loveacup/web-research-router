@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -37,6 +38,60 @@ from ..errors import EngineError
 from ..schemas import SearchOptions, SearchResult, EngineCheckResult
 
 _Scored = Tuple[float, SearchResult]
+
+
+@dataclass(frozen=True)
+class CommunitySourceDiagnostic:
+    """一次 Community 请求内的单子源诊断。"""
+
+    source: str
+    outcome: SourceOutcome
+    elapsed_ms: float
+    items_count: int = 0
+    detail: Optional[str] = None
+    cutoff_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "source": self.source,
+            "outcome": self.outcome.value,
+            "elapsed_ms": round(self.elapsed_ms, 2),
+            "items_count": self.items_count,
+        }
+        if self.detail:
+            payload["detail"] = self.detail
+        if self.cutoff_reason:
+            payload["cutoff_reason"] = self.cutoff_reason
+        return payload
+
+
+class CommunitySearchResults(list):
+    """向后兼容 list，同时携带本请求的逐子源诊断。"""
+
+    def __init__(self, items=(), *, source_diagnostics=(), partial=False,
+                 cutoff_reason=None):
+        super().__init__(items)
+        self.source_diagnostics = list(source_diagnostics)
+        self.partial = bool(partial)
+        self.cutoff_reason = cutoff_reason
+
+
+class CommunitySearchError(EngineError):
+    """Community 整体无结果，但保留本请求逐子源诊断。"""
+
+    def __init__(self, message: str, *, source_diagnostics=(), cutoff_reason=None):
+        super().__init__(message)
+        self.details = {
+            "partial": False,
+            "cutoff_reason": cutoff_reason,
+            "sources": [diagnostic.to_dict() for diagnostic in source_diagnostics],
+        }
+
+
+@dataclass(frozen=True)
+class _SourceExecution:
+    scored: List[_Scored]
+    diagnostic: CommunitySourceDiagnostic
 
 _L30_EN = os.environ.get("WRR_LAST30DAYS_EN") or os.path.expanduser(
     "~/code/last30days-skill/skills/last30days/scripts/last30days.py")
@@ -358,20 +413,27 @@ class CommunityEngine(SearchEngine):
                 "use auto routing or an external web engine with site:v2ex.com"
             )
         now = datetime.now(timezone.utc)
-        gathered = await asyncio.gather(
-            *[self._fetch_source(s, options, now) for s in sources],
-            return_exceptions=True,
-        )
+        gathered, cutoff_reason = await self._collect_sources(sources, options, now)
         merged: List[_Scored] = []
-        for res in gathered:
-            if isinstance(res, Exception) or not res:
-                continue                                  # 各源独立失败
-            merged.extend(res)
+        diagnostics: List[CommunitySourceDiagnostic] = []
+        for execution in gathered:
+            diagnostics.append(execution.diagnostic)
+            merged.extend(execution.scored)
         if not merged:
-            raise EngineError("community: all sources failed or returned no results")
+            raise CommunitySearchError(
+                "community: all sources failed or returned no results",
+                source_diagnostics=diagnostics,
+                cutoff_reason=cutoff_reason,
+            )
         merged.sort(key=lambda t: t[0], reverse=True)
         deduped = deduplicate([sr for _, sr in merged])
-        return deduped[:options.count]
+        partial = any(
+            d.outcome not in (SourceOutcome.READY, SourceOutcome.EMPTY)
+            for d in diagnostics
+        )
+        return CommunitySearchResults(
+            deduped[:options.count], source_diagnostics=diagnostics,
+            partial=partial, cutoff_reason=cutoff_reason)
 
     # ── v5.0：跨子源 RRF 聚合（源内秩 → RRF）+ canonical 去重 ──────────
     async def search_rrf(self, options: SearchOptions) -> List[SearchResult]:
@@ -389,22 +451,32 @@ class CommunityEngine(SearchEngine):
                 "use auto routing or an external web engine with site:v2ex.com"
             )
         now = datetime.now(timezone.utc)
-        gathered = await asyncio.gather(
-            *[self._fetch_source(s, options, now) for s in sources],
-            return_exceptions=True,
-        )
+        gathered, cutoff_reason = await self._collect_sources(sources, options, now)
         per_source: Dict[str, List[SearchResult]] = {}
-        for src, res in zip(sources, gathered):
-            if isinstance(res, Exception) or not res:
-                continue                                  # 各源独立失败隔离
-            ranked = sorted(res, key=lambda t: t[0], reverse=True)   # 源内秩
-            per_source[src] = [sr for _, sr in ranked]
+        diagnostics: List[CommunitySourceDiagnostic] = []
+        for execution in gathered:
+            diagnostics.append(execution.diagnostic)
+            if not execution.scored:
+                continue
+            ranked = sorted(
+                execution.scored, key=lambda t: t[0], reverse=True)  # 源内秩
+            per_source[execution.diagnostic.source] = [sr for _, sr in ranked]
         if not per_source:
-            raise EngineError("community: all sources failed or returned no results")
+            raise CommunitySearchError(
+                "community: all sources failed or returned no results",
+                source_diagnostics=diagnostics,
+                cutoff_reason=cutoff_reason,
+            )
         fused = _fusion.rrf_fuse(per_source, k=config.RRF_K)
         deduped = _fusion.dedup_cluster([f["doc"] for f in fused],
                                         config.COMMUNITY_DEDUP_THRESHOLD)
-        return deduped[:options.count]
+        partial = any(
+            d.outcome not in (SourceOutcome.READY, SourceOutcome.EMPTY)
+            for d in diagnostics
+        )
+        return CommunitySearchResults(
+            deduped[:options.count], source_diagnostics=diagnostics,
+            partial=partial, cutoff_reason=cutoff_reason)
 
     # ── 源选择 ───────────────────────────────────────────────────────
     def _detect_sources(self, query: str) -> List[str]:
@@ -462,29 +534,103 @@ class CommunityEngine(SearchEngine):
         return picked
 
     # ── 单源抓取（适配器分派 + 超时 + 异常隔离）─────────────────────
+    async def _collect_sources(self, sources, options, now):
+        """在请求总截止时间内收集子源，保留已完成结果并取消慢源。"""
+        tasks = {
+            source: asyncio.create_task(
+                self._fetch_source_execution(source, options, now))
+            for source in sources
+        }
+        done, pending = await asyncio.wait(
+            set(tasks.values()), timeout=config.COMMUNITY_TOTAL_TIMEOUT)
+        completed: Dict[str, _SourceExecution] = {}
+        for source, task in tasks.items():
+            if task not in done:
+                continue
+            try:
+                completed[source] = task.result()
+            except Exception as exc:
+                completed[source] = _SourceExecution(
+                    scored=[],
+                    diagnostic=CommunitySourceDiagnostic(
+                        source=source, outcome=SourceOutcome.ERROR,
+                        elapsed_ms=0.0, detail=type(exc).__name__),
+                )
+
+        cutoff_reason = "request_deadline" if pending else None
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for source, task in tasks.items():
+            if task in pending:
+                completed[source] = _SourceExecution(
+                    scored=[],
+                    diagnostic=CommunitySourceDiagnostic(
+                        source=source, outcome=SourceOutcome.CUTOFF,
+                        elapsed_ms=config.COMMUNITY_TOTAL_TIMEOUT * 1000.0,
+                        cutoff_reason="request_deadline"),
+                )
+        return [completed[source] for source in sources], cutoff_reason
+
     async def _fetch_source(self, source: str, options, now) -> List[_Scored]:
+        """向后兼容的裸结果入口；请求聚合使用带诊断版本。"""
+        execution = await self._fetch_source_execution(source, options, now)
+        return execution.scored
+
+    async def _fetch_source_execution(self, source: str, options, now) -> _SourceExecution:
+        started = time.monotonic()
         cfg = COMMUNITY_SOURCES.get(source)
         if not cfg:
-            return []
+            return _SourceExecution(
+                scored=[],
+                diagnostic=CommunitySourceDiagnostic(
+                    source=source, outcome=SourceOutcome.ERROR,
+                    elapsed_ms=0.0, detail="unknown_source"),
+            )
         adapter = _SOURCE_ADAPTERS.get(cfg["kind"])
         if adapter is None:
-            return []
+            return _SourceExecution(
+                scored=[],
+                diagnostic=CommunitySourceDiagnostic(
+                    source=source, outcome=SourceOutcome.ERROR,
+                    elapsed_ms=0.0, detail="adapter_unavailable"),
+            )
         # source-local breaker：冷却窗口内直接跳过（不 probe、不重启任何 daemon）。
         if self._breaker_should_skip(source):
-            return []
+            return _SourceExecution(
+                scored=[],
+                diagnostic=CommunitySourceDiagnostic(
+                    source=source, outcome=SourceOutcome.SKIPPED,
+                    elapsed_ms=0.0, detail="breaker_open"),
+            )
         # H3 refactor: opencli preflight removed from search hot path.
         # Daemon/extension health is checked by health_check() only.
         try:
             result = await self._fetch_via_adapter(adapter, cfg, options)
-        except Exception:
-            return []
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return _SourceExecution(
+                scored=[],
+                diagnostic=CommunitySourceDiagnostic(
+                    source=source, outcome=SourceOutcome.ERROR,
+                    elapsed_ms=(time.monotonic() - started) * 1000.0,
+                    detail=type(exc).__name__),
+            )
         self._breaker_record(source, result.outcome)
         out: List[_Scored] = []
         for it in result.items:
             scored = self._item_to_result(it, source, cfg, now)
             if scored:
                 out.append(scored)
-        return out
+        return _SourceExecution(
+            scored=out,
+            diagnostic=CommunitySourceDiagnostic(
+                source=source, outcome=result.outcome,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                items_count=len(out)),
+        )
 
     async def _fetch_via_adapter(self, adapter, cfg, options) -> SourceFetchResult:
         """统一取回 SourceFetchResult。

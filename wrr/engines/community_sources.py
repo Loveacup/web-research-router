@@ -47,6 +47,14 @@ class SourceOutcome(enum.Enum):
     EMPTY = "empty"
     UNAUTHENTICATED = "unauthenticated"
     SOFT_BLOCKED = "soft_blocked"
+    TIMEOUT = "timeout"
+    BRIDGE_DISCONNECTED = "bridge_disconnected"
+    NETWORK_ERROR = "network_error"
+    PLATFORM_ERROR = "platform_error"
+    SCHEMA_ERROR = "schema_error"
+    ERROR = "error"
+    SKIPPED = "skipped"
+    CUTOFF = "cutoff"
 
 
 @dataclass
@@ -68,6 +76,18 @@ _SOFTBLOCK_MARKERS = (
     "too many requests", "429", "403", "forbidden",
     "soft block", "soft-block", "temporarily blocked", "blocked by",
 )
+_BRIDGE_MARKERS = (
+    "browser_connect", "extension disconnected", "extension not connected",
+    "browser bridge extension not connected", "daemon not running",
+)
+_NETWORK_MARKERS = (
+    "econnreset", "enetunreach", "ehostunreach", "network error",
+    "connection reset", "connection refused", "dns lookup", "timed out",
+)
+_PLATFORM_MARKERS = (
+    "selector not found", "element not found", "page redesign",
+    "unexpected page", "unsupported page layout",
+)
 
 
 def _classify_block(rc: Any, out: str, err: str) -> Optional[SourceOutcome]:
@@ -86,6 +106,24 @@ def _classify_block(rc: Any, out: str, err: str) -> Optional[SourceOutcome]:
         return SourceOutcome.UNAUTHENTICATED
     if any(m in text for m in _SOFTBLOCK_MARKERS):
         return SourceOutcome.SOFT_BLOCKED
+    return None
+
+
+def _classify_failure(rc: Any, out: str, err: str) -> Optional[SourceOutcome]:
+    """把非阻断失败归一为稳定的请求级诊断类别。"""
+    if rc is None:
+        return SourceOutcome.TIMEOUT
+    text = "\n".join(
+        part for part in (err, out if rc != 0 else "") if part
+    ).lower()
+    if any(marker in text for marker in _BRIDGE_MARKERS):
+        return SourceOutcome.BRIDGE_DISCONNECTED
+    if any(marker in text for marker in _NETWORK_MARKERS):
+        return SourceOutcome.NETWORK_ERROR
+    if any(marker in text for marker in _PLATFORM_MARKERS):
+        return SourceOutcome.PLATFORM_ERROR
+    if rc != 0:
+        return SourceOutcome.ERROR
     return None
 
 
@@ -141,6 +179,7 @@ class OpenCliSourceAdapter:
         不再尝试 backup；普通 empty / 失败仍照旧继续 backup。
         """
         commands = [cfg["cli"]] + cfg.get("backup_commands", [])
+        last_failure: Optional[SourceOutcome] = None
         for idx, cli in enumerate(commands):
             is_backup = idx > 0
             if is_backup and not options.query:
@@ -156,11 +195,16 @@ class OpenCliSourceAdapter:
             blocked = _classify_block(rc, out, err)
             if blocked is not None:
                 return SourceFetchResult(items=[], outcome=blocked)  # 立即返回
+            failure = _classify_failure(rc, out, err)
+            if failure is not None:
+                last_failure = failure
+                continue
             if rc != 0 or not out.strip():
                 continue
             try:
                 data = json.loads(out)
             except json.JSONDecodeError:
+                last_failure = SourceOutcome.SCHEMA_ERROR
                 continue
             items = data if isinstance(data, list) else (data.get("results") or data.get("items") or [])
             if not items:
@@ -173,7 +217,8 @@ class OpenCliSourceAdapter:
                 items = await self._enrich_hn_time(items)
             return SourceFetchResult(items=items[:options.count],
                                      outcome=SourceOutcome.READY)
-        return SourceFetchResult(items=[], outcome=SourceOutcome.EMPTY)
+        return SourceFetchResult(
+            items=[], outcome=last_failure or SourceOutcome.EMPTY)
 
     async def _enrich_hn_time(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Best-effort 回填 HN item 的 time 字段（从 Firebase API）。

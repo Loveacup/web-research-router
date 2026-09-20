@@ -1,5 +1,6 @@
 """测试 doctor 基础设施：schemas, runner, summarize, exit_code。"""
 import asyncio
+import json
 import pytest
 
 from wrr.schemas import EngineCheckResult
@@ -191,6 +192,42 @@ def test_summarize_checks_with_fail():
     assert summary["status"] == "fail"
 
 
+def test_summarize_checks_normalizes_runtime_health_statuses():
+    """运行态 degraded/unhealthy 必须进入 warn/fail，不能生成游离计数。"""
+    results = [
+        EngineCheckResult("healthy", "ok", 1, "s1"),
+        EngineCheckResult("slow", "degraded", 2, "s2"),
+        EngineCheckResult("down", "unhealthy", 2, "s3"),
+    ]
+
+    summary = summarize_checks(results)
+
+    assert summary == {
+        "ok": 1,
+        "warn": 1,
+        "fail": 1,
+        "skip": 0,
+        "status": "fail",
+    }
+
+
+def test_doctor_cli_degraded_is_warn_and_not_ok(monkeypatch, capsys):
+    """单引擎 degraded 报告不得显示 status=ok / ok=true。"""
+    from wrr import doctor as doctor_module
+    from wrr._cli import main
+
+    async def fake_run_doctor(*args, **kwargs):
+        return [EngineCheckResult("community", "degraded", 2, "bridge disconnected")]
+
+    monkeypatch.setattr(doctor_module, "run_doctor", fake_run_doctor)
+
+    assert main(["doctor", "--engine", "community", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "warn"
+    assert payload["ok"] is False
+    assert payload["summary"] == {"ok": 0, "warn": 1, "fail": 0, "skip": 0}
+
+
 # ── doctor_exit_code 测试 ──────────────────────────────────────────
 def test_doctor_exit_code_default_ignores_warn():
     """默认模式：warn 不影响退出码（返回 0）。"""
@@ -217,6 +254,15 @@ def test_doctor_exit_code_fail_always_nonzero():
     ]
     assert doctor_exit_code(results) == 1
     assert doctor_exit_code(results, strict=True) == 1
+
+
+def test_doctor_exit_code_normalizes_runtime_health_statuses():
+    degraded = [EngineCheckResult("e1", "degraded", 1, "s1")]
+    unhealthy = [EngineCheckResult("e1", "unhealthy", 1, "s1")]
+
+    assert doctor_exit_code(degraded) == 0
+    assert doctor_exit_code(degraded, strict=True) == 1
+    assert doctor_exit_code(unhealthy) == 1
 
 
 def test_doctor_exit_code_all_ok_returns_zero():

@@ -1,11 +1,13 @@
 """router fallback 控制流单测（对齐执行包 Step4 验收）。"""
 import asyncio
 
+import pytest
+
 from conftest import FakeEngine, mk_results
 from wrr.registry import EngineRegistry
 from wrr.router import route, build_chain
 from wrr.schemas import SearchOptions, ExtractOptions, SimilarOptions
-from wrr.errors import AllEnginesFailedError
+from wrr.errors import AllEnginesFailedError, EngineError
 
 
 def _reg(*engines):
@@ -63,6 +65,28 @@ def test_search_all_fail_raises():
         assert False, "should raise"
     except AllEnginesFailedError:
         pass
+
+
+def test_all_fail_error_retains_engine_request_diagnostics():
+    class DiagnosticFailEngine(FakeEngine):
+        async def search(self, options):
+            error = EngineError("community: no completed sources")
+            error.details = {
+                "partial": False,
+                "cutoff_reason": "request_deadline",
+                "sources": [{"source": "twitter", "outcome": "cutoff"}],
+            }
+            raise error
+
+    reg = _reg(DiagnosticFailEngine("community", timeout=20.0))
+    with pytest.raises(AllEnginesFailedError) as caught:
+        run(route(
+            "search", SearchOptions("q", provider="community"), reg,
+            explicit_provider="community"))
+
+    event = caught.value.diagnostics.events[0]
+    assert event.details["cutoff_reason"] == "request_deadline"
+    assert event.details["sources"][0]["outcome"] == "cutoff"
 
 
 def test_explicit_provider_disables_fallback():
@@ -155,6 +179,40 @@ def test_route_success_includes_diagnostics():
     assert rr.diagnostics.events[0].engine == "exa"
     assert rr.diagnostics.events[0].ok is True
     assert rr.diagnostics.events[0].count == 2
+
+
+def test_route_preserves_community_subsource_diagnostics():
+    """Community 的请求级逐源诊断必须进入公开 RouteTrace。"""
+    from wrr.engines.community import (
+        CommunitySearchResults, CommunitySourceDiagnostic,
+    )
+    from wrr.engines.community_sources import SourceOutcome
+
+    payload = CommunitySearchResults(
+        mk_results(1),
+        source_diagnostics=[
+            CommunitySourceDiagnostic(
+                "reddit", SourceOutcome.READY, 12.5, items_count=1),
+            CommunitySourceDiagnostic(
+                "twitter", SourceOutcome.CUTOFF, 20.0,
+                cutoff_reason="request_deadline"),
+        ],
+        partial=True,
+        cutoff_reason="request_deadline",
+    )
+    reg = _reg(FakeEngine("community", search_results=payload, timeout=20.0))
+
+    rr = run(route(
+        "search", SearchOptions("q", provider="community"), reg,
+        explicit_provider="community"))
+
+    event = rr.diagnostics.events[0]
+    assert event.details == {
+        "partial": True,
+        "cutoff_reason": "request_deadline",
+        "sources": [d.to_dict() for d in payload.source_diagnostics],
+    }
+    assert event.to_dict()["details"]["sources"][1]["outcome"] == "cutoff"
 
 
 def test_route_fallback_includes_all_events():
