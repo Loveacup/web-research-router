@@ -19,6 +19,7 @@ async def execute_web_search(
     decision_evidence_version=1,
     stage_s_enabled=None,
     decision_evidence_sink=None,
+    request_key=None,
 ) -> str:
     """显式依赖执行 seam：调用方注入 registry / Stage S 依赖，复用解析·format·error 逻辑。
 
@@ -43,6 +44,8 @@ async def execute_web_search(
         evidence_kwargs["decision_context_observation"] = decision_context_observation
     if decision_evidence_version != 1:
         evidence_kwargs["decision_evidence_version"] = decision_evidence_version
+    if request_key is not None:
+        evidence_kwargs["request_key"] = request_key
     try:
         result = await route_search_v5(
             options,

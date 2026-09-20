@@ -965,6 +965,7 @@ async def route_search_v5(
     stage_s_enabled: Optional[bool] = None,
     decision_evidence_version: int = 1,
     decision_evidence_sink: "Optional[DecisionEvidenceSink]" = None,
+    request_key: Optional[str] = None,
 ) -> RouterResult:
     """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
 
@@ -979,6 +980,8 @@ async def route_search_v5(
     且在触碰 registry factory 之前抛出。
     ``decision_evidence_version=2`` 仅在 exact、原子一致的 observation 可用时
     投影 v2；缺失/partial/incoherent observation 回退 v1，避免半启用。
+    ``request_key`` 允许 composition 层注入 canonical request identity；仅当值为
+    ``None`` 时才保留既有 UUIDv4 fallback。Stage S OFF 不消费该值。
     """
     decision_context_observation = _normalize_decision_context_observation(
         decision_context_observation
@@ -1009,12 +1012,14 @@ async def route_search_v5(
             options, registry, plan, None, route_start, _ExecErrorState()
         )
 
-    # Stage S ON：best-effort mint request key，再把 plan + shadow comparison +
-    # execution 一并包进单一 try。UUID 失败只关闭本请求 evidence，不影响 legacy。
-    try:
-        request_key: Optional[str] = str(_uuid.uuid4())
-    except Exception:
-        request_key = None
+    # Stage S ON：composition 可显式注入 request identity；旧 caller 仍 best-effort
+    # mint UUIDv4。显式值不重 mint、不规范化；非法值由 evidence schema 拒绝并按
+    # 既有 fail-open 语义仅关闭本请求 evidence，不影响 legacy 用户结果。
+    if request_key is None:
+        try:
+            request_key = str(_uuid.uuid4())
+        except Exception:
+            request_key = None
     error_state = _ExecErrorState()
     plan: Optional[DecisionSnapshot] = None
     shadow_comparison = None

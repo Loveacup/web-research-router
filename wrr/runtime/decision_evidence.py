@@ -34,16 +34,16 @@ _REGISTRY_LOCK = threading.Lock()
 
 @runtime_checkable
 class DecisionEvidenceSink(Protocol):
-    """Accepts one immutable decision evidence record; must never raise."""
+    """Accepts one immutable record; returns persistence success and never raises."""
 
-    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> None: ...
+    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> bool: ...
 
 
 class NoopDecisionEvidenceSink:
     """Discards every record. The safe default when persistence is disabled."""
 
-    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> None:  # noqa: D401 - trivial
-        return None
+    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> bool:  # noqa: D401 - trivial
+        return False
 
 
 def decision_evidence_path(
@@ -104,18 +104,19 @@ class JsonlDecisionEvidenceSink:
     def path(self) -> Path:
         return self._path
 
-    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> None:
+    def record(self, evidence: DecisionEvidence | DecisionEvidenceV2) -> bool:
         try:
             line = json.dumps(
                 _whitelist_record(evidence), ensure_ascii=False, sort_keys=True
             )
             payload = (line + "\n").encode("utf-8")
         except Exception:
-            return
+            return False
         try:
             self._append(payload)
         except Exception:
-            return
+            return False
+        return True
 
     def _append(self, payload: bytes) -> None:
         canonical = os.path.abspath(str(self._path))

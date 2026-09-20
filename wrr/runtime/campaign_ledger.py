@@ -29,9 +29,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,6 +54,24 @@ _FAULT_CAPACITY_EXHAUSTED = "capacity_exhausted"
 _FAULT_DUPLICATE_REQUEST_KEY = "duplicate_request_key"
 _FAULT_UNKNOWN_TOKEN = "unknown_token"
 _FAULT_REQUEST_KEY_MISMATCH = "request_key_mismatch"
+_EXTERNAL_FAULT_REASONS = frozenset({
+    "identity_mint_failed",
+    "admission_failed",
+    "evidence_finish_failed",
+    "admission_drop_failed",
+    "downstream_evidence_failed",
+})
+
+
+def _synchronized(method):
+    """Serialize one shared ledger connection across request threads."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 class CampaignLedgerError(RuntimeError):
@@ -227,6 +247,7 @@ class CampaignLedger:
         declaration: Optional[CampaignDeclaration],
         reopened: bool,
     ) -> None:
+        self._lock = threading.RLock()
         self._conn = conn
         self._campaign_id = campaign_id
         self._epoch = epoch
@@ -234,6 +255,7 @@ class CampaignLedger:
         self._declaration = declaration
         self._reopened = reopened
         self._closed = False
+        self._runtime_faulted = False
         self._final_status: Optional[str] = None
 
     # ── construction ────────────────────────────────────────────────────
@@ -269,7 +291,9 @@ class CampaignLedger:
 
         target = Path(path).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(target), isolation_level=None)
+        conn = sqlite3.connect(
+            str(target), isolation_level=None, check_same_thread=False,
+        )
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=FULL")
@@ -408,6 +432,11 @@ class CampaignLedger:
     def closed(self) -> bool:
         return self._closed
 
+    def terminal_guard(self):
+        """Serialize finish plus downstream persistence against close()."""
+        return self._lock
+
+    @_synchronized
     def sqlite_pragmas(self) -> dict[str, Any]:
         """Return the live connection's durability-relevant PRAGMA state."""
         self._require_live()
@@ -417,6 +446,16 @@ class CampaignLedger:
 
     # ── admission mutations ─────────────────────────────────────────────
 
+    @_synchronized
+    def record_fault(self, reason: str) -> None:
+        """Durably poison a live campaign for a composition-layer fault."""
+        self._require_writable()
+        if reason not in _EXTERNAL_FAULT_REASONS:
+            raise ValueError("unsupported external campaign fault reason")
+        self._runtime_faulted = True
+        self._record_fault(reason)
+
+    @_synchronized
     def begin(self, request_key: str) -> Admission:
         """Admit ``request_key``, committing a monotonic seq and unique token."""
         self._require_writable()
@@ -453,6 +492,27 @@ class CampaignLedger:
             raise
         return Admission(seq=seq, token=token, request_key=request_key)
 
+    @_synchronized
+    def begin_or_fault(self, request_key: str) -> Admission:
+        """Admit, atomically poisoning the campaign before any failure escapes."""
+        try:
+            return self.begin(request_key)
+        except (
+            CampaignClosed,
+            CampaignReopened,
+            CapacityExhausted,
+            DuplicateRequestKey,
+        ):
+            raise
+        except BaseException:
+            self._runtime_faulted = True
+            try:
+                self._record_fault("admission_failed")
+            except BaseException:
+                pass
+            raise
+
+    @_synchronized
     def finish(self, token: str, evidence: DecisionEvidenceV2) -> None:
         """Atomically persist the exact v2 whitelist for a pending ``token``."""
         self._require_writable()
@@ -500,6 +560,7 @@ class CampaignLedger:
             self._conn.execute("ROLLBACK")
             raise
 
+    @_synchronized
     def drop(self, token: str) -> None:
         """Abandon a pending admission, leaving the campaign non-clean."""
         self._require_writable()
@@ -525,6 +586,7 @@ class CampaignLedger:
 
     # ── read paths ──────────────────────────────────────────────────────
 
+    @_synchronized
     def inspect(self) -> CampaignSnapshot:
         """Return the current campaign counters."""
         self._require_live()
@@ -548,6 +610,7 @@ class CampaignLedger:
             faults=faults,
         )
 
+    @_synchronized
     def export(self) -> list[dict[str, Any]]:
         """Return the finished admissions with their persisted v2 whitelist."""
         self._require_live()
@@ -565,6 +628,7 @@ class CampaignLedger:
             for seq, request_key, evidence in rows
         ]
 
+    @_synchronized
     def facts(self) -> CampaignFacts:
         """Reconstruct the durable :class:`CampaignFacts` from committed rows.
 
@@ -643,6 +707,7 @@ class CampaignLedger:
 
     # ── teardown ────────────────────────────────────────────────────────
 
+    @_synchronized
     def close(self) -> str:
         """Finalize the campaign and return its terminal ``clean``/``dirty``.
 
@@ -666,6 +731,7 @@ class CampaignLedger:
                 and facts.dropped_count == 0
                 and facts.fault_count == 0
                 and facts.sequence_gaps == 0
+                and not self._runtime_faulted
             )
             status = _STATUS_CLEAN if clean else _STATUS_DIRTY
             self._conn.execute("BEGIN IMMEDIATE")
@@ -705,6 +771,7 @@ class CampaignLedger:
         of ``duplicate_request_key`` rows), and ``meta.fault_count`` is bumped in
         the same transaction so the two can never drift.
         """
+        self._runtime_faulted = True
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self._conn.execute(

@@ -9,7 +9,11 @@ clean. Duplicate request_key/token and capacity exhaustion fail closed.
 """
 from __future__ import annotations
 
+import importlib.util
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -283,6 +287,148 @@ def test_capacity_exhausted_fails_closed_and_poisons(tmp_path):
             ledger.close()
 
 
+def test_explicit_runtime_fault_is_durable_and_forces_dirty_close(tmp_path):
+    ledger = _open(tmp_path)
+    ledger.record_fault("identity_mint_failed")
+
+    assert ledger.inspect().faults == 1
+    assert ledger.facts().fault_count == 1
+    assert ledger.close() == "dirty"
+
+
+def test_unpersisted_runtime_fault_still_prevents_clean_close(tmp_path, monkeypatch):
+    ledger = _open(tmp_path)
+
+    def fail_persistence(_reason):
+        raise sqlite3.OperationalError("injected fault persistence failure")
+
+    monkeypatch.setattr(ledger, "_record_fault", fail_persistence)
+    with pytest.raises(sqlite3.OperationalError):
+        ledger.record_fault("admission_failed")
+
+    assert ledger.close() == "dirty"
+
+
+def test_shared_ledger_serializes_cross_thread_admissions(tmp_path):
+    ledger = _open(tmp_path, capacity=2)
+    keys = (
+        "31313131-3131-4131-8131-313131313131",
+        "32323232-3232-4232-8232-323232323232",
+    )
+
+    def admit_and_finish(key):
+        admission = ledger.begin(key)
+        ledger.finish(admission.token, _v2(key))
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(admit_and_finish, keys))
+        snapshot = ledger.inspect()
+        assert (snapshot.pending, snapshot.finished, snapshot.faults) == (0, 2, 0)
+        assert ledger.close() == "clean"
+    finally:
+        if not ledger.closed:
+            ledger.close()
+
+
+def test_begin_or_fault_blocks_close_until_failure_is_poisoned(
+    tmp_path, monkeypatch,
+):
+    ledger = _open(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    close_result = []
+
+    def fail_begin(_request_key):
+        entered.set()
+        assert release.wait(5)
+        raise sqlite3.OperationalError("injected admission failure")
+
+    monkeypatch.setattr(ledger, "begin", fail_begin)
+
+    def attempt():
+        with pytest.raises(sqlite3.OperationalError):
+            ledger.begin_or_fault("41414141-4141-4141-8141-414141414141")
+
+    worker = threading.Thread(target=attempt)
+    closer = threading.Thread(target=lambda: close_result.append(ledger.close()))
+    worker.start()
+    assert entered.wait(5)
+    closer.start()
+    assert closer.is_alive()  # close cannot certify while admission is unresolved
+    release.set()
+    worker.join(5)
+    closer.join(5)
+
+    assert close_result == ["dirty"]
+    reopened = _open(tmp_path)
+    try:
+        reopened_facts = reopened.facts()
+        assert reopened_facts.fault_count == 1
+        assert reopened_facts.session_closed_cleanly is False
+        assert reopened.close() == "dirty"
+    finally:
+        if not reopened.closed:
+            reopened.close()
+
+
+def test_terminal_sink_failure_blocks_close_then_forces_dirty(tmp_path):
+    plugin_path = Path(__file__).resolve().parents[2] / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "wrr_plugin_terminal_guard_test",
+        plugin_path,
+        submodule_search_locations=[str(plugin_path.parent)],
+    )
+    assert spec is not None and spec.loader is not None
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+
+    ledger = _open(tmp_path)
+    key = "51515151-5151-4151-8151-515151515151"
+    admission = ledger.begin(key)
+    downstream_entered = threading.Event()
+    release_downstream = threading.Event()
+    close_result: list[str] = []
+    writer_errors: list[Exception] = []
+
+    class FailingDownstream:
+        def record(self, evidence):
+            downstream_entered.set()
+            assert release_downstream.wait(5)
+            return False
+
+    sink = plugin._CampaignEvidenceSink(ledger, admission, FailingDownstream())
+
+    def write_terminal_evidence():
+        try:
+            sink.record(_v2(key))
+        except Exception as exc:  # expected: downstream persistence reported false
+            writer_errors.append(exc)
+
+    writer = threading.Thread(target=write_terminal_evidence)
+    writer.start()
+    assert downstream_entered.wait(5)
+
+    closer = threading.Thread(target=lambda: close_result.append(ledger.close()))
+    closer.start()
+    closer.join(0.1)
+    assert closer.is_alive(), "close must wait for terminal evidence persistence"
+
+    release_downstream.set()
+    writer.join(5)
+    closer.join(5)
+
+    assert len(writer_errors) == 1
+    assert close_result == ["dirty"]
+    reopened = _open(tmp_path)
+    try:
+        facts = reopened.facts()
+        assert facts.fault_count == 1
+        assert facts.session_closed_cleanly is False
+    finally:
+        reopened.close()
+
+
 # ── clean vs dirty close ────────────────────────────────────────────────
 
 
@@ -309,6 +455,23 @@ def test_operations_after_close_fail(tmp_path):
 
 
 # ── reopen semantics ────────────────────────────────────────────────────
+
+
+def test_begin_or_fault_preserves_clean_reopened_ledger_read_only(tmp_path):
+    owner = _open(tmp_path)
+    assert owner.close() == "clean"
+
+    reopened = _open(tmp_path)
+    before = reopened.facts()
+    try:
+        with pytest.raises(CampaignReopened):
+            reopened.begin_or_fault("51515151-5151-4151-8151-515151515151")
+        after = reopened.facts()
+        assert after == before
+        assert reopened.close() == "clean"
+    finally:
+        if not reopened.closed:
+            reopened.close()
 
 
 def test_reopen_open_campaign_is_inspect_export_only(tmp_path):

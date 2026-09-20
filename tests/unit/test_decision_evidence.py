@@ -377,7 +377,7 @@ def test_append_zero_progress_raises_but_record_swallows(tmp_path, monkeypatch):
         sink._append(b"payload\n")
 
     # Public record() still swallows the failure and returns without hanging.
-    sink.record(_mk_evidence())
+    assert sink.record(_mk_evidence()) is False
 
 
 # ── Path resolution ──────────────────────────────────────────────────
@@ -397,7 +397,7 @@ def test_override_path_env(tmp_path):
 def test_noop_sink_writes_nothing(tmp_path):
     sink = NoopDecisionEvidenceSink()
     assert isinstance(sink, DecisionEvidenceSink)
-    sink.record(_mk_evidence())
+    assert sink.record(_mk_evidence()) is False
     # No file, no error.
     assert list(tmp_path.iterdir()) == []
 
@@ -407,8 +407,8 @@ def test_jsonl_single_line_append(tmp_path):
     path = tmp_path / "evi.jsonl"
     sink = JsonlDecisionEvidenceSink(path)
     assert isinstance(sink, DecisionEvidenceSink)
-    sink.record(_mk_evidence(result_count=3))
-    sink.record(_mk_evidence(result_count=5))
+    assert sink.record(_mk_evidence(result_count=3)) is True
+    assert sink.record(_mk_evidence(result_count=5)) is True
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
     first = json.loads(lines[0])
@@ -454,7 +454,7 @@ def test_jsonl_write_failure_is_swallowed(tmp_path):
     blocker.write_text("x", encoding="utf-8")
     path = blocker / "sub" / "evi.jsonl"
     sink = JsonlDecisionEvidenceSink(path)
-    sink.record(_mk_evidence())  # must not raise
+    assert sink.record(_mk_evidence()) is False  # must not raise
     assert not path.exists()
 
 

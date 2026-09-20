@@ -303,6 +303,32 @@ def test_execute_web_search_forwards_atomic_observation_and_version(monkeypatch)
     assert calls[0][1]["stage_s_enabled"] is True
 
 
+def test_execute_web_search_forwards_explicit_request_key(monkeypatch):
+    import wrr.tools.web_search as ws
+
+    request_key = "12345678-1234-4234-8234-123456789abc"
+    calls = []
+
+    async def route(options, registry, **kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(ws, "route_search_v5", route)
+    monkeypatch.setattr(ws, "format_search", lambda _result, _query: "OK")
+
+    out = asyncio.run(ws.execute_web_search(
+        {"query": "identity"}, registry=object(), request_key=request_key,
+    ))
+
+    assert out == "OK"
+    assert calls == [{
+        "decision_context": None,
+        "stage_s_enabled": None,
+        "decision_evidence_sink": None,
+        "request_key": request_key,
+    }]
+
+
 def test_handle_web_search_defaults_to_get_registry_and_legacy(monkeypatch):
     """兼容入口默认 get_registry()，不注入 Stage S 依赖（context None / stage None）。"""
     import wrr.tools.web_search as ws
@@ -435,12 +461,13 @@ def _install_exec_spy(monkeypatch):
     exec_calls = []
     async def _fake_exec(args, *, registry, decision_context=None, stage_s_enabled=None,
                          decision_evidence_sink=None, decision_context_observation=None,
-                         decision_evidence_version=1):
+                         decision_evidence_version=1, request_key=None):
         exec_calls.append({"registry": registry, "decision_context": decision_context,
                            "decision_context_observation": decision_context_observation,
                            "decision_evidence_version": decision_evidence_version,
                            "stage_s_enabled": stage_s_enabled,
-                           "decision_evidence_sink": decision_evidence_sink})
+                           "decision_evidence_sink": decision_evidence_sink,
+                           "request_key": request_key})
         return "OK"
     monkeypatch.setattr(ws, "execute_web_search", _fake_exec)
     return exec_calls
@@ -577,6 +604,10 @@ def test_bound_handler_cold_passes_none_and_stage_s_true(monkeypatch):
     assert exec_calls[-1]["decision_evidence_version"] == 2
     assert exec_calls[-1]["registry"] is _SENTINEL_REGISTRY
     assert exec_calls[-1]["stage_s_enabled"] is True
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        exec_calls[-1]["request_key"],
+    )
 
 
 def test_bound_handler_warm_passes_context_and_stage_s_true(monkeypatch):
@@ -607,6 +638,249 @@ def test_bound_handler_warm_passes_context_and_stage_s_true(monkeypatch):
     assert exec_calls[-1]["decision_evidence_version"] == 2
     assert exec_calls[-1]["registry"] is _SENTINEL_REGISTRY
     assert exec_calls[-1]["stage_s_enabled"] is True
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        exec_calls[-1]["request_key"],
+    )
+
+
+def test_campaign_begin_precedes_execute_and_same_key_finishes(monkeypatch):
+    import wrr.runtime.decision_evidence as de
+    import wrr.tools.web_search as ws
+
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    events = []
+
+    class Ledger:
+        def begin(self, request_key):
+            events.append(("begin", request_key))
+            return SimpleNamespace(token="admission-token", request_key=request_key)
+
+        def finish(self, token, evidence):
+            events.append(("finish", token, evidence.request_key))
+
+        def drop(self, token):
+            events.append(("drop", token))
+
+    class DownstreamSink:
+        def record(self, evidence):
+            events.append(("downstream", evidence.request_key))
+
+    monkeypatch.setattr(de, "JsonlDecisionEvidenceSink", DownstreamSink)
+
+    async def execute(args, *, request_key, decision_evidence_sink, **_kwargs):
+        events.append(("execute", request_key))
+        assert events[0] == ("begin", request_key)
+        decision_evidence_sink.record(SimpleNamespace(request_key=request_key))
+        return "OK"
+
+    monkeypatch.setattr(ws, "execute_web_search", execute)
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "campaign"}))
+
+    assert out == "OK"
+    assert [event[0] for event in events] == [
+        "begin", "execute", "finish", "downstream",
+    ]
+    assert events[0][1] == events[1][1] == events[2][2] == events[3][1]
+
+
+def test_identity_mint_failure_keeps_search_alive_and_poisons_campaign(monkeypatch):
+    created, _ = _install_register_fakes(
+        monkeypatch, snapshot=None, refresh_result=_RAISE,
+    )
+    exec_calls = _install_exec_spy(monkeypatch)
+    faults = []
+
+    class Ledger:
+        def record_fault(self, reason):
+            faults.append(reason)
+
+        def begin(self, _request_key):
+            raise AssertionError("identity failure must not admit a request")
+
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    def fail_uuid():
+        raise OSError("injected UUID failure")
+
+    monkeypatch.setattr(mod.uuid, "uuid4", fail_uuid)
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "still route"}))
+
+    assert out == "OK"
+    assert created[0].observe_calls == 1
+    assert faults == ["identity_mint_failed"]
+    assert exec_calls[-1]["request_key"] is None
+    assert exec_calls[-1]["stage_s_enabled"] is True
+
+
+def test_admission_failure_keeps_search_alive_and_poisons_campaign(monkeypatch):
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    exec_calls = _install_exec_spy(monkeypatch)
+    faults = []
+
+    class Ledger:
+        def begin(self, _request_key):
+            raise RuntimeError("injected admission failure")
+
+        def record_fault(self, reason):
+            faults.append(reason)
+
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "still route"}))
+
+    assert out == "OK"
+    assert faults == ["admission_failed"]
+    assert exec_calls[-1]["request_key"] is not None
+    assert exec_calls[-1]["stage_s_enabled"] is True
+
+
+def test_atomic_admission_failure_is_not_double_counted(monkeypatch):
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    _install_exec_spy(monkeypatch)
+    events = []
+
+    class Ledger:
+        def begin(self, _request_key):
+            raise AssertionError("atomic API must be preferred")
+
+        def begin_or_fault(self, _request_key):
+            events.append("atomic_fault")
+            raise RuntimeError("already poisoned atomically")
+
+        def record_fault(self, reason):
+            events.append(reason)
+
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "still route"}))
+
+    assert out == "OK"
+    assert events == ["atomic_fault"]
+
+
+def test_finish_failure_reaches_downstream_then_drops_and_poisons(monkeypatch):
+    import wrr.runtime.decision_evidence as de
+    import wrr.tools.web_search as ws
+
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    events = []
+
+    class Ledger:
+        def begin(self, request_key):
+            return SimpleNamespace(token="token", request_key=request_key)
+
+        def finish(self, _token, _evidence):
+            events.append("finish")
+            raise RuntimeError("injected finish failure")
+
+        def drop(self, _token):
+            events.append("drop")
+
+        def record_fault(self, reason):
+            events.append(reason)
+
+    class DownstreamSink:
+        def record(self, _evidence):
+            events.append("downstream")
+
+    monkeypatch.setattr(de, "JsonlDecisionEvidenceSink", DownstreamSink)
+
+    async def execute(args, *, request_key, decision_evidence_sink, **_kwargs):
+        try:
+            decision_evidence_sink.record(SimpleNamespace(request_key=request_key))
+        except RuntimeError:
+            pass  # mirrors router._safe_record fail-open behavior
+        return "OK"
+
+    monkeypatch.setattr(ws, "execute_web_search", execute)
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "finish"}))
+
+    assert out == "OK"
+    assert events == ["finish", "evidence_finish_failed", "downstream", "drop"]
+
+
+def test_missing_evidence_drop_failure_poisons_without_breaking_search(monkeypatch):
+    import wrr.tools.web_search as ws
+
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    events = []
+
+    class Ledger:
+        def begin(self, request_key):
+            return SimpleNamespace(token="token", request_key=request_key)
+
+        def drop(self, _token):
+            events.append("drop")
+            raise RuntimeError("injected drop failure")
+
+        def record_fault(self, reason):
+            events.append(reason)
+
+    async def execute(_args, **_kwargs):
+        return "OK"  # no evidence was recorded
+
+    monkeypatch.setattr(ws, "execute_web_search", execute)
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "missing"}))
+
+    assert out == "OK"
+    assert events == ["drop", "admission_drop_failed"]
+
+
+def test_downstream_failure_after_finish_poisons_without_breaking_search(monkeypatch):
+    import wrr.runtime.decision_evidence as de
+    import wrr.tools.web_search as ws
+
+    _install_register_fakes(monkeypatch, snapshot=None, refresh_result=_RAISE)
+    events = []
+
+    class Ledger:
+        def begin(self, request_key):
+            return SimpleNamespace(token="token", request_key=request_key)
+
+        def finish(self, _token, _evidence):
+            events.append("finish")
+
+        def drop(self, _token):
+            events.append("drop")
+
+        def record_fault(self, reason):
+            events.append(reason)
+
+    class DownstreamSink:
+        def record(self, _evidence):
+            events.append("downstream")
+            raise OSError("injected JSONL failure")
+
+    monkeypatch.setattr(de, "JsonlDecisionEvidenceSink", DownstreamSink)
+
+    async def execute(args, *, request_key, decision_evidence_sink, **_kwargs):
+        try:
+            decision_evidence_sink.record(SimpleNamespace(request_key=request_key))
+        except OSError:
+            pass
+        return "OK"
+
+    monkeypatch.setattr(ws, "execute_web_search", execute)
+    mod, ctx = _load_entry(), MockCtx()
+    mod.register(ctx, campaign_ledger=Ledger())
+
+    out = asyncio.run(ctx.tools["web_search"]["handler"]({"query": "downstream"}))
+
+    assert out == "OK"
+    assert events == ["finish", "downstream", "downstream_evidence_failed"]
 
 
 def test_register_hook_returns_none(monkeypatch):
@@ -646,6 +920,7 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
     import wrr.runtime.decision_context_provider as providers
     import wrr.runtime.decision_evidence as evidence
     from wrr.evidence_gate import evaluate_jsonl
+    from wrr.runtime.campaign_ledger import CampaignLedger
 
     registry = registry_mod.EngineRegistry()
     searches = []
@@ -694,6 +969,10 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
     monkeypatch.setattr(router, "_route_registry", forbidden_registry)
 
     mod, ctx = _load_entry(), MockCtx()
+    ledger_path = tmp_path / "campaign.db"
+    ledger = CampaignLedger.open(
+        ledger_path, campaign_id="plugin-real-join", capacity=3,
+    )
     # Exercise the handler during registration, before eager activation publishes.
     # The provider itself, router, formatter and sink are not mocked.
     def register_hook(event, handler):
@@ -702,7 +981,7 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
         asyncio.run(ctx.tools["web_search"]["handler"]({"query": "atomic", "mode": "grounding"}))
         assert builds == []  # cold handler cannot refresh
     ctx.register_hook = register_hook
-    mod.register(ctx)
+    mod.register(ctx, campaign_ledger=ledger)
     provider = created[0]
     good = provider.observe()
     assert good.status == "available"
@@ -730,6 +1009,29 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
     assert [row["comparison_status"] for row in rows] == ["context_unavailable", "compared", "compared"]
     assert all("actual_provider" not in row and "query" not in row for row in rows)
     assert rows[1]["shadow_comparison"]["code"] == "E0"
+    facts = ledger.facts()
+    persisted = ledger.export()
+    assert facts.attempts_started == facts.persisted_evidence_count == 3
+    assert facts.fault_count == facts.dropped_count == facts.unresolved_count == 0
+    assert facts.request_keys == tuple(row["request_key"] for row in rows)
+    assert [row["request_key"] for row in persisted] == [
+        row["request_key"] for row in rows
+    ]
+    assert ledger.close() == "clean"
+
+    def fail_uuid():
+        raise OSError("injected UUID failure")
+
+    monkeypatch.setattr(mod.uuid, "uuid4", fail_uuid)
+    assert asyncio.run(handler({"query": "atomic", "mode": "grounding"}))
+    assert len(searches) == 8
+
+    reopened = CampaignLedger.open(ledger_path, campaign_id="plugin-real-join")
+    try:
+        assert reopened.facts().session_closed_cleanly is True
+        assert reopened.export() == persisted
+    finally:
+        reopened.close()
     report = evaluate_jsonl(lines, requested_modes=("grounding",)).to_dict()
     assert report["input"]["valid_rows"] == 3
     assert report["input"]["invalid_rows"] == 0

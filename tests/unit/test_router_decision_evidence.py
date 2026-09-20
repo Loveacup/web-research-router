@@ -902,6 +902,102 @@ def test_uuid_failure_only_disables_evidence(monkeypatch):
     assert sink.records == []
 
 
+# ── D7-S1 explicit request identity seam ─────────────────────────────
+def test_explicit_request_key_is_reused_for_success_without_remint(monkeypatch):
+    request_key = "12345678-1234-4234-8234-123456789abc"
+
+    def fail_uuid():
+        raise AssertionError("explicit request identity must not be minted again")
+
+    monkeypatch.setattr("wrr.router._uuid.uuid4", fail_uuid)
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        stage_s_enabled=True,
+        request_key=request_key,
+        decision_evidence_sink=sink,
+    ))
+
+    evidence = result.diagnostics.decision_evidence
+    assert evidence.request_key == request_key
+    assert sink.records == [evidence]
+
+
+def test_explicit_request_key_is_reused_for_error_without_remint(monkeypatch):
+    request_key = "12345678-1234-4234-8234-123456789abc"
+    boom = RuntimeError("dispatch boom")
+
+    def fail_uuid():
+        raise AssertionError("explicit request identity must not be minted again")
+
+    async def fake_dispatch(*_args, **_kwargs):
+        raise boom
+
+    monkeypatch.setattr("wrr.router._uuid.uuid4", fail_uuid)
+    monkeypatch.setattr("wrr.router._dispatch", fake_dispatch)
+    sink = SpySink()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run(route_search_v5(
+            SearchOptions("what is python", count=5),
+            _full_reg(),
+            stage_s_enabled=True,
+            request_key=request_key,
+            decision_evidence_sink=sink,
+        ))
+
+    assert excinfo.value is boom
+    assert len(sink.records) == 1
+    assert sink.records[0].request_key == request_key
+    assert sink.records[0].terminal == "execution_error"
+
+
+def test_stage_s_off_ignores_explicit_request_key(monkeypatch):
+    def fail_uuid():
+        raise AssertionError("Stage S OFF must not mint request identity")
+
+    monkeypatch.setattr("wrr.router._uuid.uuid4", fail_uuid)
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        stage_s_enabled=False,
+        request_key="12345678-1234-4234-8234-123456789abc",
+        decision_evidence_sink=sink,
+    ))
+
+    assert result.payload
+    assert result.diagnostics.decision_evidence is None
+    assert sink.records == []
+
+
+def test_explicit_none_request_key_keeps_uuid_fallback(monkeypatch):
+    minted = uuid.UUID("12345678-1234-4234-8234-123456789abc")
+    calls = []
+
+    def mint_uuid():
+        calls.append(True)
+        return minted
+
+    monkeypatch.setattr("wrr.router._uuid.uuid4", mint_uuid)
+    sink = SpySink()
+
+    result = run(route_search_v5(
+        SearchOptions("what is python", count=5),
+        _full_reg(),
+        stage_s_enabled=True,
+        request_key=None,
+        decision_evidence_sink=sink,
+    ))
+
+    assert calls == [True]
+    assert result.diagnostics.decision_evidence.request_key == str(minted)
+    assert sink.records == [result.diagnostics.decision_evidence]
+
+
 # ── expected all-fail exceptions carry NO injected metadata on the object ─────
 def test_recovery_blocked_exception_has_no_injected_metadata(monkeypatch):
     monkeypatch.setattr("wrr.router.config.recovery_allowed", lambda *a, **k: False)

@@ -8,6 +8,9 @@ wrr.doctor / wrr.engines.loader），所有重依赖在 ``register(ctx)`` 内部
 import logging
 import threading
 import time
+import uuid
+from contextlib import nullcontext
+from typing import ContextManager, cast
 
 __version__ = "6.1.1"
 
@@ -182,7 +185,67 @@ _SIMILAR_SCHEMA = {
 }
 
 
-def register(ctx) -> None:
+class _CampaignEvidenceSink:
+    """Request-local sink that joins one admission to its v2 evidence."""
+
+    def __init__(self, ledger, admission, downstream):
+        self._ledger = ledger
+        self._admission = admission
+        self._downstream = downstream
+        self._finished = False
+
+    def record(self, evidence):
+        finish_error = None
+        downstream_error = None
+        guard_factory = getattr(self._ledger, "terminal_guard", None)
+        guard = cast(
+            ContextManager[None],
+            guard_factory() if callable(guard_factory) else nullcontext(),
+        )
+        with guard:
+            try:
+                self._ledger.finish(self._admission.token, evidence)
+            except Exception as exc:  # noqa: BLE001 - user search must remain fail-open
+                finish_error = exc
+                try:
+                    self._ledger.record_fault("evidence_finish_failed")
+                except Exception:  # noqa: BLE001 - best-effort durable poison
+                    pass
+            else:
+                self._finished = True
+
+            try:
+                persisted = self._downstream.record(evidence)
+                if persisted is False:
+                    downstream_error = RuntimeError(
+                        "downstream evidence was not persisted"
+                    )
+            except Exception as exc:  # noqa: BLE001 - preserve user-search fail-open
+                downstream_error = exc
+            if downstream_error is not None:
+                try:
+                    self._ledger.record_fault("downstream_evidence_failed")
+                except Exception:  # noqa: BLE001 - best-effort durable poison
+                    pass
+
+        if finish_error is not None:
+            raise finish_error
+        if downstream_error is not None:
+            raise downstream_error
+
+    def drop_pending(self):
+        if self._finished:
+            return
+        try:
+            self._ledger.drop(self._admission.token)
+        except Exception:  # noqa: BLE001 - campaign faults never break user search
+            try:
+                self._ledger.record_fault("admission_drop_failed")
+            except Exception:  # noqa: BLE001 - best-effort durable poison
+                pass
+
+
+def register(ctx, *, campaign_ledger=None) -> None:
     """Hermes plugin loader 入口：注册 wrr toolset 的 3 个异步工具。
 
     重依赖（handler 链路会拉起 wrr.router / httpx 等）在此处延迟 import，
@@ -238,14 +301,51 @@ def register(ctx) -> None:
         # discovery / report / bridge。Stage S 恒开，强制 caller legacy registry 执行。
         # 复用组合层拥有的同一个 sink 对象（显式注入，不 per-request 构造）。
         observation = provider.observe()
-        return await execute_web_search(
-            args,
-            registry=legacy_registry,
-            decision_context_observation=observation,
-            decision_evidence_version=2,
-            stage_s_enabled=True,
-            decision_evidence_sink=decision_evidence_sink,
-        )
+        stage_s_for_request = True
+        try:
+            request_key = str(uuid.uuid4())
+        except Exception:  # noqa: BLE001 - identity failure must not break search
+            request_key = None
+            if campaign_ledger is not None:
+                try:
+                    campaign_ledger.record_fault("identity_mint_failed")
+                except Exception:  # noqa: BLE001 - best-effort durable poison
+                    pass
+        request_sink = decision_evidence_sink
+        campaign_sink = None
+        if campaign_ledger is not None and request_key is not None:
+            atomic_begin = getattr(campaign_ledger, "begin_or_fault", None)
+            try:
+                begin = atomic_begin or campaign_ledger.begin
+                admission = begin(request_key)
+            except Exception:  # noqa: BLE001 - campaign is fail-open for user search
+                admission = None
+                if atomic_begin is None:
+                    try:
+                        campaign_ledger.record_fault("admission_failed")
+                    except Exception:  # noqa: BLE001 - best-effort durable poison
+                        pass
+            if admission is not None:
+                campaign_sink = _CampaignEvidenceSink(
+                    campaign_ledger, admission, decision_evidence_sink,
+                )
+                request_sink = campaign_sink
+
+        try:
+            return await execute_web_search(
+                args,
+                registry=legacy_registry,
+                decision_context_observation=(
+                    observation if stage_s_for_request else None
+                ),
+                decision_evidence_version=2,
+                stage_s_enabled=stage_s_for_request,
+                decision_evidence_sink=request_sink,
+                request_key=request_key,
+            )
+        finally:
+            if campaign_sink is not None:
+                campaign_sink.drop_pending()
 
     # web_search 与内建工具（toolset="web"）同名，Hermes registry 会拒绝跨
     # toolset 重名注册，必须显式 override=True 才能让插件版接管。
