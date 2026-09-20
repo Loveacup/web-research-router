@@ -49,6 +49,11 @@ _V2_TOP_FIELDS = (_TOP_FIELDS - {"actual_provider"}) | {
     "context_status", "comparison_status", "execution_protection", "context_cohort_id",
 }
 _V2_BLOCKERS = ["D5_COHORT_WINDOW_UNRESOLVED", "D6_DURABLE_COVERAGE_UNRESOLVED"]
+_CAMPAIGN_POLICY_VERSION = "EV-D5-v1"
+_CAMPAIGN_MIN_SAMPLES = 50
+_CAMPAIGN_MIN_OBSERVATION_SECONDS = 86400
+_CAMPAIGN_MAX_U1_COUNT = 1
+_CAMPAIGN_MAX_U1_RATIO = 0.02
 _SHADOW_FIELDS = {
     "code", "safe", "legacy_provider_ids", "descriptor_provider_ids",
     "omitted_provider_ids", "added_provider_ids", "reasons",
@@ -651,4 +656,245 @@ def evaluate_jsonl(
                 report["reasons"] = [reason for reason in report["reasons"] if reason != "NO_COMPARABLE_SAMPLES"]
             report["reasons"] = sorted(set(report["reasons"] + _V2_BLOCKERS))
         payload["selection_status"] = "NOT_READY"
+    return GateReport(payload)
+
+
+def _canonical_evidence_bytes(evidence: object) -> bytes:
+    """Render one admission's evidence as canonical JSON bytes, fail-closed."""
+    try:
+        text = json.dumps(
+            evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        # Unserialisable evidence never leaks its value; it decodes to a
+        # structurally invalid row that the shared parser rejects.
+        return b"null"
+    return text.encode("utf-8")
+
+
+def _campaign_join_ok(facts: object, admissions: object) -> bool:
+    """The admission ledger must exactly, unambiguously cover the facts.
+
+    Every admission carries precisely ``{seq, request_key, evidence}``; the
+    ``seq`` values form a gap-free ``1..N`` run; the admitted ``request_key``
+    sequence-to-key mapping equals the durable facts order (so swaps,
+    duplicates, and missing/extra keys fail closed); and each row's persisted
+    ``request_key`` matches the key it was admitted under.
+    """
+    if not isinstance(admissions, list):
+        return False
+    facts_keys = getattr(facts, "request_keys", None)
+    if not isinstance(facts_keys, tuple):
+        return False
+    capacity = getattr(facts, "capacity", None)
+    if (
+        type(capacity) is not int
+        or len(admissions) != capacity
+        or len(facts_keys) != capacity
+        or any(not isinstance(key, str) for key in facts_keys)
+        or len(set(facts_keys)) != capacity
+    ):
+        return False
+    seqs: list[int] = []
+    keys: list[str] = []
+    for admission in admissions:
+        if not isinstance(admission, dict) or set(admission) != {
+            "seq", "request_key", "evidence"
+        }:
+            return False
+        seq = admission["seq"]
+        if type(seq) is not int:  # rejects bool and non-int seq values
+            return False
+        if not isinstance(admission["request_key"], str):
+            return False
+        seqs.append(seq)
+        keys.append(admission["request_key"])
+        evidence = admission["evidence"]
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("request_key") != admission["request_key"]
+        ):
+            return False
+    if sorted(seqs) != list(range(1, len(admissions) + 1)):
+        return False
+    if len(set(keys)) != len(keys):
+        return False
+    ordered_keys = tuple(key for _, key in sorted(zip(seqs, keys)))
+    if ordered_keys != facts_keys:
+        return False
+    return True
+
+
+def _campaign_mode_report(mode: str, rows: list[dict]) -> dict:
+    """Per-mode threshold projection over that mode's declared, comparable rows."""
+    summary = _v2_summary(rows)
+    comparable_rows = summary["comparable_rows"]
+    effective_u4_rows = summary["effective_u4_rows"]
+    compared = [row for row in rows if row["comparison_status"] == "compared"]
+    times = [row["_recorded_dt"] for row in compared]
+    observation_seconds = (
+        (max(times) - min(times)).total_seconds() if len(times) >= 2 else 0.0
+    )
+    codes = {code: 0 for code in _CODES}
+    for row in compared:
+        codes[row["shadow_comparison"]["code"]] += 1
+    u1_ratio = codes["U1"] / comparable_rows if comparable_rows else 0.0
+    reasons: list[str] = []
+    if comparable_rows < _CAMPAIGN_MIN_SAMPLES:
+        reasons.append("INSUFFICIENT_SAMPLES")
+    if observation_seconds < _CAMPAIGN_MIN_OBSERVATION_SECONDS:
+        reasons.append("INSUFFICIENT_OBSERVATION")
+    if codes["U1"] > _CAMPAIGN_MAX_U1_COUNT or u1_ratio > _CAMPAIGN_MAX_U1_RATIO:
+        reasons.append("U1_LIMIT_EXCEEDED")
+    if codes["U2"]:
+        reasons.append("U2_PRESENT")
+    if codes["U3"]:
+        reasons.append("U3_PRESENT")
+    if effective_u4_rows:
+        reasons.append("U4_PRESENT")
+    return {
+        "mode": mode,
+        "status": "READY" if not reasons else "NOT_READY",
+        "valid_rows": summary["valid_rows"],
+        "comparable_rows": comparable_rows,
+        "effective_u4_rows": effective_u4_rows,
+        "observation_seconds": observation_seconds,
+        "reasons": sorted(reasons),
+    }
+
+
+def evaluate_campaign(facts: object, admissions: object) -> GateReport:
+    """Pure projection of a fixed campaign into a manual-review verdict.
+
+    ``facts`` is a ``CampaignFacts``-shaped durable projection and ``admissions``
+    the ledger's ``export()`` rows. The evaluator performs no I/O, never reaches
+    ``READY``, and never authorises an automatic Stage C: the strongest verdict
+    it returns is ``ELIGIBLE_FOR_MANUAL_C5_REVIEW`` with ``automatic_action`` off.
+    Structurally invalid or unexpected input fails closed without echoing raw
+    identifiers, timestamps, or cohort values.
+    """
+    admission_list = admissions if isinstance(admissions, list) else []
+
+    # Bounded, canonical decode of every admitted evidence row through the shared
+    # v2 wire parser — the same size/count limits the JSONL evaluator enforces.
+    parsed: list[dict | None] = []
+    input_bytes = 0
+    for index, admission in enumerate(admission_list):
+        if index + 1 > MAX_ROWS:
+            raise EvidenceInputLimitError("maximum evidence row count exceeded")
+        evidence = (
+            admission.get("evidence") if isinstance(admission, dict) else None
+        )
+        raw = _canonical_evidence_bytes(evidence)
+        if len(raw) > MAX_LINE_BYTES:
+            raise EvidenceInputLimitError("maximum evidence line size exceeded")
+        input_bytes += len(raw)
+        if input_bytes > MAX_FILE_BYTES:
+            raise EvidenceInputLimitError("maximum evidence file size exceeded")
+        try:
+            parsed.append(_parse_row(raw))
+        except _InvalidRow:
+            parsed.append(None)
+
+    valid_rows = [
+        row for row in parsed if row is not None and row.get("schema_version") == 2
+    ]
+
+    reasons: list[str] = []
+
+    declaration = getattr(facts, "declaration", None)
+    if declaration is None:
+        reasons.append("CAMPAIGN_NOT_DECLARED")
+        policy_version = None
+        requested_modes: list[str] = []
+        accepted_cohort = None
+    else:
+        policy_version = getattr(declaration, "policy_version", None)
+        requested_modes = list(getattr(declaration, "requested_modes", ()) or ())
+        accepted_cohort = getattr(declaration, "accepted_context_cohort_id", None)
+        if policy_version != _CAMPAIGN_POLICY_VERSION:
+            reasons.append("POLICY_VERSION_UNSUPPORTED")
+
+    capacity = getattr(facts, "capacity", None)
+    if type(capacity) is not int or capacity <= 0:
+        reasons.append("CAMPAIGN_CAPACITY_UNDECLARED")
+        capacity = None
+
+    if getattr(facts, "status", None) != "clean" or not getattr(
+        facts, "session_closed_cleanly", False
+    ):
+        reasons.append("CAMPAIGN_NOT_CLEAN")
+
+    if capacity is not None:
+        coverage_ok = (
+            getattr(facts, "persisted_evidence_count", None) == capacity
+            and getattr(facts, "terminal_count", None) == capacity
+            and getattr(facts, "attempts_started", None) == capacity
+            and getattr(facts, "start_sequence", None) == 1
+            and getattr(facts, "end_sequence", None) == capacity
+            and getattr(facts, "sequence_gaps", None) == 0
+            and getattr(facts, "fault_count", None) == 0
+            and getattr(facts, "dropped_count", None) == 0
+            and getattr(facts, "unresolved_count", None) == 0
+            and getattr(facts, "duplicate_count", None) == 0
+        )
+        if not coverage_ok:
+            reasons.append("CAMPAIGN_COVERAGE_INCOMPLETE")
+
+    if not _campaign_join_ok(facts, admissions):
+        reasons.append("ADMISSION_JOIN_MISMATCH")
+
+    if any(
+        row is None or row.get("schema_version") != 2 for row in parsed
+    ):
+        reasons.append("INVALID_EVIDENCE_ROWS_PRESENT")
+
+    declared_modes = set(requested_modes)
+    if any(row["mode"] not in declared_modes for row in valid_rows):
+        reasons.append("UNDECLARED_MODE_PRESENT")
+    if accepted_cohort is not None and any(
+        row.get("context_cohort_id") != accepted_cohort for row in valid_rows
+    ):
+        reasons.append("COHORT_MISMATCH")
+    if any(row["context_status"] != "available" for row in valid_rows):
+        reasons.append("CONTEXT_UNAVAILABLE")
+    if any(
+        row["context_status"] == "available" and row["comparison_status"] != "compared"
+        for row in valid_rows
+    ):
+        reasons.append("COMPARISON_UNAVAILABLE")
+
+    mode_reports = []
+    any_mode_not_ready = False
+    for mode in requested_modes:
+        scoped = [
+            row
+            for row in valid_rows
+            if row["mode"] == mode
+            and (accepted_cohort is None or row.get("context_cohort_id") == accepted_cohort)
+        ]
+        report = _campaign_mode_report(mode, scoped)
+        mode_reports.append(report)
+        if report["status"] != "READY":
+            any_mode_not_ready = True
+
+    ready = bool(mode_reports) and not reasons and not any_mode_not_ready
+    payload = {
+        "gate": "S_TO_C5_L2",
+        "status": "ELIGIBLE_FOR_MANUAL_C5_REVIEW" if ready else "NOT_READY",
+        "automatic_action": False,
+        "reasons": sorted(set(reasons)),
+        "policy_version": policy_version,
+        "requested_modes": requested_modes,
+        "thresholds": {
+            "minimum_comparable_samples": _CAMPAIGN_MIN_SAMPLES,
+            "minimum_observation_seconds": _CAMPAIGN_MIN_OBSERVATION_SECONDS,
+            "maximum_u1_count": _CAMPAIGN_MAX_U1_COUNT,
+            "maximum_u1_ratio": _CAMPAIGN_MAX_U1_RATIO,
+            "maximum_u2_count": 0,
+            "maximum_u3_count": 0,
+            "maximum_u4_count": 0,
+        },
+        "modes": mode_reports,
+    }
     return GateReport(payload)
