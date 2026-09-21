@@ -236,6 +236,31 @@ def test_controller_disables_campaign_when_admission_storage_fails(tmp_path, mon
     assert ledger.facts().fault_count == 1
 
 
+def test_controller_record_fault_disables_campaign(tmp_path):
+    _config_obj, controller, ledger = _controller(tmp_path, capacity=3)
+
+    controller.record_fault("downstream_evidence_failed")
+
+    assert controller.state == "disabled"
+    assert ledger.facts().fault_count == 1
+
+
+def test_controller_shutdown_marks_incomplete_campaign_dirty_and_closes_ledger(tmp_path):
+    config, controller, _ledger = _controller(tmp_path, capacity=3)
+
+    assert controller.shutdown() == "dirty"
+    assert controller.state == "closed"
+
+    reopened = CampaignLedger.open(config.ledger_path, campaign_id=config.campaign_id)
+    try:
+        facts = reopened.facts()
+        assert facts.status == "dirty"
+        assert facts.fault_count == 1
+        assert facts.session_closed_cleanly is False
+    finally:
+        reopened.close()
+
+
 def test_controller_disables_campaign_on_context_cohort_change(tmp_path):
     _config_obj, controller, ledger = _controller(tmp_path, capacity=3)
 

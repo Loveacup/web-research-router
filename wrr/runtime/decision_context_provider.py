@@ -11,12 +11,13 @@ Contract:
 * ``get()`` never invokes the builder; it returns the last published snapshot and
   never filters by TTL. Before the first successful refresh it returns ``None``.
 * ``observe()`` returns one immutable atomic ``(context, status, cohort_id)``
-  view. Cohort IDs are internally minted UUIDv4 values and cannot be supplied by
-  callers.
+  view. Cohort IDs are internally derived canonical UUIDv4 values from routing
+  semantics and cannot be supplied by callers.
 * ``refresh()`` invokes the builder, publishes the result atomically on success, and
   returns it. Refreshes are serialized (no single-flight merge). A failed build or
-  cohort mint propagates, records ``refresh_failed``, and retains the last-good
-  snapshot/cohort pair. A later success publishes a fresh pair and clears failure.
+  cohort derivation propagates, records ``refresh_failed``, and retains the last-good
+  snapshot/cohort pair. Equivalent rebuilt contexts retain their cohort; a later
+  semantic change publishes a new pair and clears failure.
 * A read is never blocked by an in-flight refresh: the builder runs while holding
   only the refresh lock; snapshot reads and the publish write are guarded by a
   separate, always-brief state lock. Correctness does not rely on the GIL.
@@ -24,6 +25,8 @@ Contract:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from typing import Callable, NamedTuple
 import uuid
@@ -37,6 +40,35 @@ class DecisionContextObservation(NamedTuple):
     context: DecisionContext | None
     status: str
     cohort_id: str | None
+
+
+def _semantic_cohort_id(context: DecisionContext) -> str:
+    """Return a stable UUIDv4 identity for the routing semantics in ``context``."""
+    payload = {
+        "runtime": context.runtime,
+        "profile": context.profile,
+        "registry_source": context.registry_source,
+        "routable_descriptor_ids": context.routable_descriptor_ids,
+        "bridged_provider_ids": context.bridged_provider_ids,
+        "missing_provider_ids": context.missing_provider_ids,
+        "adapter_errors": context.adapter_errors,
+        "descriptor_reasons": context.descriptor_reasons,
+        "descriptor_provider_aliases": context.descriptor_provider_aliases,
+        "config_fingerprint": context.config_fingerprint,
+    }
+    digest = bytearray(
+        hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
 
 
 class CachedDecisionContextProvider:
@@ -90,7 +122,7 @@ class CachedDecisionContextProvider:
                         "builder must return a DecisionContext, got "
                         f"{type(context).__name__}"
                     )
-                cohort_id = str(uuid.uuid4())
+                cohort_id = _semantic_cohort_id(context)
             except Exception:
                 with self._state_lock:
                     self._status = "refresh_failed"

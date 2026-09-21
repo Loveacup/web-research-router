@@ -120,7 +120,11 @@ class CampaignController:
         self._ledger.drop(token)
 
     def record_fault(self, reason: str) -> None:
-        self._ledger.record_fault(reason)
+        with self._lock:
+            try:
+                self._ledger.record_fault(reason)
+            finally:
+                self._state = _STATE_DISABLED
 
     def facts(self):
         return self._ledger.facts()
@@ -245,6 +249,25 @@ class CampaignController:
 
     def inspect(self):
         return self._ledger.inspect()
+
+    def shutdown(self) -> str:
+        """Dirty-close an incomplete owner session and release its SQLite handle."""
+        with self._lock:
+            if self._state == _STATE_CLOSED:
+                return self._final_status or "dirty"
+            if self._state in {_STATE_ACTIVE, _STATE_DRAINING}:
+                try:
+                    self._ledger.record_fault("owner_unloaded")
+                finally:
+                    self._state = _STATE_DISABLED
+            try:
+                status = self._ledger.close()
+            except Exception:
+                self._state = _STATE_DISABLED
+                raise
+            self._final_status = status
+            self._state = _STATE_CLOSED
+            return status
 
     def close(self) -> str:
         with self._lock:

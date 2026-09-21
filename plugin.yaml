@@ -1,12 +1,14 @@
 name: wrr-hermes
-version: 6.1.1
+version: 6.1.2
 description: Web Research Router for Hermes — 11 engines (7 web + 4 local) with mode-based routing, parallel execution, and RRF fusion
 author: Alex Cai
 entry: __init__.py
-tools:
+provides_tools:
   - web_search
   - web_fetch
   - web_similar
+provides_hooks:
+  - pre_llm_call
 dependencies:
   - httpx>=0.28
   - PyYAML>=6
@@ -16,3 +18,8 @@ config_schema:
     default:
       enabled: false
     description: "Opt-in fixed evidence campaign (D7-S4). Disabled by default; see README."
+  campaign_sampler:
+    type: dict
+    default:
+      enabled: false
+    description: "Plugin-owned bounded sampler for an enabled fixed campaign (D7-S5). Disabled by default."

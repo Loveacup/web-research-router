@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from ..schemas import DecisionEvidenceV2
 
@@ -61,6 +61,10 @@ _EXTERNAL_FAULT_REASONS = frozenset({
     "admission_drop_failed",
     "downstream_evidence_failed",
     "context_changed",
+    "owner_unloaded",
+    "sampler_start_failed",
+    "sampler_search_failed",
+    "sampler_sleep_failed",
 })
 
 
@@ -88,7 +92,24 @@ class CampaignReopened(CampaignLedgerError):
 
 
 class CampaignMismatch(CampaignLedgerError):
-    """Raised when a database already belongs to a different campaign."""
+    """Raised when a database already belongs to a different fixed campaign."""
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        diagnostic: Mapping[str, object],
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self._diagnostic = dict(diagnostic)
+
+    @property
+    def diagnostic(self) -> dict[str, object]:
+        """A defensive copy suitable for structured operator diagnostics."""
+        return dict(self._diagnostic)
+
+
 
 
 class DuplicateRequestKey(CampaignLedgerError):
@@ -353,7 +374,17 @@ class CampaignLedger:
             stored_campaign, stored_epoch, stored_capacity, stored_declaration_json = row
             if stored_campaign != campaign_id:
                 raise CampaignMismatch(
-                    "database already belongs to a different campaign"
+                    "campaign_id_mismatch",
+                    "database already belongs to a different campaign",
+                    {
+                        "ledger_path": str(target),
+                        "stored_campaign_id": stored_campaign,
+                        "requested_campaign_id": campaign_id,
+                        "remediation": (
+                            "Preserve the existing ledger and select a different "
+                            "campaign id with an unused ledger path."
+                        ),
+                    },
                 )
             stored_declaration = _declaration_from_json(stored_declaration_json)
             # A reopen reconstructs the canonical declaration/capacity. If the
@@ -362,11 +393,38 @@ class CampaignLedger:
             # fail closed rather than silently ignore the disagreement.
             if declaration is not None and declaration != stored_declaration:
                 raise CampaignMismatch(
-                    "database already belongs to a different declaration"
+                    "declaration_mismatch",
+                    "database already belongs to a different declaration",
+                    {
+                        "ledger_path": str(target),
+                        "stored_campaign_id": stored_campaign,
+                        "requested_campaign_id": campaign_id,
+                        "stored_declaration": json.loads(stored_declaration_json)
+                        if stored_declaration_json is not None
+                        else None,
+                        "requested_declaration": json.loads(_declaration_to_json(declaration)),
+                        "remediation": (
+                            "Preserve the existing ledger. An equivalent restart must "
+                            "reconstruct its declaration; a changed semantic context or "
+                            "policy cannot resume this fixed campaign."
+                        ),
+                    },
                 )
             if capacity is not None and capacity != stored_capacity:
                 raise CampaignMismatch(
-                    "database already belongs to a different capacity"
+                    "capacity_mismatch",
+                    "database already belongs to a different capacity",
+                    {
+                        "ledger_path": str(target),
+                        "stored_campaign_id": stored_campaign,
+                        "requested_campaign_id": campaign_id,
+                        "stored_capacity": stored_capacity,
+                        "requested_capacity": capacity,
+                        "remediation": (
+                            "Preserve the existing ledger and select a matching capacity "
+                            "or an unused campaign id and ledger path."
+                        ),
+                    },
                 )
             return cls(
                 conn,

@@ -5,6 +5,7 @@ plugin.yaml ``entry: __init__.py`` 指向此文件。这是兼容 Hermes plugin 
 wrr.doctor / wrr.engines.loader），所有重依赖在 ``register(ctx)`` 内部延迟 import。
 """
 
+import json
 import logging
 import threading
 import time
@@ -12,7 +13,7 @@ import uuid
 from contextlib import nullcontext
 from typing import ContextManager, cast
 
-__version__ = "6.1.1"
+__version__ = "6.1.2"
 
 logger = logging.getLogger("wrr.plugin")
 
@@ -285,7 +286,15 @@ def register(ctx, *, campaign_ledger=None) -> None:
         CampaignController,
         parse_campaign_config,
     )
-    from wrr.runtime.campaign_ledger import CampaignDeclaration, CampaignLedger
+    from wrr.runtime.campaign_sampler import (
+        parse_campaign_sampler_config,
+        start_campaign_sampler,
+    )
+    from wrr.runtime.campaign_ledger import (
+        CampaignDeclaration,
+        CampaignLedger,
+        CampaignMismatch,
+    )
 
     # 唯一 execution legacy registry：冷态与暖态都用同一个对象执行，get_registry()
     # 恰好调用一次。
@@ -301,6 +310,12 @@ def register(ctx, *, campaign_ledger=None) -> None:
         except ValueError as exc:
             logger.warning("campaign config rejected; campaign disabled: %s", exc)
             campaign_config = None
+    sampler_config = None
+    if campaign_config is not None and callable(get_config):
+        try:
+            sampler_config = parse_campaign_sampler_config(get_config("campaign_sampler"))
+        except ValueError as exc:
+            logger.warning("campaign sampler config rejected; sampler disabled: %s", exc)
 
     def _build_control_plane_context():
         # builder 闭包把同一个 legacy object 桥接进 assembly（内部不做第二次 discovery）。
@@ -436,7 +451,9 @@ def register(ctx, *, campaign_ledger=None) -> None:
         toolset="wrr",
         is_async=True,
     )
-    def _pre_llm_call():
+    start_sampler_once = lambda: None
+
+    def _pre_llm_call(**_kwargs):
         activator.pre_llm_call()
         if controller is not None:
             observation = provider.observe()
@@ -444,6 +461,7 @@ def register(ctx, *, campaign_ledger=None) -> None:
                 context_status=observation.status,
                 context_cohort_id=observation.cohort_id,
             )
+        start_sampler_once()
         return None
 
     ctx.register_hook("pre_llm_call", _pre_llm_call)
@@ -478,6 +496,71 @@ def register(ctx, *, campaign_ledger=None) -> None:
                 )
             else:
                 logger.warning("campaign activation skipped: decision context not available")
+        except CampaignMismatch as exc:
+            logger.warning(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "campaign_activation_mismatch",
+                        "reason": exc.reason,
+                        **exc.diagnostic,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            controller = None
         except Exception as exc:  # noqa: BLE001 - campaign is opt-in and fail-safe
             logger.warning("campaign activation failed; campaign disabled: %s", exc)
             controller = None
+
+    # 可选 D7-S5 sampler 延迟到首次 pre_llm_call 才启动，避免 register 阶段产生
+    # 搜索/ledger 副作用。启动受锁保护且只尝试一次；unload 先停止 writer，再把
+    # 未完整 campaign dirty-close 并释放 SQLite handle。
+    if controller is not None and campaign_config is not None:
+        on_unload = getattr(ctx, "on_unload", None)
+        if callable(on_unload):
+            sampler_lock = threading.Lock()
+            sampler_stop = None
+            sampler_start_attempted = False
+            sampler_unloaded = False
+
+            def start_sampler_once():
+                nonlocal sampler_stop, sampler_start_attempted
+                if sampler_config is None or campaign_config.capacity != 50:
+                    return
+                with sampler_lock:
+                    if (
+                        sampler_unloaded
+                        or sampler_start_attempted
+                        or controller.state != "active"
+                    ):
+                        return
+                    sampler_start_attempted = True
+                    try:
+                        sampler_stop = start_campaign_sampler(
+                            _bound_web_search,
+                            controller,
+                            campaign_id=campaign_config.campaign_id,
+                            config=sampler_config,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - hook must stay fail-open
+                        try:
+                            controller.record_fault("sampler_start_failed")
+                        except Exception:  # noqa: BLE001 - best-effort durable poison
+                            pass
+                        logger.warning(
+                            "campaign sampler start failed; sampler disabled: %s", exc,
+                        )
+
+            def stop_sampler_and_shutdown():
+                nonlocal sampler_unloaded
+                with sampler_lock:
+                    sampler_unloaded = True
+                    stop = sampler_stop
+                try:
+                    if stop is not None:
+                        stop()
+                finally:
+                    controller.shutdown()
+
+            on_unload(stop_sampler_and_shutdown)

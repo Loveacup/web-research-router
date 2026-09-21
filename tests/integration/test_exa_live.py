@@ -6,6 +6,7 @@ from wrr.schemas import SearchOptions
 
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("EXA_API_KEY"), reason="EXA_API_KEY not set")
+@pytest.mark.asyncio
 async def test_exa_search_live():
     engine = ExaEngine()
     results = await engine.search(SearchOptions(query="OpenAI API official docs", count=3))
@@ -15,7 +16,7 @@ async def test_exa_search_live():
 
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("EXA_API_KEY"), reason="EXA_API_KEY not set")
-async def test_exa_mode_routing():
+def test_exa_mode_routing():
     """测试自动路由是否正确选择模式。"""
     from wrr.engines.exa import classify_query, get_search_mode
     

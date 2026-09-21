@@ -20,7 +20,14 @@ from wrr.runtime.decision_context_provider import CachedDecisionContextProvider
 from wrr.schemas import DecisionContext
 
 
-def _context(*, snapshot_version="v1", built_at=1.0, expires_at=2.0):
+def _context(
+    *,
+    snapshot_version="v1",
+    built_at=1.0,
+    expires_at=2.0,
+    config_fingerprint="fp",
+    routable_descriptor_ids=("exa",),
+):
     """Build a minimal valid DecisionContext for provider tests."""
     return DecisionContext(
         snapshot_version=snapshot_version,
@@ -29,13 +36,13 @@ def _context(*, snapshot_version="v1", built_at=1.0, expires_at=2.0):
         runtime="standalone",
         profile="default",
         registry_source="test",
-        routable_descriptor_ids=("exa",),
+        routable_descriptor_ids=routable_descriptor_ids,
         bridged_provider_ids=("exa",),
         missing_provider_ids=(),
         adapter_errors=(),
         descriptor_reasons=(),
         descriptor_provider_aliases=(),
-        config_fingerprint="fp",
+        config_fingerprint=config_fingerprint,
     )
 
 
@@ -118,16 +125,33 @@ def test_get_does_not_call_builder_after_publish():
     assert builder.calls == 1
 
 
-def test_refresh_replaces_previous_snapshot_atomically():
-    first = _context(snapshot_version="v1")
-    second = _context(snapshot_version="v2")
+def test_equivalent_refresh_replaces_snapshot_without_changing_cohort():
+    first = _context(snapshot_version="v1", built_at=1.0, expires_at=2.0)
+    second = _context(snapshot_version="v2", built_at=3.0, expires_at=4.0)
     contexts = iter((first, second))
     provider = CachedDecisionContextProvider(lambda: next(contexts))
 
     provider.refresh()
+    first_observation = provider.observe()
     assert provider.get() is first
     provider.refresh()
+
     assert provider.get() is second
+    assert provider.observe().cohort_id == first_observation.cohort_id
+
+
+def test_equivalent_contexts_keep_cohort_across_provider_instances():
+    first = CachedDecisionContextProvider(
+        lambda: _context(snapshot_version="first", built_at=1.0, expires_at=2.0)
+    )
+    second = CachedDecisionContextProvider(
+        lambda: _context(snapshot_version="second", built_at=3.0, expires_at=4.0)
+    )
+
+    first.refresh()
+    second.refresh()
+
+    assert second.observe().cohort_id == first.observe().cohort_id
 
 
 # ── failure retains last-good and propagates ────────────────────────────
@@ -187,9 +211,9 @@ def test_first_refresh_failure_leaves_no_snapshot():
     assert observation.cohort_id is None
 
 
-def test_success_after_failure_mints_new_cohort_and_clears_failure():
+def test_success_after_failure_with_changed_semantics_publishes_new_cohort():
     first = _context(snapshot_version="first")
-    second = _context(snapshot_version="second")
+    second = _context(snapshot_version="second", config_fingerprint="changed")
     state = {"step": 0}
 
     def builder():
@@ -213,7 +237,7 @@ def test_success_after_failure_mints_new_cohort_and_clears_failure():
     assert recovered.cohort_id != first_observation.cohort_id
 
 
-def test_cohort_id_is_internal_and_uuid_mint_failure_retains_last_good(monkeypatch):
+def test_cohort_id_is_internal_and_derivation_failure_retains_last_good(monkeypatch):
     constructor = getattr(provider_module, "CachedDecisionContextProvider")
     with pytest.raises(TypeError):
         constructor(lambda: _context(), cohort_id="caller")
@@ -223,12 +247,12 @@ def test_cohort_id_is_internal_and_uuid_mint_failure_retains_last_good(monkeypat
     provider.refresh()
     before = provider.observe()
     monkeypatch.setattr(
-        provider_module.uuid,
-        "uuid4",
-        lambda: (_ for _ in ()).throw(RuntimeError("uuid unavailable")),
+        provider_module.hashlib,
+        "sha256",
+        lambda _value: (_ for _ in ()).throw(RuntimeError("hash unavailable")),
     )
 
-    with pytest.raises(RuntimeError, match="uuid unavailable"):
+    with pytest.raises(RuntimeError, match="hash unavailable"):
         provider.refresh()
 
     after = provider.observe()
@@ -314,7 +338,7 @@ def test_get_returns_old_snapshot_while_refresh_builds():
     after = provider.observe()
     assert after.context is new
     assert after.status == "available"
-    assert after.cohort_id != old_observation.cohort_id
+    assert after.cohort_id == old_observation.cohort_id
 
 
 # ── source purity: no hot-path / I/O dependencies ───────────────────────
@@ -342,8 +366,10 @@ def _provider_source_tree():
 
 def test_provider_only_imports_stdlib_and_schemas():
     # The only permitted imports are stdlib plumbing and the DecisionContext schema.
-    allowed_roots = {"__future__", "threading", "typing", "uuid", "wrr"}
-    allowed_modules = {"__future__", "threading", "typing", "uuid", "wrr.schemas"}
+    allowed_roots = {"__future__", "hashlib", "json", "threading", "typing", "uuid", "wrr"}
+    allowed_modules = {
+        "__future__", "hashlib", "json", "threading", "typing", "uuid", "wrr.schemas",
+    }
     for node in ast.walk(_provider_source_tree()):
         if isinstance(node, ast.Import):
             for alias in node.names:

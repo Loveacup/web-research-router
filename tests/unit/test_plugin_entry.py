@@ -14,8 +14,11 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from pathlib import Path
+import pytest
+import yaml
 
 ENTRY = Path(__file__).resolve().parents[2] / "__init__.py"
 PLUGIN_MANIFEST = ENTRY.parent / "plugin.yaml"
@@ -884,7 +887,7 @@ def test_downstream_failure_after_finish_poisons_without_breaking_search(monkeyp
 
 
 def test_register_hook_returns_none(monkeypatch):
-    """pre_llm_call hook 恒返回 None，不注入 LLM context。"""
+    """pre_llm_call hook 恒返回 None，兼容未来 keyword payload。"""
     _install_register_fakes(monkeypatch, snapshot=_SENTINEL_CONTEXT, refresh_result=_SENTINEL_CONTEXT)
     _install_exec_spy(monkeypatch)
     mod = _load_entry()
@@ -893,9 +896,21 @@ def test_register_hook_returns_none(monkeypatch):
 
     hook = ctx.hooks[0]["handler"]
     assert hook() is None
+    assert hook(future_payload=object()) is None
 
 
-def _r3_context(ttl_sec=300):
+def test_manifest_capabilities_match_registered_plugin_surface():
+    manifest = yaml.safe_load(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
+    ctx = MockCtx()
+    _load_entry().register(ctx)
+
+    assert "tools" not in manifest
+    assert set(manifest["provides_tools"]) == set(ctx.tools)
+    assert set(manifest["provides_hooks"]) == {
+        item["event"] for item in ctx.hooks
+    }
+
+def _r3_context(ttl_sec=300, *, config_fingerprint="r3-test"):
     import time
     from wrr.schemas import DecisionContext
 
@@ -907,7 +922,7 @@ def _r3_context(ttl_sec=300):
         bridged_provider_ids=("exa", "brave"), missing_provider_ids=(),
         adapter_errors=(), descriptor_reasons=(),
         descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
-        config_fingerprint="r3-test",
+        config_fingerprint=config_fingerprint,
     )
 
 
@@ -1039,7 +1054,10 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
     assert report["modes"][0]["selection_status"] == "NOT_READY"
 
 
-def test_register_opt_in_campaign_wires_real_admission_and_exact_join(monkeypatch, tmp_path):
+@pytest.mark.parametrize("outcome", ["success", "empty", "error"])
+def test_register_opt_in_campaign_wires_real_admission_and_exact_join(
+    monkeypatch, tmp_path, outcome,
+):
     import json
     import sqlite3
     from conftest import FakeEngine, mk_results
@@ -1049,7 +1067,13 @@ def test_register_opt_in_campaign_wires_real_admission_and_exact_join(monkeypatc
 
     registry = registry_mod.EngineRegistry()
     for name in ("exa", "brave"):
-        registry.register(FakeEngine(name, search_results=mk_results(2)))
+        if outcome == "error":
+            registry.register(FakeEngine(name, error="injected engine failure"))
+        else:
+            registry.register(FakeEngine(
+                name,
+                search_results=mk_results(2) if outcome == "success" else [],
+            ))
 
     ttl_seen = []
 
@@ -1063,18 +1087,28 @@ def test_register_opt_in_campaign_wires_real_admission_and_exact_join(monkeypatc
     real_sink = evidence.JsonlDecisionEvidenceSink
 
     class CampaignCtx(MockCtx):
+        def __init__(self):
+            super().__init__()
+            self.unload_callbacks = []
+
         def get_config(self, key, default=None):
-            assert key == "campaign"
-            return {
-                "enabled": True,
-                "id": "d7-s4-grounding-001",
-                "mode": "grounding",
-                "capacity": 50,
-                "policy_version": "EV-D5-v1",
-                "build_manifest_id": "a95fac3",
-                "ledger_path": str(ledger_path),
-                "context_ttl_sec": 93600,
-            }
+            if key == "campaign":
+                return {
+                    "enabled": True,
+                    "id": "d7-s4-grounding-001",
+                    "mode": "grounding",
+                    "capacity": 50,
+                    "policy_version": "EV-D5-v1",
+                    "build_manifest_id": "a95fac3",
+                    "ledger_path": str(ledger_path),
+                    "context_ttl_sec": 93600,
+                }
+            if key == "campaign_sampler":
+                return {"enabled": True, "interval_sec": 1800}
+            return default
+
+        def on_unload(self, callback):
+            self.unload_callbacks.append(callback)
 
     monkeypatch.setattr(registry_mod, "get_registry", lambda: registry)
     monkeypatch.setattr(assembly, "build_control_plane_decision_context", build)
@@ -1083,12 +1117,30 @@ def test_register_opt_in_campaign_wires_real_admission_and_exact_join(monkeypatc
 
     mod, ctx = _load_entry(), CampaignCtx()
     mod.register(ctx)
-    handler = ctx.tools["web_search"]["handler"]
-    asyncio.run(handler({
-        "query": "production campaign join",
-        "mode": "grounding",
-        "campaign_id": "d7-s4-grounding-001",
-    }))
+    assert len(ctx.unload_callbacks) == 1
+    with sqlite3.connect(ledger_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] == 0
+
+    hook = next(item["handler"] for item in ctx.hooks if item["event"] == "pre_llm_call")
+    callers = [threading.Thread(target=hook) for _ in range(4)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if ledger_path.exists():
+            with sqlite3.connect(ledger_path) as conn:
+                finished = conn.execute(
+                    "SELECT COUNT(*) FROM admissions WHERE state = 'finished'"
+                ).fetchone()[0]
+            if finished == 1:
+                break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("plugin-owned sampler did not persist one finished admission")
+    ctx.unload_callbacks[0]()
 
     assert ttl_seen == [93600.0]
     evidence_rows = [
@@ -1106,6 +1158,324 @@ def test_register_opt_in_campaign_wires_real_admission_and_exact_join(monkeypatc
     declaration_obj = json.loads(declaration)
     assert declaration_obj["policy_version"] == "EV-D5-v1"
     assert declaration_obj["build_manifest_id"] == "a95fac3"
+
+
+def test_register_logs_actionable_campaign_declaration_mismatch(monkeypatch, tmp_path, caplog):
+    import json
+    import logging
+    import sqlite3
+    import wrr.registry as registry_mod
+    import wrr.runtime.decision_context_assembly as assembly
+    from wrr.runtime.campaign_ledger import CampaignDeclaration, CampaignLedger
+
+    ledger_path = tmp_path / "campaign.sqlite"
+    old_ledger = CampaignLedger.open(
+        ledger_path,
+        campaign_id="d7-s5-grounding-001",
+        capacity=50,
+        declaration=CampaignDeclaration(
+            policy_version="EV-D5-v1",
+            requested_modes=("grounding",),
+            accepted_context_cohort_id="old-cohort",
+            build_manifest_id="a95fac3",
+        ),
+    )
+    old_ledger.close()
+
+    class CampaignCtx(MockCtx):
+        def get_config(self, key, default=None):
+            if key == "campaign":
+                return {
+                    "enabled": True,
+                    "id": "d7-s5-grounding-001",
+                    "mode": "grounding",
+                    "capacity": 50,
+                    "policy_version": "EV-D5-v1",
+                    "build_manifest_id": "a95fac3",
+                    "ledger_path": str(ledger_path),
+                    "context_ttl_sec": 93600,
+                }
+            return default
+
+    monkeypatch.setattr(registry_mod, "get_registry", registry_mod.EngineRegistry)
+    monkeypatch.setattr(
+        assembly,
+        "build_control_plane_decision_context",
+        lambda actual, *, ttl_sec: _r3_context(ttl_sec),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="wrr.plugin"):
+        mod, ctx = _load_entry(), CampaignCtx()
+        mod.register(ctx)
+
+    assert set(ctx.tools) == {"web_search", "web_fetch", "web_similar"}
+    event = next(
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "wrr.plugin" and "campaign_activation_mismatch" in record.message
+    )
+    assert event["reason"] == "declaration_mismatch"
+    assert "changed semantic context or policy" in event["remediation"]
+    with sqlite3.connect(ledger_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] == 0
+
+
+def test_register_equivalent_restart_reopens_campaign_without_declaration_mismatch(
+    monkeypatch, tmp_path, caplog,
+):
+    import logging
+    import sqlite3
+    import wrr.registry as registry_mod
+    import wrr.runtime.decision_context_assembly as assembly
+
+    ledger_path = tmp_path / "campaign.sqlite"
+
+    class CampaignCtx(MockCtx):
+        def __init__(self):
+            super().__init__()
+            self.unload_callbacks = []
+
+        def get_config(self, key, default=None):
+            if key == "campaign":
+                return {
+                    "enabled": True,
+                    "id": "semantic-restart",
+                    "mode": "grounding",
+                    "capacity": 50,
+                    "policy_version": "EV-D5-v1",
+                    "build_manifest_id": "restart-check",
+                    "ledger_path": str(ledger_path),
+                    "context_ttl_sec": 93600,
+                }
+            return default
+
+        def on_unload(self, callback):
+            self.unload_callbacks.append(callback)
+
+    monkeypatch.setattr(registry_mod, "get_registry", registry_mod.EngineRegistry)
+    monkeypatch.setattr(
+        assembly,
+        "build_control_plane_decision_context",
+        lambda actual, *, ttl_sec: _r3_context(ttl_sec),
+    )
+
+    first_mod, first_ctx = _load_entry(), CampaignCtx()
+    first_mod.register(first_ctx)
+    assert len(first_ctx.unload_callbacks) == 1
+    first_ctx.unload_callbacks[0]()
+    with sqlite3.connect(ledger_path) as conn:
+        before = conn.execute(
+            "SELECT declaration, status, fault_count FROM meta WHERE id = 1"
+        ).fetchone()
+        admissions_before = conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0]
+
+    with caplog.at_level(logging.WARNING, logger="wrr.plugin"):
+        second_mod, second_ctx = _load_entry(), CampaignCtx()
+        second_mod.register(second_ctx)
+
+    assert set(second_ctx.tools) == {"web_search", "web_fetch", "web_similar"}
+    assert len(second_ctx.unload_callbacks) == 1
+    assert not any("campaign_activation_mismatch" in record.message for record in caplog.records)
+    with sqlite3.connect(ledger_path) as conn:
+        assert conn.execute(
+            "SELECT declaration, status, fault_count FROM meta WHERE id = 1"
+        ).fetchone() == before
+        assert conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] == admissions_before
+    second_ctx.unload_callbacks[0]()
+
+
+def test_register_changed_context_still_fails_closed_without_mutating_ledger(
+    monkeypatch, tmp_path, caplog,
+):
+    import json
+    import logging
+    import sqlite3
+    import wrr.registry as registry_mod
+    import wrr.runtime.decision_context_assembly as assembly
+
+    ledger_path = tmp_path / "campaign.sqlite"
+    fingerprints = iter(("first", "changed"))
+
+    class CampaignCtx(MockCtx):
+        def __init__(self):
+            super().__init__()
+            self.unload_callbacks = []
+
+        def get_config(self, key, default=None):
+            if key == "campaign":
+                return {
+                    "enabled": True,
+                    "id": "semantic-change",
+                    "mode": "grounding",
+                    "capacity": 50,
+                    "policy_version": "EV-D5-v1",
+                    "build_manifest_id": "change-check",
+                    "ledger_path": str(ledger_path),
+                    "context_ttl_sec": 93600,
+                }
+            return default
+
+        def on_unload(self, callback):
+            self.unload_callbacks.append(callback)
+
+    monkeypatch.setattr(registry_mod, "get_registry", registry_mod.EngineRegistry)
+    monkeypatch.setattr(
+        assembly,
+        "build_control_plane_decision_context",
+        lambda actual, *, ttl_sec: _r3_context(
+            ttl_sec, config_fingerprint=next(fingerprints),
+        ),
+    )
+
+    first_mod, first_ctx = _load_entry(), CampaignCtx()
+    first_mod.register(first_ctx)
+    first_ctx.unload_callbacks[0]()
+    with sqlite3.connect(ledger_path) as conn:
+        before = conn.execute(
+            "SELECT declaration, status, fault_count FROM meta WHERE id = 1"
+        ).fetchone()
+        admissions_before = conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0]
+
+    with caplog.at_level(logging.WARNING, logger="wrr.plugin"):
+        second_mod, second_ctx = _load_entry(), CampaignCtx()
+        second_mod.register(second_ctx)
+
+    event = next(
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "wrr.plugin" and "campaign_activation_mismatch" in record.message
+    )
+    assert event["reason"] == "declaration_mismatch"
+    assert set(second_ctx.tools) == {"web_search", "web_fetch", "web_similar"}
+    with sqlite3.connect(ledger_path) as conn:
+        assert conn.execute(
+            "SELECT declaration, status, fault_count FROM meta WHERE id = 1"
+        ).fetchone() == before
+        assert conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0] == admissions_before
+
+
+def test_register_does_not_start_d7_s5_sampler_for_non_fixed_capacity(monkeypatch, tmp_path):
+    from conftest import FakeEngine, mk_results
+    import wrr.registry as registry_mod
+    import wrr.runtime.decision_context_assembly as assembly
+    import wrr.runtime.campaign_sampler as sampler_mod
+
+    registry = registry_mod.EngineRegistry()
+    registry.register(FakeEngine("exa", search_results=mk_results(1)))
+    starts = []
+
+    class CampaignCtx(MockCtx):
+        def __init__(self):
+            super().__init__()
+            self.unload_callbacks = []
+
+        def get_config(self, key, default=None):
+            if key == "campaign":
+                return {
+                    "enabled": True,
+                    "id": "d7-s5-grounding-capacity-51",
+                    "mode": "grounding",
+                    "capacity": 51,
+                    "policy_version": "EV-D5-v1",
+                    "build_manifest_id": "capacity-check",
+                    "ledger_path": str(tmp_path / "capacity-51.sqlite"),
+                    "context_ttl_sec": 93600,
+                }
+            if key == "campaign_sampler":
+                return {"enabled": True, "interval_sec": 1800}
+            return default
+
+        def on_unload(self, callback):
+            self.unload_callbacks.append(callback)
+
+    monkeypatch.setattr(registry_mod, "get_registry", lambda: registry)
+    monkeypatch.setattr(
+        assembly,
+        "build_control_plane_decision_context",
+        lambda actual, *, ttl_sec: _r3_context(ttl_sec),
+    )
+    monkeypatch.setattr(
+        sampler_mod,
+        "start_campaign_sampler",
+        lambda *_args, **_kwargs: starts.append(True),
+    )
+
+    mod, ctx = _load_entry(), CampaignCtx()
+    mod.register(ctx)
+    hook = next(item["handler"] for item in ctx.hooks if item["event"] == "pre_llm_call")
+    hook()
+
+    assert starts == []
+    assert len(ctx.unload_callbacks) == 1
+    ctx.unload_callbacks[0]()
+
+
+def test_register_reopened_campaign_does_not_start_sampler(monkeypatch, tmp_path):
+    from conftest import FakeEngine, mk_results
+    import wrr.registry as registry_mod
+    import wrr.runtime.campaign_ledger as ledger_mod
+    import wrr.runtime.campaign_sampler as sampler_mod
+    import wrr.runtime.decision_context_assembly as assembly
+
+    registry = registry_mod.EngineRegistry()
+    registry.register(FakeEngine("exa", search_results=mk_results(1)))
+    starts = []
+
+    class ReopenedLedger:
+        reopened = True
+
+        def close(self):
+            return "dirty"
+
+    class CampaignCtx(MockCtx):
+        def __init__(self):
+            super().__init__()
+            self.unload_callbacks = []
+
+        def get_config(self, key, default=None):
+            if key == "campaign":
+                return {
+                    "enabled": True,
+                    "id": "d7-s5-grounding-reopened",
+                    "mode": "grounding",
+                    "capacity": 50,
+                    "policy_version": "EV-D5-v1",
+                    "build_manifest_id": "reopened-check",
+                    "ledger_path": str(tmp_path / "reopened.sqlite"),
+                    "context_ttl_sec": 93600,
+                }
+            if key == "campaign_sampler":
+                return {"enabled": True, "interval_sec": 1800}
+            return default
+
+        def on_unload(self, callback):
+            self.unload_callbacks.append(callback)
+
+    monkeypatch.setattr(registry_mod, "get_registry", lambda: registry)
+    monkeypatch.setattr(
+        assembly,
+        "build_control_plane_decision_context",
+        lambda actual, *, ttl_sec: _r3_context(ttl_sec),
+    )
+    monkeypatch.setattr(
+        ledger_mod.CampaignLedger,
+        "open",
+        lambda *_args, **_kwargs: ReopenedLedger(),
+    )
+    monkeypatch.setattr(
+        sampler_mod,
+        "start_campaign_sampler",
+        lambda *_args, **_kwargs: starts.append(True),
+    )
+
+    mod, ctx = _load_entry(), CampaignCtx()
+    mod.register(ctx)
+    hook = next(item["handler"] for item in ctx.hooks if item["event"] == "pre_llm_call")
+    hook()
+
+    assert starts == []
+    assert len(ctx.unload_callbacks) == 1
+    ctx.unload_callbacks[0]()
 
 
 # ── cold activator 合同（fake monotonic / 并发 / 二次 get）────────────────
@@ -1147,7 +1517,7 @@ def test_warm_expiry_refreshes_context_without_search_io():
     wall.t = 1300.0
     act.pre_llm_call()
     assert builds == [1000.0, 1300.0]
-    assert provider.observe().cohort_id != first.cohort_id
+    assert provider.observe().cohort_id == first.cohort_id
     snapshot = provider.get()
     assert snapshot is not None
     assert snapshot.expires_at == 1600.0
@@ -1197,7 +1567,7 @@ def test_warm_retry_preserves_last_good_and_resets_after_success():
     assert act._next_attempt_at is None
     assert act._backoff_sec == 1.0
     assert provider.observe().status == "available"
-    assert provider.observe().cohort_id != good.cohort_id
+    assert provider.observe().cohort_id == good.cohort_id
     wall.t = 10299.0
     fail[0] = True
     act.activate()

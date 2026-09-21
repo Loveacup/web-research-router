@@ -13,6 +13,7 @@ from wrr.schemas import SearchOptions
 
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("WRR_LIVE"), reason="set WRR_LIVE=1 to run live community test")
+@pytest.mark.asyncio
 async def test_community_reddit_live():
     engine = CommunityEngine()
     # site:reddit.com → 仅走 reddit（opencli），避免重型 last30days

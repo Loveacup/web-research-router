@@ -93,6 +93,15 @@ def _open(tmp_path, **kw) -> CampaignLedger:
     return CampaignLedger.open(tmp_path / "ledger.db", campaign_id=CID, **kw)
 
 
+def _storage_snapshot(path: Path):
+    with sqlite3.connect(path) as conn:
+        meta = conn.execute(
+            "SELECT campaign_id, capacity, declaration, status, fault_count FROM meta WHERE id = 1"
+        ).fetchone()
+        admissions = conn.execute("SELECT COUNT(*) FROM admissions").fetchone()[0]
+    return meta, admissions
+
+
 # ── lifecycle basics ────────────────────────────────────────────────────
 
 
@@ -504,9 +513,17 @@ def test_reopen_open_campaign_is_inspect_export_only(tmp_path):
 
 def test_reopen_campaign_id_mismatch_fails_closed(tmp_path):
     primary = _open(tmp_path)
+    path = tmp_path / "ledger.db"
+    before = _storage_snapshot(path)
     try:
-        with pytest.raises(CampaignMismatch):
-            CampaignLedger.open(tmp_path / "ledger.db", campaign_id="other-campaign")
+        with pytest.raises(CampaignMismatch) as raised:
+            CampaignLedger.open(path, campaign_id="other-campaign")
+        error = raised.value
+        assert error.reason == "campaign_id_mismatch"
+        assert error.diagnostic["stored_campaign_id"] == CID
+        assert error.diagnostic["requested_campaign_id"] == "other-campaign"
+        assert "Preserve the existing ledger" in error.diagnostic["remediation"]
+        assert _storage_snapshot(path) == before
     finally:
         primary.close()
 
@@ -795,15 +812,30 @@ def test_reopen_with_matching_declaration_and_capacity_is_allowed(tmp_path):
 def test_reopen_with_conflicting_declaration_fails_closed(tmp_path):
     ledger = _open(tmp_path, declaration=_decl(), capacity=2)
     ledger.close()
-    with pytest.raises(CampaignMismatch):
+    path = tmp_path / "ledger.db"
+    before = _storage_snapshot(path)
+    with pytest.raises(CampaignMismatch) as raised:
         _open(tmp_path, declaration=_decl(policy="policy-v2"), capacity=2)
+    error = raised.value
+    assert error.reason == "declaration_mismatch"
+    assert error.diagnostic["stored_declaration"]["policy_version"] == "policy-v1"
+    assert error.diagnostic["requested_declaration"]["policy_version"] == "policy-v2"
+    assert "changed semantic context or policy" in error.diagnostic["remediation"]
+    assert _storage_snapshot(path) == before
 
 
 def test_reopen_with_conflicting_capacity_fails_closed(tmp_path):
     ledger = _open(tmp_path, declaration=_decl(), capacity=2)
     ledger.close()
-    with pytest.raises(CampaignMismatch):
+    path = tmp_path / "ledger.db"
+    before = _storage_snapshot(path)
+    with pytest.raises(CampaignMismatch) as raised:
         _open(tmp_path, declaration=_decl(), capacity=5)
+    error = raised.value
+    assert error.reason == "capacity_mismatch"
+    assert (error.diagnostic["stored_capacity"], error.diagnostic["requested_capacity"]) == (2, 5)
+    assert "Preserve the existing ledger" in error.diagnostic["remediation"]
+    assert _storage_snapshot(path) == before
 
 
 def test_reopen_with_conflicting_capacity_only_fails_closed(tmp_path):

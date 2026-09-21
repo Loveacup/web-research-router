@@ -394,3 +394,59 @@ def test_cli_search_json_includes_diagnostics():
         if "diagnostics" in out:
             assert "events" in out["diagnostics"]
             assert "elapsed_ms" in out["diagnostics"]
+
+
+def test_direct_cli_skips_python39_default_for_python311_on_path(tmp_path):
+    import os
+
+    cli = tmp_path / "wrr-cli.py"
+    cli.write_text(CLI.read_text(encoding="utf-8"), encoding="utf-8")
+    cli.chmod(0o755)
+    os.symlink(ROOT / "wrr", tmp_path / "wrr")
+    python39 = tmp_path / "python3"
+    python39.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    python39.chmod(0o755)
+    python311 = tmp_path / "python3.11"
+    python311.write_text(
+        f"#!/bin/sh\nexec {sys.executable!r} \"$@\"\n", encoding="utf-8",
+    )
+    python311.chmod(0o755)
+
+    completed = subprocess.run(
+        [str(cli), "doctor", "--help"],
+        cwd=tmp_path,
+        env={"PATH": str(tmp_path)},
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "usage: wrr-cli.py doctor" in completed.stdout
+
+
+def test_direct_cli_reports_missing_python311_or_newer(tmp_path):
+    cli = tmp_path / "wrr-cli.py"
+    cli.write_text(CLI.read_text(encoding="utf-8"), encoding="utf-8")
+    cli.chmod(0o755)
+    python39 = tmp_path / "python3"
+    python39.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    python39.chmod(0o755)
+
+    completed = subprocess.run(
+        [str(cli), "doctor", "--help"],
+        cwd=tmp_path,
+        env={"PATH": str(tmp_path)},
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert completed.returncode == 126
+    assert completed.stdout == ""
+    assert completed.stderr == (
+        "wrr-cli.py requires Python 3.11+; create .venv/venv or install "
+        "python3.11+ on PATH.\n"
+    )

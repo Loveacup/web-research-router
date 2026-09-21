@@ -8,6 +8,7 @@ from wrr.schemas import SearchOptions
 
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("GITHUB_TOKEN"), reason="GITHUB_TOKEN not set")
+@pytest.mark.asyncio
 async def test_github_search_live():
     engine = GitHubEngine()
     results = await engine.search(SearchOptions(query="asyncio", count=5))
@@ -20,6 +21,7 @@ async def test_github_search_live():
 
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("GITHUB_TOKEN"), reason="GITHUB_TOKEN not set")
+@pytest.mark.asyncio
 async def test_github_scored_descending():
     """返回结果应按综合评分降序（snippet 内 score= 单调不增）。"""
     engine = GitHubEngine()

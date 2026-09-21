@@ -2,7 +2,7 @@
 
 Semantic search router with mode-based routing, 11 engines, and Reciprocal Rank Fusion.
 
-**Current version:** 6.1.1 — v6.1 Engine Health Policy is released and the v6 descriptor-backed router is the default path (`WRR_V6_ROUTER=1`). P1 control-plane hardening (profile matrix, diagnostics, recovery runtime gate, OpenCLI status strict matching, GitHub fast-mode dynamic switching, academic client reuse) is documented in `RELEASE_NOTES_v6.1.1.md`.
+**Current version:** 6.1.2 — v6.1 Engine Health Policy remains released and the v6 descriptor-backed router is the default path (`WRR_V6_ROUTER=1`). The optional D7-S5 campaign sampler is packaged inside the plugin, disabled by default, and runs only when both `campaign.enabled` and `campaign_sampler.enabled` are explicitly true.
 
 ## Architecture
 
@@ -43,13 +43,13 @@ not on importing Agent-Reach code.
 
 ## Quick start
 
-Requires Python >= 3.10 (`pyproject.toml` enforces this). On macOS, `/usr/bin/env python3` may resolve to Python 3.9; for direct script usage prefer a 3.10+ environment or call `python3.10 ./wrr-cli.py ...`.
+Requires Python >= 3.11 (`pyproject.toml` enforces this). `./wrr-cli.py` selects a supported repository virtual environment or `python3.11+` on `PATH`; if none exists, it exits 126 with an actionable error.
 
 ```bash
 # Install as Hermes plugin
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 
-# Legacy-compatible CLI examples (run inside Python >=3.10)
+# Legacy-compatible CLI examples (requires Python >=3.11)
 ./wrr-cli.py doctor          # 引擎 + 全量依赖自检
 ./wrr-cli.py doctor --json   # legacy JSON 输出，迁移窗口内 schema 保持不变
 ./wrr-cli.py search "your query" --provider exa --count 5
@@ -60,7 +60,7 @@ wrr search "your query"      # Hermes runtime tool entrypoint
 
 ## Packaging & install
 
-Three interchangeable entrypoints share one codebase at package version `6.1.1`:
+Three interchangeable entrypoints share one codebase at package version `6.1.2`:
 
 ```bash
 # 1) pip install — exposes the `wrr` console script ([project.scripts] wrr = wrr._cli:main).
@@ -68,16 +68,20 @@ Three interchangeable entrypoints share one codebase at package version `6.1.1`:
 pip install .
 wrr doctor --v6 --json --runtime standalone
 
-# 2) Direct script — still works without install, on any Python >= 3.10:
+# 2) Direct script — bootstraps a repository venv or any Python >= 3.11:
 ./wrr-cli.py doctor --json
 ./wrr-cli.py search "your query" --provider exa --count 5
 
 # 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
-#    plugin.yaml `version` is kept aligned with the package version (6.1.1).
+#    plugin.yaml `version` is kept aligned with the package version (6.1.2).
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ```
 
 Notes:
+- The optional fixed campaign sampler is plugin-owned, disabled by default, and
+  supervised by the Hermes plugin lifecycle. It calls the registered WRR production
+  handler directly and stops on drain/close/disable or the first failed sample;
+  Hermes core is not modified.
 - The v6 migration gate stays **opt-in**: pip/console install does not flip the
   default router to v6: legacy `doctor`/`search` behavior is unchanged unless you
   pass `--v6` (see below).

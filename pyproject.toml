@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-research-router"
-version = "6.1.1"
+version = "6.1.2"
 description = "Semantic search router with 11 engines, mode-based routing, and RRF fusion"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "Alex Cai"},
