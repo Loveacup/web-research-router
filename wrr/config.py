@@ -471,7 +471,7 @@ SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 ARXIV_API = "http://export.arxiv.org/api/query"
 
 # ── Skill 发现引擎（v5.0）────────────────────────────────────────────
-SKILL_CODE_SEARCH_PATH = "path:**/SKILL.md"
+SKILL_CODE_SEARCH_PATH = "filename:SKILL.md"
 SKILL_MAX_ENTITIES = 30
 SKILL_ACTIVITY_WINDOW_DAYS = 90
 SKILL_EXCLUDE_DIRS = ("template/", "spec/", ".system/", "examples/")

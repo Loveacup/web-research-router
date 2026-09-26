@@ -1,6 +1,6 @@
 """Skill 发现引擎（v5.0，D3）。复用共享 GitHubClient，零自造认证/httpx。
 
-主力检索：code search ``path:**/SKILL.md`` 定位 SKILL.md → 反推 (repo, skill 子目录)
+主力检索：code search ``filename:SKILL.md`` 定位 SKILL.md → 反推 (repo, skill 子目录)
 → contents API 取 SKILL.md 内容（base64 解码）→ 解析 YAML frontmatter
 → **无 name 或无 description 即丢弃**（区分"真 skill" vs"恰好有 SKILL.md"）
 → 单 skill 级活跃度（``subdir_commit_count(path=子目录)``，解"大包整体≠单 skill"难点）
@@ -369,7 +369,7 @@ class SkillDiscoveryEngine(SearchEngine):
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(
                     "https://api.github.com/search/code",
-                    params={"q": "path:**/SKILL.md", "per_page": 1},
+                    params={"q": "filename:SKILL.md", "per_page": 1},
                     headers={
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/vnd.github.v3+json",

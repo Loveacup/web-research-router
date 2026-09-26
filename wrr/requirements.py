@@ -63,7 +63,7 @@ ENGINE_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
         "env": ["GITHUB_TOKEN"],
         "commands": [],
         "endpoints": [
-            "https://api.github.com/search/code (path:**/SKILL.md)",
+            "https://api.github.com/search/code (filename:SKILL.md)",
             "https://api.github.com/repos/vercel-labs/skills (主信源)",
         ],
         "description": "Skill Discovery（GitHub code search；主信源 vercel-labs/skills + Agent-Reach/last30days 等）",
