@@ -6,6 +6,8 @@ from typing import List
 from .base import SearchEngine
 from .. import config
 from ..errors import EngineError, EngineTimeoutError, RateLimitError
+from ..extraction import make_extraction
+from ..fetch_transport import fetch_html
 from ..schemas import SearchOptions, SearchResult, ExtractOptions, ExtractResult, EngineCheckResult
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -51,15 +53,14 @@ class BraveEngine(SearchEngine):
                 for r in data.get("web", {}).get("results", [])]
 
     async def extract(self, options: ExtractOptions) -> ExtractResult:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
-            resp = await client.get(options.url, headers={"User-Agent": config.USER_AGENT})
-            resp.raise_for_status()
-            html = resp.text
+        html = await fetch_html(
+            options.url, timeout=self.timeout, allow_private_origin=options.allow_private_origin,
+        )
         # 极简正文提取：剥 script/style → 剥标签 → 折叠空白。
         text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        return ExtractResult(url=options.url, text=text[:options.max_characters])
+        return make_extraction(options, text, method="httpx.html_tag_strip")
 
     async def health_check(self, *, deep: bool = False) -> EngineCheckResult:
         """检查 Brave API key（主用或备用）是否存在。"""

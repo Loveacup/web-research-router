@@ -16,7 +16,8 @@ async def handle_web_fetch(args, **kwargs) -> str:
         config.MAX_MAX_CHARACTERS,
     )
     provider = args.get("provider")
-    options = ExtractOptions(url=url, max_characters=max_chars, provider=provider)
+    options = ExtractOptions(url=url, max_characters=max_chars, provider=provider,
+                             allow_private_origin=args.get("allow_private_origin"))
     try:
         result = await route("extract", options, get_registry(), explicit_provider=provider)
         return format_extract(result, url)
