@@ -414,10 +414,12 @@ def test_last30days_adapter_parses_mixed_stdout():
 
 
 def test_fetch_source_wired_to_adapter_registry():
-    assert set(cm._SOURCE_ADAPTERS) >= {"opencli", "last30days"}
+    assert set(cm._SOURCE_ADAPTERS) >= {"opencli", "last30days", "mcp"}
     from wrr.engines import community_sources as cs
     assert isinstance(cm._SOURCE_ADAPTERS["opencli"], cs.OpenCliSourceAdapter)
-    assert isinstance(cm._SOURCE_ADAPTERS["last30days"], cs.Last30DaysSourceAdapter)
+    assert isinstance(
+        cm._SOURCE_ADAPTERS["last30days"], cs.Last30DaysSourceAdapter)
+    assert isinstance(cm._SOURCE_ADAPTERS["mcp"], cs.McpSourceAdapter)
 
 
 def test_fetch_source_rss_accepts_float_now_and_datetime_published_at():
@@ -722,12 +724,14 @@ def test_source_outcome_and_result_wrapper_exposed():
     from wrr.engines import community_sources as cs
     assert hasattr(cs, "SourceOutcome")
     assert hasattr(cs, "SourceFetchResult")
-    # 四态齐备
-    for name in ("READY", "EMPTY", "UNAUTHENTICATED", "SOFT_BLOCKED"):
+    for name in (
+            "READY", "EMPTY", "UNAUTHENTICATED", "SOFT_BLOCKED",
+            "PERMISSION_DENIED"):
         assert hasattr(cs.SourceOutcome, name)
-    r = cs.SourceFetchResult(items=[{"a": 1}], outcome=cs.SourceOutcome.READY)
-    assert r.items == [{"a": 1}]
-    assert r.outcome is cs.SourceOutcome.READY
+    result = cs.SourceFetchResult(
+        items=[{"a": 1}], outcome=cs.SourceOutcome.READY)
+    assert result.items == [{"a": 1}]
+    assert result.outcome is cs.SourceOutcome.READY
 
 
 def test_opencli_outcome_ready():

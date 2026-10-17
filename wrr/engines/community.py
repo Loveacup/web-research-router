@@ -33,6 +33,7 @@ from .base import SearchEngine
 from . import _fusion
 from .community_sources import (SOURCE_ADAPTERS as _SOURCE_ADAPTERS,
                                 SourceFetchResult, SourceOutcome)
+from .configured_sources import load_source_config, run_isolated_command
 from .. import config
 from ..errors import EngineError
 from ..schemas import SearchOptions, SearchResult, EngineCheckResult
@@ -264,7 +265,7 @@ def _quality_score(comments: int, engagement: int) -> float:
 def calculate_score(item: Dict[str, Any], source_config: Dict[str, Any],
                     now: Optional[datetime] = None) -> float:
     """统一三维加权综合分。权重取自 config.COMMUNITY_SCORE_WEIGHTS。"""
-    eng = _to_int(item.get(source_config["engagement"], 0))
+    eng = _to_int(item.get(source_config.get("engagement"), 0))
     cfield = source_config.get("comments")
     com = _to_int(item.get(cfield, 0)) if cfield else 0
     tval = item.get(source_config["time"]) if source_config.get("time") else None
@@ -382,6 +383,8 @@ class CommunityEngine(SearchEngine):
         # 实例级、source-local breaker：source -> 冷却到期的 monotonic 时刻。
         # 每个 engine 实例独立，无跨实例/全局共享，避免污染。
         self._breaker_open_until: Dict[str, float] = {}
+        self._configured_sources, self._configured_defaults = load_source_config(
+            reserved=COMMUNITY_SOURCES)
 
     # ── source-local TTL breaker ─────────────────────────────────────
     def _breaker_should_skip(self, source: str) -> bool:
@@ -524,7 +527,8 @@ class CommunityEngine(SearchEngine):
             return []
 
         if not picked:
-            picked = list(config.COMMUNITY_DEFAULT_SOURCES)
+            picked = list(self._configured_defaults if self._configured_defaults is not None
+                          else config.COMMUNITY_DEFAULT_SOURCES)
 
         # 研究意图 / 显式开关 → 追加 last30days 重型源
         research = any(k in q for k in ("trending", "30 days", "30天", "最近", "本周", "this week"))
@@ -535,43 +539,46 @@ class CommunityEngine(SearchEngine):
 
     # ── 单源抓取（适配器分派 + 超时 + 异常隔离）─────────────────────
     async def _collect_sources(self, sources, options, now):
-        """在请求总截止时间内收集子源，保留已完成结果并取消慢源。"""
+        """在请求总截止时间内收集子源；调用方取消也必须回收已创建的任务。"""
         tasks = {
             source: asyncio.create_task(
                 self._fetch_source_execution(source, options, now))
             for source in sources
         }
-        done, pending = await asyncio.wait(
-            set(tasks.values()), timeout=config.COMMUNITY_TOTAL_TIMEOUT)
-        completed: Dict[str, _SourceExecution] = {}
-        for source, task in tasks.items():
-            if task not in done:
-                continue
-            try:
-                completed[source] = task.result()
-            except Exception as exc:
-                completed[source] = _SourceExecution(
-                    scored=[],
-                    diagnostic=CommunitySourceDiagnostic(
-                        source=source, outcome=SourceOutcome.ERROR,
-                        elapsed_ms=0.0, detail=type(exc).__name__),
-                )
+        pending = set(tasks.values())
+        try:
+            done, pending = await asyncio.wait(
+                pending, timeout=config.COMMUNITY_TOTAL_TIMEOUT)
+            completed: Dict[str, _SourceExecution] = {}
+            for source, task in tasks.items():
+                if task not in done:
+                    continue
+                try:
+                    completed[source] = task.result()
+                except Exception as exc:
+                    completed[source] = _SourceExecution(
+                        scored=[],
+                        diagnostic=CommunitySourceDiagnostic(
+                            source=source, outcome=SourceOutcome.ERROR,
+                            elapsed_ms=0.0, detail=type(exc).__name__),
+                    )
 
-        cutoff_reason = "request_deadline" if pending else None
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for source, task in tasks.items():
-            if task in pending:
-                completed[source] = _SourceExecution(
-                    scored=[],
-                    diagnostic=CommunitySourceDiagnostic(
-                        source=source, outcome=SourceOutcome.CUTOFF,
-                        elapsed_ms=config.COMMUNITY_TOTAL_TIMEOUT * 1000.0,
-                        cutoff_reason="request_deadline"),
-                )
-        return [completed[source] for source in sources], cutoff_reason
+            cutoff_reason = "request_deadline" if pending else None
+            for source, task in tasks.items():
+                if task in pending:
+                    completed[source] = _SourceExecution(
+                        scored=[],
+                        diagnostic=CommunitySourceDiagnostic(
+                            source=source, outcome=SourceOutcome.CUTOFF,
+                            elapsed_ms=config.COMMUNITY_TOTAL_TIMEOUT * 1000.0,
+                            cutoff_reason="request_deadline"),
+                    )
+            return [completed[source] for source in sources], cutoff_reason
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _fetch_source(self, source: str, options, now) -> List[_Scored]:
         """向后兼容的裸结果入口；请求聚合使用带诊断版本。"""
@@ -580,13 +587,20 @@ class CommunityEngine(SearchEngine):
 
     async def _fetch_source_execution(self, source: str, options, now) -> _SourceExecution:
         started = time.monotonic()
-        cfg = COMMUNITY_SOURCES.get(source)
+        cfg = self._configured_sources.get(source) or COMMUNITY_SOURCES.get(source)
         if not cfg:
             return _SourceExecution(
                 scored=[],
                 diagnostic=CommunitySourceDiagnostic(
                     source=source, outcome=SourceOutcome.ERROR,
                     elapsed_ms=0.0, detail="unknown_source"),
+            )
+        if source in self._configured_sources and not cfg["authorized"]:
+            return _SourceExecution(
+                scored=[],
+                diagnostic=CommunitySourceDiagnostic(
+                    source=source, outcome=SourceOutcome.PERMISSION_DENIED,
+                    elapsed_ms=0.0, detail="source_not_authorized"),
             )
         adapter = _SOURCE_ADAPTERS.get(cfg["kind"])
         if adapter is None:
@@ -629,7 +643,7 @@ class CommunityEngine(SearchEngine):
             diagnostic=CommunitySourceDiagnostic(
                 source=source, outcome=result.outcome,
                 elapsed_ms=(time.monotonic() - started) * 1000.0,
-                items_count=len(out)),
+                items_count=len(out), detail=result.detail),
         )
 
     async def _fetch_via_adapter(self, adapter, cfg, options) -> SourceFetchResult:
@@ -640,12 +654,17 @@ class CommunityEngine(SearchEngine):
         从不触发 breaker，语义保持不变。在调用点解析模块级 `_run_cmd`，保留单测
         monkeypatch 语义。
         """
+        runner = _run_cmd
+        if any(cfg is value for value in self._configured_sources.values()):
+            async def runner(cli, timeout):
+                return await run_isolated_command(
+                    cli, timeout, shared_env_keys=cfg["shared_env_keys"])
         fetch_result = getattr(adapter, "fetch_result", None)
         if fetch_result is not None:
             return await fetch_result(
-                cfg, options, _run_cmd, config.COMMUNITY_SOURCE_TIMEOUT)
+                cfg, options, runner, config.COMMUNITY_SOURCE_TIMEOUT)
         items = await adapter.fetch(
-            cfg, options, _run_cmd, config.COMMUNITY_SOURCE_TIMEOUT)
+            cfg, options, runner, config.COMMUNITY_SOURCE_TIMEOUT)
         return SourceFetchResult(
             items=items,
             outcome=SourceOutcome.READY if items else SourceOutcome.EMPTY)

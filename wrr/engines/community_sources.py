@@ -53,6 +53,7 @@ class SourceOutcome(enum.Enum):
     PLATFORM_ERROR = "platform_error"
     SCHEMA_ERROR = "schema_error"
     ERROR = "error"
+    PERMISSION_DENIED = "permission_denied"
     SKIPPED = "skipped"
     CUTOFF = "cutoff"
 
@@ -63,6 +64,7 @@ class SourceFetchResult:
 
     items: List[Dict[str, Any]] = field(default_factory=list)
     outcome: SourceOutcome = SourceOutcome.EMPTY
+    detail: Optional[str] = None
 
 
 # 从 stderr（必要时含 stdout）识别登录墙 / 软封锁的标记（全小写子串匹配）。
@@ -206,7 +208,15 @@ class OpenCliSourceAdapter:
             except json.JSONDecodeError:
                 last_failure = SourceOutcome.SCHEMA_ERROR
                 continue
-            items = data if isinstance(data, list) else (data.get("results") or data.get("items") or [])
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("results", data.get("items", []))
+            else:
+                items = None
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                last_failure = SourceOutcome.SCHEMA_ERROR
+                continue
             if not items:
                 continue
             if is_backup and cfg.get("backup_filter_by_query"):
@@ -404,9 +414,12 @@ class RssSourceAdapter:
             return value
 
 
+from .mcp_source import McpSourceAdapter
+
 # kind → 适配器实例（无状态，可复用）
 SOURCE_ADAPTERS: Dict[str, CommunitySourceAdapter] = {
     "opencli": OpenCliSourceAdapter(),
     "last30days": Last30DaysSourceAdapter(),
     "rss": RssSourceAdapter(),
+    "mcp": McpSourceAdapter(),
 }

@@ -148,7 +148,8 @@ def test_detect_sources_wechat_requires_both_keyword_and_feeds(monkeypatch):
     """
     import wrr.engines.community as community_mod
     from wrr.engines.community import CommunityEngine
-    eng = CommunityEngine.__new__(CommunityEngine)
+    monkeypatch.delenv("WRR_COMMUNITY_CONFIG", raising=False)
+    eng = CommunityEngine()
 
     # Case 1: feeds empty + keyword present → wechat_rss must NOT be added
     monkeypatch.setattr(community_mod.config, "WECHAT_RSS_FEEDS", ())
