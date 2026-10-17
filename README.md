@@ -1,8 +1,8 @@
 # Web Research Router (WRR)
 
-Semantic search router with mode-based routing, 11 engines, and Reciprocal Rank Fusion.
+Semantic search router with mode-based routing, 12 registered engines (11 routed + Tavily backfill), and Reciprocal Rank Fusion.
 
-**Current version:** 6.1.2 — v6.1 Engine Health Policy remains released and the v6 descriptor-backed router is the default path (`WRR_V6_ROUTER=1`). The optional D7-S5 campaign sampler is packaged inside the plugin, disabled by default, and runs only when both `campaign.enabled` and `campaign_sampler.enabled` are explicitly true.
+**Current version:** 6.1.2 — v6.1 Engine Health Policy is released. Production search still executes on the legacy v5 mode/RRF data plane (Stage S); the v6 descriptor registry participates only as a shadow selection and evidence source. The optional D7-S5 campaign sampler is packaged inside the plugin, disabled by default, and runs only when both `campaign.enabled` and `campaign_sampler.enabled` are explicitly true.
 
 ## Design scope and progress
 
@@ -18,16 +18,26 @@ browser use, delegation, or report files. This coordination is not implemented.
 
 ## Architecture
 
-### Runtime modes
+Interactive diagrams (generated with archify from the code at this revision): `docs/architecture/wrr-components.html` (component map) and `docs/architecture/wrr-web-search.html` (Hermes `web_search` request sequence). Sources: the `*.json` specs beside them.
 
-**Hermes plugin `web_search`** uses the v6 descriptor-backed registry when
-`WRR_V6_ROUTER=1`, falling back to the v5 mode/RRF route when the variable is unset.
 
-### v6 descriptor bridge (default as of v6.1)
+### Runtime paths
 
-v6.1 completed the S3 default switch: the descriptor-backed registry is the live
-default path when `WRR_V6_ROUTER=1` (set in the launch environment). The legacy
-v5 mode/RRF route remains available by unsetting `WRR_V6_ROUTER`.
+| Entrypoint | Router | Registry used for execution |
+|---|---|---|
+| Hermes plugin `web_search` | v5 `route_search_v5` with Stage S on (`__init__.py` sets `stage_s_enabled=True`) | legacy `default_registry()`; `WRR_V6_ROUTER` does **not** change execution |
+| `wrr search --route-mode <mode>` | v5 `route_search_v5`, Stage S off | legacy by default; v6 descriptor-backed registry when `WRR_V6_ROUTER=1` |
+| `wrr search` / `fetch` / `similar` (no `--route-mode`) | v4 sequential `route()` — first non-empty engine wins, no RRF | legacy |
+
+### v6 descriptor bridge (shadow, opt-in)
+
+When Stage S is on (the packaged Hermes path) the v6 registry builds a
+`DecisionContext` that is compared against the legacy selection plan
+(`wrr/selection_shadow.py`). The comparison is recorded in `RouteTrace` and the
+decision-evidence sink; it never changes which engines run. Only Stage-S-off
+callers with `WRR_V6_ROUTER=1` execute through the descriptor-backed registry
+(`wrr/router.py:_route_registry`). Stage C (descriptor-driven production
+execution) is not enabled in this release.
 
 ### Agent-Reach provenance
 
@@ -37,21 +47,30 @@ not on importing Agent-Reach code.
 
 ### 8 routing modes
 
-| Mode | Use case | Engines |
-|------|----------|---------|
-| discovery | "what's out there" | exa + brave + github + community |
-| grounding | "what's the fact" | exa + brave |
-| research | deep investigation | exa (deep) + brave + academic |
-| academic | papers only | openalex + semantic-scholar + arxiv |
-| platform | platform/community-specific questions | github + community |
-| broad | broad practical interest / exploratory queries | exa + brave + community |
-| local | search my stuff | supermemory + session + qmd + obsidian |
-| recovery | everything failed | searxng |
+Mode is chosen by `resolve_mode()`: explicit `route_mode` → legacy `mode` →
+`classify_intent(query)` (keyword rules, no LLM; priority recovery → local →
+broad → platform → academic → research → discovery → grounding). Base engines
+and RRF weights come from `wrr/config.py` `MODE_DISPATCH` / `MODE_WEIGHTS`;
+query triggers may append `github`, `skill`, `academic`, or `community`.
 
-### 11 engines
+| Mode | Use case | Base engines (in order) | Notable weights |
+|------|----------|-------------------------|-----------------|
+| discovery | "what's out there" | exa, brave, community | community 0.50 |
+| grounding | "what's the fact" | exa, brave | — |
+| research | deep investigation | exa (`deep-lite`), brave, community, academic | community 0.35, academic 0.30 |
+| academic | papers | academic (OpenAlex + Semantic Scholar; arXiv off by default), exa, community | academic 1.0 |
+| platform | platform/community questions | community, exa, brave | community 1.0 |
+| broad | exploratory queries | exa, brave, community, searxng | community 0.55, searxng 0.30 |
+| local | search my stuff | supermemory, session, qmd, obsidian, exa, brave | local 1.0/0.9/0.9/0.8, web 0.3 |
+| recovery | primary mode returned nothing | brave, exa, searxng | gated by `recovery_allowed(runtime)` |
 
-- **Public-web (7):** Exa, Brave, GitHub, Community (OpenCLI), Academic (OpenAlex+Semantic Scholar+arXiv), Skill, SearXNG
+### 12 engines
+
+- **Public-web (8):** Exa, Brave, GitHub, Community (OpenCLI + Last30Days + RSS), Academic (OpenAlex + Semantic Scholar, optional arXiv), Skill, SearXNG, Tavily
 - **Local (4):** Supermemory, Session, QMD, Obsidian
+
+Tavily is registered but not in any mode; it is only used as a bounded diversity
+backfill for `grounding` / `research` when Brave fails (rate-limit / timeout / empty).
 
 ## Quick start
 
@@ -67,7 +86,7 @@ ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ./wrr-cli.py search "your query" --provider exa --count 5
 ./wrr-cli.py fetch "https://example.com" --provider exa --max-chars 2000
 ./wrr-cli.py similar "https://example.com" --provider exa --count 5
-wrr search "your query"      # Hermes runtime tool entrypoint
+wrr search "your query" --route-mode research   # standalone CLI (wrr._cli:main); v5 mode routing needs --route-mode
 ```
 
 ### OMP native extension
@@ -371,8 +390,10 @@ real-host activation acceptance and release approval remain outstanding.
 
 ## v6 CLI migration gate
 
-v6.0 introduced the control-plane CLI; v6.1 completed the S3 default switch and the
-Engine Health Policy. Legacy `doctor` behavior and old JSON consumers still work
+v6.0 introduced the control-plane CLI; v6.1 added the Engine Health Policy. The
+v6.0 S3 default switch was later superseded by Stage S: production execution is
+legacy-only and the descriptor registry is shadow/evidence only (see "Runtime
+paths" above). Legacy `doctor` behavior and old JSON consumers still work
 when `WRR_V6_ROUTER` is unset.
 
 ```bash
@@ -421,8 +442,9 @@ automation is wired into the search hot path; the fallback remains a v6.x candid
 ### v6.1.1 — P1 control-plane hardening (released)
 
 - `wrr-cli.py doctor --v6 --profile-matrix --json` — per-profile readiness
-  across `hermes` / `claude_code` / `codex` / `omp`; control-plane only;
-  `--engine` / `--tier` / `--deep` rejected.
+  across the built-in doctor profiles (`default_doctor_profiles()`: default,
+  editable install, standalone, S2 codex, S3 hermes, cron worker, Hermes
+  runtime); control-plane only; `--engine` / `--tier` / `--deep` rejected.
 - `RouterResult.diagnostics` carries `RouteTrace` (mode / mode_reason /
   engines / events / timing) for every search call.
 - `config.recovery_allowed(runtime)` gates the search recovery fallback.

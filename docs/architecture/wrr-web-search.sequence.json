@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Hermes web_search 一次请求的完整时序",
+    "output": "wrr-web-search.html",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      690
+    ],
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "admission",
+        "label": "准入",
+        "focus": [
+          "hermes",
+          "plugin",
+          "campaign"
+        ],
+        "note": "pre_llm_call 刷新上下文；campaign 开启时先做准入，失败不阻断普通搜索。"
+      },
+      {
+        "id": "routing",
+        "label": "选路与执行",
+        "focus": [
+          "router",
+          "shadow",
+          "engines"
+        ],
+        "note": "关键词分类出 mode，并行跑引擎；影子比对只记录，不改执行列表。"
+      },
+      {
+        "id": "output",
+        "label": "融合与证据",
+        "focus": [
+          "router",
+          "sink",
+          "plugin",
+          "hermes"
+        ],
+        "note": "RRF 融合、去重、写证据，再格式化返回。"
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "hermes",
+      "type": "external",
+      "label": "Hermes",
+      "sublabel": "LLM 宿主"
+    },
+    {
+      "id": "plugin",
+      "type": "frontend",
+      "label": "插件 handler",
+      "sublabel": "_bound_web_search"
+    },
+    {
+      "id": "campaign",
+      "type": "messagebus",
+      "label": "Campaign",
+      "sublabel": "默认关闭"
+    },
+    {
+      "id": "router",
+      "type": "backend",
+      "label": "v5 路由器",
+      "sublabel": "route_search_v5"
+    },
+    {
+      "id": "shadow",
+      "type": "security",
+      "label": "影子比对",
+      "sublabel": "DecisionContext"
+    },
+    {
+      "id": "engines",
+      "type": "external",
+      "label": "mode 引擎",
+      "sublabel": "legacy registry"
+    },
+    {
+      "id": "sink",
+      "type": "database",
+      "label": "证据 sink",
+      "sublabel": "JSONL"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 265,
+      "label": "准入"
+    },
+    {
+      "from": 275,
+      "to": 455,
+      "label": "选路与执行"
+    },
+    {
+      "from": 465,
+      "to": 580,
+      "label": "融合与返回"
+    }
+  ],
+  "messages": [
+    {
+      "id": "pre-llm",
+      "from": "hermes",
+      "to": "plugin",
+      "y": 165,
+      "label": "pre_llm_call 刷新上下文",
+      "variant": "dashed"
+    },
+    {
+      "id": "call",
+      "from": "hermes",
+      "to": "plugin",
+      "y": 195,
+      "label": "web_search(query)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "admit",
+      "from": "plugin",
+      "to": "campaign",
+      "y": 225,
+      "label": "admit(request_key)",
+      "variant": "dashed"
+    },
+    {
+      "id": "admitted",
+      "from": "campaign",
+      "to": "plugin",
+      "y": 255,
+      "label": "准入 / 跳过",
+      "variant": "return"
+    },
+    {
+      "id": "route",
+      "from": "plugin",
+      "to": "router",
+      "y": 290,
+      "label": "Stage S=on + legacy registry",
+      "variant": "emphasis",
+      "note": "resolve_mode: route_mode → mode → classify_intent 关键词"
+    },
+    {
+      "id": "compare",
+      "from": "router",
+      "to": "shadow",
+      "y": 320,
+      "label": "比对 legacy / 描述符计划",
+      "variant": "dashed"
+    },
+    {
+      "id": "codes",
+      "from": "shadow",
+      "to": "router",
+      "y": 350,
+      "label": "E0-E2 / U1-U3",
+      "variant": "return"
+    },
+    {
+      "id": "gather",
+      "from": "router",
+      "to": "engines",
+      "y": 385,
+      "label": "asyncio.gather 每个 ≤10s",
+      "variant": "emphasis"
+    },
+    {
+      "id": "results",
+      "from": "engines",
+      "to": "router",
+      "y": 415,
+      "label": "结果 / 超时 / 限流",
+      "variant": "return"
+    },
+    {
+      "id": "recovery",
+      "from": "router",
+      "to": "engines",
+      "y": 445,
+      "label": "全空时 recovery 重派",
+      "variant": "dashed"
+    },
+    {
+      "id": "evidence",
+      "from": "router",
+      "to": "sink",
+      "y": 480,
+      "label": "DecisionEvidence v2",
+      "variant": "dashed"
+    },
+    {
+      "id": "fused",
+      "from": "router",
+      "to": "plugin",
+      "y": 510,
+      "label": "RRF k=60 + 去重",
+      "variant": "return"
+    },
+    {
+      "id": "finish",
+      "from": "plugin",
+      "to": "campaign",
+      "y": 540,
+      "label": "finish / drop",
+      "variant": "dashed"
+    },
+    {
+      "id": "reply",
+      "from": "plugin",
+      "to": "hermes",
+      "y": 570,
+      "label": "format_search JSON",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "plugin",
+      "from": 190,
+      "to": 576,
+      "type": "frontend"
+    },
+    {
+      "participant": "campaign",
+      "from": 220,
+      "to": 261,
+      "type": "messagebus"
+    },
+    {
+      "participant": "router",
+      "from": 290,
+      "to": 516,
+      "type": "backend"
+    },
+    {
+      "participant": "shadow",
+      "from": 315,
+      "to": 356,
+      "type": "security"
+    },
+    {
+      "participant": "engines",
+      "from": 380,
+      "to": 451,
+      "type": "external"
+    },
+    {
+      "participant": "sink",
+      "from": 475,
+      "to": 486,
+      "type": "database"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "选路规则",
+      "items": [
+        "优先级：recovery → local → broad → platform → academic → research → discovery → grounding",
+        "纯关键词判断，不调 LLM",
+        "命中触发词再追加 github / skill / academic / community"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "降级",
+      "items": [
+        "单引擎失败只记事件，不拖垮整体",
+        "grounding/research 在 Brave 失败时可补一次 Tavily",
+        "全空时按 recovery_allowed(runtime) 决定是否用 recovery mode 重派"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "证据",
+      "items": [
+        "上下文完整时写 v2，否则回退 v1",
+        "写证据失败不影响返回",
+        "Campaign 未完成的准入在 finally 里 drop"
+      ]
+    }
+  ]
+}

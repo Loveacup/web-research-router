@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "dd7215bb-3503-4f88-b976-c5905434ba9e",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Users/alexcai/code/web-research-router/docs/architecture/wrr-components.architecture.json",
+  "output": "/Users/alexcai/code/web-research-router/docs/architecture/wrr-components.html",
+  "specification": {
+    "sha256": "1ed1cad0f578763db0e38733856446671f291b262e2ede1f0b051e1da20285bf",
+    "bytes": 6060
+  },
+  "artifact": {
+    "sha256": "8bc28c7f52893715b22c0f0bd79e035dd28d9f9b6185c2716df9f920171a2130",
+    "bytes": 828992
+  }
+}

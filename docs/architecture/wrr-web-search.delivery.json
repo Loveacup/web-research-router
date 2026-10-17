@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "7ee12395-cbbb-4ddf-a50d-32f4d092795a",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/Users/alexcai/code/web-research-router/docs/architecture/wrr-web-search.sequence.json",
+  "output": "/Users/alexcai/code/web-research-router/docs/architecture/wrr-web-search.html",
+  "specification": {
+    "sha256": "9d54df9f4f28434e4ea58915e81f8a73108b7eea0dbdf6b0c2d1bcd7f24a8649",
+    "bytes": 6220
+  },
+  "artifact": {
+    "sha256": "c55b7e1c30502a222d82a3bc4a00241aaa685d2318355d9dfd319105a3dd37a8",
+    "bytes": 820306
+  }
+}
