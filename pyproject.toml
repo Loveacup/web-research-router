@@ -25,7 +25,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "httpx"]
+dev = ["pytest", "pytest-asyncio", "httpx", "jsonschema", "referencing"]
+mcp = ["mcp>=2.0,<3"]
 
 [project.scripts]
 wrr = "wrr._cli:main"

@@ -71,6 +71,25 @@ def test_canonical_versions_match():
     assert len(set(sources.values())) == 1, sources
 
 
+def test_dev_extra_declares_schema_dependencies_without_requiring_mcp():
+    """Unconditional schema regressions must work with the dev extra alone."""
+    import tomllib
+
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
+
+    def names(requirements):
+        return {
+            re.split(r"[\s\[<>=!~;]", requirement, maxsplit=1)[0].lower().replace("_", "-")
+            for requirement in requirements
+        }
+
+    extras = project["optional-dependencies"]
+    assert {"jsonschema", "referencing"} <= names(extras["dev"])
+    assert "mcp" not in names(project["dependencies"])
+    assert "mcp" not in names(extras["dev"])
+    assert extras["mcp"] == ["mcp>=2.0,<3"]
+
+
 def test_top_level_import_is_light():
     """子进程纯净导入 entry，断言重依赖未被顶层拉起。"""
     code = (
@@ -193,19 +212,53 @@ def test_schemas_are_openai_function_format():
         assert "properties" in schema["parameters"], name
 
 
-def test_schema_properties_align_with_handlers():
-    mod = _load_entry()
+@pytest.mark.parametrize("name, expected", [
+    ("web_search", {"query", "max_results", "provider", "mode", "campaign_id"}),
+    ("web_fetch", {"url", "max_characters", "provider", "allow_private_origin"}),
+    ("web_similar", {"url", "max_results", "provider"}),
+])
+def test_schema_properties_exact_contract(name, expected):
+    """Catch removed, renamed and unexpected fields on every registered tool."""
     ctx = MockCtx()
-    mod.register(ctx)
-    assert set(ctx.tools["web_search"]["schema"]["parameters"]["properties"]) == {
-        "query", "max_results", "provider", "mode", "campaign_id",
-    }
-    assert set(ctx.tools["web_fetch"]["schema"]["parameters"]["properties"]) == {
-        "url", "max_characters", "provider",
-    }
-    assert set(ctx.tools["web_similar"]["schema"]["parameters"]["properties"]) == {
-        "url", "max_results", "provider",
-    }
+    _load_entry().register(ctx)
+    assert set(ctx.tools[name]["schema"]["parameters"]["properties"]) == expected
+
+
+def test_registered_fetch_exposes_and_honors_request_scoped_grant(monkeypatch):
+    import json
+    import httpx
+    from httpx._client import AsyncClient
+    from wrr.engines.brave import BraveEngine
+    from wrr.registry import EngineRegistry
+    from wrr.tools import web_fetch
+
+    requests = []
+
+    async def transport(request):
+        requests.append(str(request.url))
+        return httpx.Response(200, text="<p>Authorized local fixture</p>")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: AsyncClient(
+        **kwargs, transport=httpx.MockTransport(transport)))
+    registry = EngineRegistry()
+    registry.register(BraveEngine())
+    monkeypatch.setattr(web_fetch, "get_registry", lambda: registry)
+    ctx = MockCtx()
+    _load_entry().register(ctx)
+    tool = ctx.tools["web_fetch"]
+    assert "allow_private_origin" in tool["schema"]["parameters"]["properties"]
+    args = {"url": "http://127.0.0.1:8080/fixture", "provider": "brave"}
+    before = json.loads(asyncio.run(tool["handler"](args)))
+    authorized = json.loads(asyncio.run(tool["handler"]({
+        **args, "allow_private_origin": "http://127.0.0.1:8080",
+    })))
+    after = json.loads(asyncio.run(tool["handler"](args)))
+    assert "denied" in before["error"] and "denied" in after["error"]
+    assert authorized["success"] is True
+    assert "Authorized local fixture" in authorized["content"]
+    assert len(requests) == 1
+
+
 
 
 def test_provider_schema_rejects_fusion_labels():

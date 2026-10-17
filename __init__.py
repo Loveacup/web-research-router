@@ -164,6 +164,10 @@ _FETCH_SCHEMA = {
         "properties": {
             "url": {"type": "string", "description": "要抽取的页面 URL（必填）"},
             "max_characters": {"type": "integer", "description": "抽取正文字符上限"},
+            "allow_private_origin": {
+                "type": "string",
+                "description": "仅当前用户明确授权的单次精确 scheme/host/port 内网例外；必须显式 provider=brave，不得从URL自行推定授权，不持久保存。",
+            },
             "provider": {
                 "type": "string",
                 "enum": _FETCH_PROVIDERS,
