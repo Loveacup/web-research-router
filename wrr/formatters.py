@@ -10,7 +10,8 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 from . import config
-from .schemas import FallbackStep, RouterResult, EngineCheckResult, SearchResult
+from .schemas import FallbackStep, RouterResult, EngineCheckResult, SearchResult, ExtractResult, RouteQuality
+from .extraction import qualify_extraction
 
 
 def _chain_dicts(steps: List[FallbackStep]):
@@ -90,15 +91,18 @@ def _banner(result: RouterResult, primary: str) -> str:
 def quality_payload(result: RouterResult) -> dict:
     if result.quality is not None:
         return result.quality.to_dict()
-    return {
-        "verdict": "complete",
-        "expected_sources": [result.actual_provider],
-        "successful_sources": [result.actual_provider],
-        "failed_sources": [],
-        "independent_source_count": 1,
-        "min_required": 1,
-        "reasons": ["legacy_route_without_quality"],
-    }
+    quality = RouteQuality(
+        verdict="complete",
+        expected_sources=[result.actual_provider],
+        successful_sources=[result.actual_provider],
+        failed_sources=[],
+        independent_source_count=1,
+        min_required=1,
+        reasons=["legacy_route_without_quality"],
+    )
+    if isinstance(result.payload, ExtractResult):
+        qualify_extraction(result.payload, quality)
+    return quality.to_dict()
 
 
 def failed_quality_payload() -> dict:
@@ -199,6 +203,7 @@ def format_extract(result: RouterResult, url: str) -> str:
             "actualProvider": result.actual_provider,
             "chars": len(ex.text),
             "highlights": ex.highlights,
+            "extraction": ex.content_metadata(),
             "fallback_chain": _chain_dicts(result.fallback_chain),
             "backup_hint": config.BACKUP_HINT,
             "quality": quality,

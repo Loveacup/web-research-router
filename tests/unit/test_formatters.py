@@ -74,7 +74,6 @@ def test_format_extract_includes_highlights():
     out = json.loads(format_extract(rr, "https://x"))
     assert out["details"]["actualProvider"] == "exa"
     assert out["details"]["highlights"] == ["hl1"]
-    assert out["details"]["quality"]["verdict"] == "complete"
     assert "Highlights" in out["content"]
 
 

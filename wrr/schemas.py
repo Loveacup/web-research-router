@@ -66,6 +66,7 @@ class ExtractOptions:
     url: str
     max_characters: int = config.DEFAULT_MAX_CHARACTERS
     provider: Optional[str] = None
+    allow_private_origin: Optional[str] = None
 
 
 @dataclass
@@ -73,9 +74,31 @@ class ExtractResult:
     url: str
     text: str
     highlights: List[str] = field(default_factory=list)
+    content_kind: str = "unknown"
+    content_type: str = "text/plain"
+    completeness: str = "unknown"
+    extraction_method: str = "unknown"
+    fetched_at: Optional[str] = None
+
+    @property
+    def partial(self) -> bool:
+        return self.content_kind != "body" or self.completeness != "complete"
+
+    def content_metadata(self) -> Dict[str, Any]:
+        return {
+            "content_kind": self.content_kind,
+            "content_type": self.content_type,
+            "completeness": self.completeness,
+            "extraction_method": self.extraction_method,
+            "fetched_at": self.fetched_at,
+            "partial": self.partial,
+        }
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"url": self.url, "text": self.text, "highlights": self.highlights}
+        return {
+            "url": self.url, "text": self.text, "highlights": self.highlights,
+            **self.content_metadata(),
+        }
 
 
 # ── Similar（findSimilar）────────────────────────────────────────────

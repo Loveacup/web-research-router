@@ -1,4 +1,4 @@
-"""单测公共桩件：fake 引擎 + fake httpx 客户端。无真实网络。"""
+"""Unit fixtures: isolated HOME and fake engines/HTTP; local wire tests stay real."""
 import sys
 from pathlib import Path
 
@@ -12,6 +12,30 @@ if str(ROOT) not in sys.path:
 from wrr.engines.base import SearchEngine  # noqa: E402
 from wrr.errors import EngineError  # noqa: E402
 from wrr.schemas import SearchResult, ExtractResult  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path_factory, monkeypatch):
+    """Default env-file/cache discovery must not read or write the user's HOME."""
+    # Keep tmp_path pristine for tests asserting that no files were written.
+    home = tmp_path_factory.mktemp("unit-home")
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def mock_doctor_checks(monkeypatch):
+    """CLI shape tests exercise formatting, not installed tools or live APIs."""
+    from unittest.mock import AsyncMock
+    from wrr.schemas import EngineCheckResult
+
+    checks = AsyncMock(return_value=[EngineCheckResult(
+        engine="community", status="ok", tier=2, summary="fixture check",
+    )])
+    deps = AsyncMock(return_value=[])
+    monkeypatch.setattr("wrr.doctor.run_doctor", checks)
+    monkeypatch.setattr("wrr.doctor.run_deps_doctor", deps)
+    return checks, deps
 
 
 @pytest.fixture(autouse=True)

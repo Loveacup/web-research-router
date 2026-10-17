@@ -6,6 +6,8 @@ import json
 import sys
 import time
 
+import pytest
+
 from wrr.doctor import doctor_v6
 from wrr.engines.registry import EngineRegistry
 from wrr.runtime.detect import detect_runtime
@@ -518,7 +520,23 @@ def test_auto_and_routable_never_run_recovery_or_live_probe(tmp_path, monkeypatc
     assert load_state(state_file).health_cache == {}
 
 
-def test_doctor_v6_deep_runs_live_health(tmp_path, monkeypatch):
+@pytest.fixture
+def mock_builtin_opencli(monkeypatch):
+    """Stub only the unrelated builtin probe; keep the plugin subprocess real."""
+    import subprocess
+
+    real_run = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if argv[0] == "opencli":
+            assert list(argv) == _STATUS, "unexpected OpenCLI command"
+            return _FakeCompleted(0, _DAEMON_CONNECTED)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr("wrr.engines.registry.subprocess.run", run)
+
+
+def test_doctor_v6_deep_runs_live_health(tmp_path, monkeypatch, mock_builtin_opencli):
     plugin_paths, marker = _plugin(tmp_path)
     monkeypatch.setenv("WRR_STATE_PATH", str(tmp_path / "doctor-state.json"))
 
@@ -618,7 +636,7 @@ def test_v6_router_enabled_semantic_bool_from_env(tmp_path, monkeypatch):
     assert "v6_router_setting" not in unset
 
 
-def test_health_source_diagnostic_for_all_paths(tmp_path, monkeypatch):
+def test_health_source_diagnostic_for_all_paths(tmp_path, monkeypatch, mock_builtin_opencli):
     """P0-2 R3: health_source must be light/cache/live_recovery for all health paths."""
     plugin_paths, marker = _plugin(tmp_path)
     state_file = tmp_path / "doctor-state.json"

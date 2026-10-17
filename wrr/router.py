@@ -17,8 +17,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
-from .errors import EngineError, EngineTimeoutError, RateLimitError, AllEnginesFailedError
+from .errors import (AllEnginesFailedError, EngineError, EngineTimeoutError,
+                     FetchPolicyError, RateLimitError, TerminalReason)
 from .evidence_v2 import project_decision_evidence_v2
+from .extraction import extraction_error, qualify_extraction
 from .runtime.decision_context_provider import DecisionContextObservation
 from .schemas import (DecisionContext, DecisionEvidence, DecisionEvidenceV2,
                       DecisionSnapshot, DiagnosticEvent,
@@ -152,6 +154,12 @@ def _result_diagnostic_details(result) -> Optional[Dict[str, Any]]:
 
 async def route(operation: str, options, registry: SearchRegistry,
                 explicit_provider: Optional[str] = None) -> RouterResult:
+    if (operation == "extract" and getattr(options, "allow_private_origin", None) is not None
+            and explicit_provider != "brave"):
+        raise AllEnginesFailedError(
+            "fetch denied: a private-origin grant requires explicit provider brave",
+            terminal_reason=TerminalReason.FETCH_POLICY_DENIED,
+        )
     chain = build_chain(operation, explicit_provider, getattr(options, "query", None))
     budget = config.budget_for(operation)
     # Explicit single provider → allow full engine timeout, no fallback-chain budget cap.
@@ -164,6 +172,7 @@ async def route(operation: str, options, registry: SearchRegistry,
     start = time.monotonic()
     actual: Optional[str] = None
     payload: Any = None
+    terminal_reason: TerminalReason | None = None
 
     for provider in chain:
         step_start = time.monotonic()
@@ -192,8 +201,9 @@ async def route(operation: str, options, registry: SearchRegistry,
         try:
             result = await asyncio.wait_for(_invoke(engine, operation, options), timeout=per_engine)
             step_elapsed = _elapsed_ms(step_start)
-            if _is_empty(operation, result):
-                step = FallbackStep(provider, False, 0, "empty result")
+            body_error = extraction_error(result) if operation == "extract" else None
+            if body_error or _is_empty(operation, result):
+                step = FallbackStep(provider, False, 0, body_error or "empty result")
                 steps.append(step)
                 event = DiagnosticEvent(
                     engine=provider, ok=False, category=operation,
@@ -233,6 +243,9 @@ async def route(operation: str, options, registry: SearchRegistry,
                 details=_safe_request_diagnostic_details(getattr(e, "details", None)),
             )
             events.append(event)
+            if isinstance(e, FetchPolicyError):
+                terminal_reason = TerminalReason.FETCH_POLICY_DENIED
+                break
         except Exception as e:  # 引擎内部未归一的异常也不该让整链崩
             step_elapsed = _elapsed_ms(step_start)
             step = FallbackStep(provider, False, 0, str(e) or type(e).__name__)
@@ -258,6 +271,7 @@ async def route(operation: str, options, registry: SearchRegistry,
         raise AllEnginesFailedError(
             f"All engines failed for {operation}:\n{reasons}",
             diagnostics=trace,
+            terminal_reason=terminal_reason,
         )
 
     route_elapsed = _elapsed_ms(start)
@@ -267,6 +281,8 @@ async def route(operation: str, options, registry: SearchRegistry,
         steps,
         payload is not None,
     )
+    if operation == "extract":
+        qualify_extraction(payload, quality)
     trace = RouteTrace(
         mode=None,
         mode_reason="v4_fallback_chain",
@@ -553,11 +569,11 @@ def _v6_router_enabled(env: Optional[Dict[str, str]] = None) -> bool:
 
 
 def _descriptor_backed_registry() -> SearchRegistry:
-    """Build a v6 descriptor-backed legacy registry for opt-in shadow routing."""
+    """Build descriptors from the host-authorized process environment only."""
 
     from .registry import default_registry_v6_shadow
 
-    report = default_registry_v6_shadow()
+    report = default_registry_v6_shadow(env_files=[])
     return report.registry
 
 

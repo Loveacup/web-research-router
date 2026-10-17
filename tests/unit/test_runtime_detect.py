@@ -2,7 +2,15 @@
 
 import json
 
+import pytest
+
 from wrr.runtime import ProcessSnapshot, detect_runtime
+
+
+@pytest.fixture
+def no_config_markers(monkeypatch):
+    """Process/fallback cases assume no markers, including in cwd ancestors."""
+    monkeypatch.setattr("wrr.runtime.detect._detect_from_config", lambda cwd: None)
 
 
 def test_explicit_codex_wins_with_full_confidence(tmp_path):
@@ -44,7 +52,7 @@ def test_cwd_marker_beats_process_signal(tmp_path):
     assert any("ignored codex from process" in warning for warning in info.warnings)
 
 
-def test_process_signal_detects_codex(tmp_path):
+def test_process_signal_detects_codex(tmp_path, no_config_markers):
     process = ProcessSnapshot(executable="/opt/homebrew/bin/codex", argv=["codex", "exec"])
 
     info = detect_runtime(cwd=tmp_path, env={}, process=process)
@@ -53,7 +61,7 @@ def test_process_signal_detects_codex(tmp_path):
     assert info.source == "process"
 
 
-def test_standalone_fallback_capabilities(tmp_path):
+def test_standalone_fallback_capabilities(tmp_path, no_config_markers):
     info = detect_runtime(cwd=tmp_path, env={})
 
     assert info.name == "standalone"

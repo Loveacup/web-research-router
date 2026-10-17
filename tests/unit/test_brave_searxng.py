@@ -80,10 +80,13 @@ def test_brave_key_fallback_name():
     os.environ["BRAVE_API_KEY"] = "k"
 
 
-def test_brave_extract_strips_html():
-    _reset(text="<html><body><script>x=1</script><p>Hello <b>World</b></p></body></html>")
-    brave_mod.httpx.AsyncClient = FakeAsyncClient
-    out = run(brave_mod.BraveEngine().extract(ExtractOptions("https://x", max_characters=100)))
+def test_brave_extract_strips_html(monkeypatch):
+    from httpx._client import AsyncClient
+    html = "<html><body><script>x=1</script><p>Hello <b>World</b></p></body></html>"
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=html))
+    monkeypatch.setattr(brave_mod.httpx, "AsyncClient",
+                        lambda **kwargs: AsyncClient(**kwargs, transport=transport))
+    out = run(brave_mod.BraveEngine().extract(ExtractOptions("https://8.8.8.8", max_characters=100)))
     assert "Hello World" in out.text
     assert "x=1" not in out.text         # script 被剥
 

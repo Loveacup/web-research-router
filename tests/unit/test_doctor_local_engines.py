@@ -32,7 +32,9 @@ def test_doctor_single_local_engine():
 
 def test_doctor_tier2_filter_includes_qmd_obsidian():
     reg = default_registry()
-    results = run(run_doctor(reg, tier=2))
+    # Test selection, not the host's OpenCLI daemon or qmd installation.
+    with patch("shutil.which", return_value=None):
+        results = run(run_doctor(reg, tier=2))
     engines = {r.engine for r in results}
     assert "local_qmd" in engines
     assert "local_obsidian" in engines

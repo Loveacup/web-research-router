@@ -12,6 +12,7 @@ from typing import List
 from .base import SearchEngine
 from .. import config
 from ..errors import EngineError
+from ..extraction import make_extraction
 from ..schemas import (SearchOptions, SearchResult, ExtractOptions,
                        ExtractResult, SimilarOptions, EngineCheckResult)
 
@@ -144,10 +145,9 @@ class ExaEngine(SearchEngine):
             data = resp.json()
         results = data.get("results", [])
         first = results[0] if results else {}
-        return ExtractResult(
-            url=options.url,
-            text=(first.get("text", "") or "")[:options.max_characters],
-            highlights=list(first.get("highlights", []) or []),
+        return make_extraction(
+            options, first.get("text", "") or "", method="exa.contents",
+            highlights=first.get("highlights", []),
         )
 
     async def similar(self, options: SimilarOptions) -> List[SearchResult]:

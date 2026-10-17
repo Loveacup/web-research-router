@@ -470,19 +470,24 @@ OPENALEX_API = "https://api.openalex.org/works"
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 ARXIV_API = "http://export.arxiv.org/api/query"
 
-# ── Skill 发现引擎（v5.0）────────────────────────────────────────────
+# ── Skill 发现引擎（v2，P2b）────────────────────────────────────────
 SKILL_CODE_SEARCH_PATH = "filename:SKILL.md"
-SKILL_MAX_ENTITIES = 30
-SKILL_ACTIVITY_WINDOW_DAYS = 90
 SKILL_EXCLUDE_DIRS = ("template/", "spec/", ".system/", "examples/")
-SKILL_SCORE_WEIGHTS = (0.40, 0.35, 0.25)         # 子目录活跃度/frontmatter/工程化
-# 包级评分（STDD §5.2 双层模型上层）：stars/recency/community_activity/license
-SKILL_BUNDLE_WEIGHTS = (0.30, 0.25, 0.25, 0.20)
-SKILL_BUNDLE_NEUTRAL = 0.5                        # 取不到 repo 元数据时的中性先验
-SKILL_BUNDLE_RECENCY_HALFLIFE_DAYS = 180.0       # 仓库 pushed_at 衰减半衰期
-# 宽松许可（permissive）SPDX 集合：有 license 加分，permissive 再加分
-SKILL_PERMISSIVE_LICENSES = ("mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause",
-                             "isc", "mpl-2.0", "unlicense", "0bsd", "cc0-1.0")
+# 可信来源：skill 主题的厂商/工具所有者发布的官方仓库；多个 repo: 限定在一次 code search 中为 OR。
+SKILL_TRUSTED_SOURCES = tuple(
+    s.strip() for s in os.environ.get(
+        "WRR_SKILL_TRUSTED_SOURCES",
+        "anthropics/skills,kepano/obsidian-skills,firecrawl/cli,vercel-labs/skills",
+    ).split(",") if s.strip()
+)
+SKILL_GENERAL_PER_PAGE = 50
+SKILL_TRUSTED_PER_PAGE = 20
+SKILL_PATH_PER_PAGE = 30       # 反馈词目录名检索
+SKILL_REPO_PER_PAGE = 10       # 反馈词仓库检索（按 star）
+SKILL_ENRICH_TOP_K = 6        # 只为前 K 组取 SKILL.md
+SKILL_REPO_META_CAP = 10      # 仓库元数据（stars）调用上限（仅非可信仓库）
+SKILL_RESERVED_SLOTS = 2      # K 截断外预留补全槽（选择性可信 → 仓库通道）
+SKILL_SELECTIVE_TRUSTED_MAX = 3  # 可信检索命中 ≤3 条时豁免证据门
 
 # ── GitHub v5 评分（加法式：4 维 + maintenance，不改 v4 三维）──────────
 GITHUB_SCORE_WEIGHTS_V5 = (0.30, 0.30, 0.20, 0.20)  # activity/popularity/freshness/maintenance
