@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+case "$0" in
+  /*) launcher=$0 ;;
+  *) launcher=$PWD/$0 ;;
+esac
+script_dir=${launcher%/*}
+exec "$script_dir/../.venv/bin/python" -I -S "$script_dir/wrr_release_supervisor.py" "$@"

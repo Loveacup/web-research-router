@@ -86,7 +86,7 @@ def install(
         from wrr.cli.update import update
 
         update_report = update(
-            dry_run=dry_run,
+            dry_run=True,  # Install is report-only, including dependency refresh.
             trust_project=trust_project,
             cwd=resolved_cwd,
             env=process_env,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import json
 import subprocess
@@ -124,42 +123,6 @@ def test_cmd_search_builds_both_mode_fields(monkeypatch):
     assert captured["options"].exa_mode == "fast"
 
 
-def test_run_uses_v5_only_when_route_mode_is_explicit(monkeypatch):
-    cli = _load_cli_module()
-    import wrr.registry as registry_module
-    import wrr.router as router_module
-    from wrr.schemas import SearchOptions
-
-    calls = []
-    sentinel_v5 = object()
-    sentinel_legacy = object()
-    monkeypatch.setattr(registry_module, "get_registry", lambda: "registry")
-
-    async def fake_v5(options, registry):
-        calls.append(("v5", options.route_mode, registry))
-        return sentinel_v5
-
-    async def fake_legacy(operation, options, registry, explicit_provider=None):
-        calls.append(("legacy", operation, registry, explicit_provider))
-        return sentinel_legacy
-
-    monkeypatch.setattr(router_module, "route_search_v5", fake_v5)
-    monkeypatch.setattr(router_module, "route", fake_legacy)
-
-    routed = asyncio.run(cli._run("search", SearchOptions("q", route_mode="research"), None))
-    explicit = asyncio.run(cli._run(
-        "search", SearchOptions("q", provider="exa", route_mode="research"), "exa"
-    ))
-    legacy = asyncio.run(cli._run("search", SearchOptions("q"), None))
-
-    assert routed is sentinel_v5
-    assert explicit is sentinel_legacy
-    assert legacy is sentinel_legacy
-    assert calls == [
-        ("v5", "research", "registry"),
-        ("legacy", "search", "registry", "exa"),
-        ("legacy", "search", "registry", None),
-    ]
 
 
 def test_search_fetch_similar_provider_choices_are_preserved():
@@ -188,10 +151,12 @@ def test_search_fetch_similar_provider_choices_are_preserved():
         parser.parse_args(["search", "q", "--provider", "not_a_provider"])
 
 
-def test_doctor_v6_json_available_without_changing_legacy_json_shape():
-    legacy = _run_cli("doctor", "--json")
-    assert legacy.stdout
-    legacy_payload = json.loads(legacy.stdout)
+def test_doctor_v6_json_available_without_changing_legacy_json_shape(capsys, mock_doctor_checks):
+    assert _load_cli_module().main(["doctor", "--json"]) == 0
+    legacy_payload = json.loads(capsys.readouterr().out)
+    checks, deps = mock_doctor_checks
+    checks.assert_awaited_once()
+    deps.assert_awaited_once_with(deep=False)
 
     assert {"ok", "status", "summary", "engines"} <= set(legacy_payload)
     assert "runtime" not in legacy_payload

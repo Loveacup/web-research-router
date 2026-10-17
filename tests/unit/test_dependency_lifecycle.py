@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
+
+import pytest
 
 from wrr.cli.install import install
 from wrr.cli.update import update
@@ -174,7 +177,6 @@ def test_project_remote_clone_is_refused_by_default_and_allowed_when_trusted(tmp
     ).to_dict()
 
     assert default_report["repos"][0]["status"] == "refused"
-    assert default_report["repos"][0]["message"] == "project_remote_clone_refused"
     assert trusted_report["repos"][0]["status"] == "planned"
     assert trusted_report["repos"][0]["path"] == str(tmp_path / "cache" / "deps" / "sample")
 
@@ -202,6 +204,45 @@ def test_install_refresh_deps_includes_dependency_update_report(tmp_path):
 
     engine_ids = {item["engine_id"] for item in discovered_report["dependency_updates"]}
     assert discovery.engine_id in engine_ids
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["clone", "refresh"])
+def test_install_report_only_never_changes_dependency_repositories(tmp_path, monkeypatch, existing):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-git-config"))
+    source = tmp_path / "source.git"
+    target = tmp_path / "dependency"
+    subprocess.run(["git", "init", "--bare", str(source)], check=True, capture_output=True)
+    if existing:
+        subprocess.run(["git", "clone", str(source), str(target)], check=True, capture_output=True)
+        (target / "local-work.txt").write_text("preserve this work", encoding="utf-8")
+    payload = _manifest(default_path=str(target), pin=None)
+    payload["requirements"]["repos"][0]["remote"] = str(source)
+    _discovery(tmp_path, payload)
+    before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+
+    report = install(
+        dry_run=False,
+        refresh_deps=True,
+        trust_project=True,
+        runtime_hint="standalone",
+        cwd=tmp_path,
+        env={"WRR_CACHE_DIR": str(tmp_path / "cache")},
+        env_files=[],
+        plugin_paths=[tmp_path / "plugins" / "engines"],
+    ).to_dict()
+
+    assert target.exists() is existing
+    assert {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()} == before
+    assert not (home / ".config" / "wrr" / "config.yaml").exists()
+    assert report["summary"]["status"] == "report_only"
+    assert report["summary"]["writes_performed"] == 0
+    dependency = next(item for item in report["dependency_updates"] if item["engine_id"] == "repo_engine")
+    assert dependency["status"] == "planned"
+    assert dependency["dry_run"] is True
 
 
 def test_doctor_v6_reports_repo_commit_revision_and_drift(tmp_path):

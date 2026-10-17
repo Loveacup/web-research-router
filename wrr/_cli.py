@@ -14,9 +14,9 @@
 通用选项：--json（机器可读）/ --env PATH（指定 .env）/ -q 静默元信息。
 
 设计取舍：
-  - 走 wrr.router.route()（wrr 自带的 fallback + 超时 + 总预算编排），而非
-    wrr.tools.handle_web_* —— 后者是 Hermes 工具适配层，会耦合运行时。
-  - --provider 透传为 route 的 explicit_provider：单引擎、禁用 fallback。
+  - search 与 Hermes 共用 route_search_v5；fetch/similar 共用 route。
+    宿主只负责参数和输出，不另选默认 search 策略。
+  - --provider 由共享 router 处理：单引擎、禁用 fallback。
   - 仅依赖标准库 + wrr 自身；不引入 click/typer，.env 用内置极简解析器。
 """
 from __future__ import annotations
@@ -33,43 +33,38 @@ import sys
 
 
 # ── .env 加载（极简，零依赖）──────────────────────────────────────────
-def _candidate_env_paths(explicit: str | None) -> list[str]:
-    """按优先级返回候选 .env 路径：--env > $WRR_ENV > ~/.hermes/.env。"""
-    out: list[str] = []
-    for p in (explicit, os.environ.get("WRR_ENV"),
-              os.path.join(os.path.expanduser("~"), ".hermes", ".env")):
-        if p and p not in out:
-            out.append(p)
-    return out
 
 
 def load_env(explicit: str | None = None) -> str | None:
-    """把第一个存在的 .env 解析进 os.environ（不覆盖已存在的真实环境变量）。
+    """Load one authorized env file without overriding the process environment.
 
-    返回实际加载的文件路径；都不存在时返回 None。
-    支持 `KEY=VALUE` / `export KEY=VALUE`、# 注释、空行、首尾引号。
+    --env wins over WRR_ENV; otherwise use WRR's own default.env. An explicitly
+    selected missing/unreadable file is an error, never a credential fallback.
     """
-    for path in _candidate_env_paths(explicit):
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    if line.startswith("export "):
-                        line = line[len("export "):]
-                    key, _, val = line.partition("=")
-                    key = key.strip()
-                    val = val.strip().strip('"').strip("'")
-                    if key and key not in os.environ:
-                        os.environ[key] = val
-        except OSError as e:
-            _eprint(f"警告：读取 {path} 失败：{e}")
-            continue
-        return path
-    return None
+    selected = explicit or os.environ.get("WRR_ENV")
+    path = selected or os.path.join(
+        os.path.expanduser("~"), ".config", "wrr", "env.d", "default.env",
+    )
+    values: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                key, _, val = line.partition("=")
+                key = key.strip()
+                if key:
+                    values.setdefault(key, val.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        if selected:
+            raise
+        return None
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+    return path
 
 
 # ── 输出辅助 ─────────────────────────────────────────────────────────
@@ -120,9 +115,62 @@ def cmd_evidence_gate(ns) -> int:
         return 2
     return 0 if report["status"] == "READY" else 1
 
+def cmd_host_fetch_result(ns) -> int:
+    """Evaluate one accepted host-native fetch return from bounded JSON stdin."""
+    from wrr.host_handoff import HostHandoffError, evaluate_host_fetch
+
+    try:
+        raw = sys.stdin.buffer.read(128 * 1024 + 1)
+        if len(raw) > 128 * 1024:
+            raise HostHandoffError("host return input exceeds the supported limit")
+        payload = json.loads(raw.decode("utf-8"))
+        result = evaluate_host_fetch(payload)
+    except (HostHandoffError, json.JSONDecodeError, UnicodeError):
+        _emit_json({
+            "operation": "host_fetch_return",
+            "ok": False,
+            "error": "invalid_host_return",
+            "detail": "Host return failed closed.",
+        })
+        return 2
+    _emit_json(result)
+    return 0 if result["ok"] else 1
+
+def cmd_host_fetch_eligibility(ns) -> int:
+    """Evaluate the shared public-target policy without loading provider config."""
+    from wrr.errors import EngineError, FetchPolicyError
+    from wrr.fetch_transport import validate_public_target
+
+    try:
+        asyncio.run(validate_public_target(ns.url))
+    except FetchPolicyError:
+        _emit_json({
+            "operation": "host_fetch_eligibility",
+            "ok": True,
+            "eligible": False,
+            "reason": "policy_denied",
+        })
+        return 0
+    except EngineError:
+        _emit_json({
+            "operation": "host_fetch_eligibility",
+            "ok": False,
+            "eligible": False,
+            "error": "eligibility_unavailable",
+        })
+        return 1
+    _emit_json({
+        "operation": "host_fetch_eligibility",
+        "ok": True,
+        "eligible": True,
+    })
+    return 0
+
 
 def _result_to_payload(operation: str, result) -> object:
     """RouterResult.payload → 可 JSON 化结构（search/similar 为 list，extract 为 dict）。"""
+    from .schemas import ExtractResult
+
     payload = result.payload
     if isinstance(payload, list):
         items = []
@@ -134,6 +182,8 @@ def _result_to_payload(operation: str, result) -> object:
                 value.pop("rrf_score", None)
             items.append(value)
         return items
+    if isinstance(payload, ExtractResult):
+        return payload.to_dict()
     if dataclasses.is_dataclass(payload):
         return dataclasses.asdict(payload)
     return payload
@@ -149,14 +199,15 @@ async def _run(operation: str, options, provider: str | None):
     from wrr.router import route, route_search_v5
 
     registry = get_registry()
-    if operation == "search" and getattr(options, "route_mode", None) and provider is None:
+    if operation == "search":
         return await route_search_v5(options, registry)
     return await route(operation, options, registry, explicit_provider=provider)
 
 
-def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatter):
+def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatter,
+              *, host_fallback_requested: bool = False):
     """执行 + 渲染 + 退出码。返回 0/1。"""
-    from wrr.errors import AllEnginesFailedError, WRRError
+    from wrr.errors import AllEnginesFailedError, TerminalReason, WRRError
     from wrr.formatters import failed_quality_payload, quality_payload
     try:
         result = asyncio.run(_run(operation, options, provider))
@@ -165,6 +216,12 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
             payload = {"operation": operation, "ok": False,
                        "error": "all_engines_failed", "detail": str(e),
                        "quality": failed_quality_payload()}
+            if (host_fallback_requested
+                    and e.terminal_reason is TerminalReason.FETCH_POLICY_DENIED):
+                payload["host_fallback"] = {
+                    "status": "denied",
+                    "reason": TerminalReason.FETCH_POLICY_DENIED.value,
+                }
             if e.diagnostics is not None:
                 payload["diagnostics"] = e.diagnostics.to_dict()
             _emit_json(payload)
@@ -247,9 +304,11 @@ def cmd_fetch(ns) -> int:
         _eprint(f"✗ --max-chars 须在 1..{config.MAX_MAX_CHARACTERS}")
         return 2
     opts = ExtractOptions(url=ns.url, max_characters=ns.max_chars,
-                          provider=ns.provider)
-    return _dispatch("extract", opts, ns.provider, ns.url,
-                     ns.json, ns.quiet, format_extract)
+                          provider=ns.provider, allow_private_origin=ns.allow_private_origin)
+    return _dispatch(
+        "extract", opts, ns.provider, ns.url, ns.json, ns.quiet, format_extract,
+        host_fallback_requested=ns.host_fallback == "request",
+    )
 
 
 def cmd_similar(ns) -> int:
@@ -376,17 +435,28 @@ def cmd_update(ns) -> int:
     report = update(
         dry_run=ns.dry_run,
         trust_project=ns.trust_project,
+        owned_paths=ns.owned_repo,
+        candidate_root=ns.candidate_root,
     )
     payload = report.to_dict()
     if ns.json:
         _emit_json(payload)
     else:
         summary = payload["summary"]
-        print("WRR v6 dependency update")
+        print("WRR dependency candidates (no activation)")
         print(f"  repos: {summary['repos']}")
         print(f"  planned: {summary['planned']}")
+        print(f"  downloaded: {summary['downloaded']}")
         print(f"  refused: {summary['refused']}")
         print(f"  failed: {summary['failed']}")
+        for item in payload["repos"]:
+            print(f"  {item['path']}: {item['status']} ({item['message']})")
+            if item["candidate_path"]:
+                print(f"    candidate: {item['candidate_path']}")
+                print(f"    revision: {item['candidate_revision']}")
+                print("    activated: false")
+        for error in payload["errors"]:
+            print(f"  refused: {error}")
     return 1 if payload["summary"]["status"] == "fail" else 0
 
 
@@ -591,7 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 全局选项（放父 parser，子命令继承）
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="输出 JSON（机器可读）")
-    common.add_argument("--env", metavar="PATH", help="指定 .env 路径（默认 $WRR_ENV 或 ~/.hermes/.env）")
+    common.add_argument("--env", metavar="PATH", help="指定 .env 路径（查询默认 $WRR_ENV 或 ~/.config/wrr/env.d/default.env）")
     common.add_argument("-q", "--quiet", action="store_true", help="不打印 provider 等元信息")
     common.add_argument("--provider", choices=["exa", "brave", "searxng", "github", "community", "academic", "skill",
                                                "local_supermemory", "local_session", "local_qmd", "local_obsidian"],
@@ -627,6 +697,12 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("url")
     fp.add_argument("--max-chars", type=int, default=5000, dest="max_chars",
                     help="正文截断上限（默认 5000）")
+    fp.add_argument("--allow-private-origin", metavar="ORIGIN",
+                    help="本次已获用户授权的精确 scheme/host/port；须显式 --provider brave，不持久保存")
+    fp.add_argument(
+        "--host-fallback", choices=["request"],
+        help="显式请求宿主备用判定元数据；不调用或授权宿主工具",
+    )
     fp.set_defaults(func=cmd_fetch)
 
     mp = sub.add_parser("similar", parents=[common], help="查找相似页面（仅 Exa）")
@@ -649,6 +725,19 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--mode", action="append", choices=MODES, help="仅评估指定 mode；可重复")
     ep.add_argument("--json", action="store_true", help="输出稳定机器可读 JSON")
     ep.set_defaults(func=cmd_evidence_gate)
+
+    hp = sub.add_parser(
+        "host-fetch-result",
+        help="从 stdin 校验一次已接受的宿主原生 fetch 回传；不调用 provider 或宿主工具",
+    )
+    hp.set_defaults(func=cmd_host_fetch_result, quiet=True, json=True, env=None)
+    hep = sub.add_parser(
+        "host-fetch-eligibility",
+        help="判定 URL 是否可交给宿主原生 public fetch（需要 DNS 安全检查）；不加载 provider 或凭据配置",
+    )
+    hep.add_argument("url")
+    hep.set_defaults(func=cmd_host_fetch_eligibility, quiet=True, json=True, env=None)
+
 
     ip = sub.add_parser(
         "install",
@@ -682,19 +771,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = sub.add_parser(
         "update",
-        help="规划或执行 v6 repo 依赖刷新；默认 dry-run",
+        help="规划或隔离下载依赖候选；不改运行目标，默认 dry-run",
         description=(
-            "刷新 v6 manifest 声明的 managed repo 依赖。默认只输出计划；"
-            "只有传 --apply 才会执行允许的 git clone/fetch/checkout。"
+            "为 manifest 依赖准备固定提交候选，不 checkout 现有目标。"
+            "执行需要 --apply、精确 --owned-repo 与既有 --candidate-root；不会激活。"
         ),
     )
     up.add_argument("--dry-run", action="store_true", default=True, help="默认行为：只输出计划，不执行 git 操作")
-    up.add_argument("--apply", action="store_false", dest="dry_run", help="执行允许的 git clone/fetch/checkout")
+    up.add_argument("--apply", action="store_false", dest="dry_run", help="通过授权检查后隔离下载候选，不改运行目标")
+    up.add_argument("--owned-repo", action="append", default=[], metavar="PATH",
+                    help="选择并确认本次拥有维护权的精确 WRR 私有目标；可重复；不用于宿主或共享资源")
+    up.add_argument("--candidate-root", metavar="PATH",
+                    help="显式提供既有、独立、拥有写权的候选输出目录")
     up.add_argument("--json", action="store_true", help="输出 JSON 格式")
     up.add_argument(
         "--trust-project",
         action="store_true",
-        help="显式允许 project-level manifest 的 remote clone；默认拒绝 project remote clone",
+        help="信任 project-level manifest 来源；不代替目标所有权或切换授权",
     )
     up.add_argument("-q", "--quiet", action="store_true", help="不打印元信息")
     up.set_defaults(func=cmd_update)
@@ -748,11 +841,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
 
-    if ns.cmd == "evidence-gate":
+    if ns.cmd in {"evidence-gate", "host-fetch-result", "host-fetch-eligibility"}:
         return ns.func(ns)
 
     use_v6_env = ns.cmd == "install" or (ns.cmd == "doctor" and getattr(ns, "v6", False))
-    loaded = None if use_v6_env else load_env(getattr(ns, "env", None))
+    try:
+        loaded = None if use_v6_env else load_env(getattr(ns, "env", None))
+    except (OSError, UnicodeError) as exc:
+        detail = f"WRR env 加载失败 ({type(exc).__name__})；未尝试其他凭据文件。"
+        if getattr(ns, "json", False):
+            from wrr.formatters import failed_quality_payload
+            _emit_json({
+                "operation": "extract" if ns.cmd == "fetch" else ns.cmd,
+                "ok": False, "error": "configuration_error", "detail": detail,
+                "quality": failed_quality_payload(),
+            })
+        else:
+            _eprint(detail)
+        return 2
     if not ns.quiet and not getattr(ns, "json", False):
         if loaded:
             _eprint(f"· 已加载 env：{loaded}")

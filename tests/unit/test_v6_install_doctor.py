@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 
 from wrr.cli.install import install
 from wrr.doctor import doctor_v6
@@ -74,16 +72,14 @@ def test_doctor_v6_project_env_secret_is_ignored_by_default(tmp_path):
     assert payload["env"]["ignored_values"][0]["ignore_reason"] == "project_env_ignored_secret"
 
 
-def test_legacy_cli_doctor_json_keeps_old_top_level_shape():
-    completed = subprocess.run(
-        [sys.executable, "wrr-cli.py", "doctor", "--json"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+def test_legacy_cli_doctor_json_keeps_old_top_level_shape(capsys, mock_doctor_checks):
+    from wrr._cli import main
 
-    payload = json.loads(completed.stdout)
+    assert main(["doctor", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    checks, deps = mock_doctor_checks
+    checks.assert_awaited_once()
+    deps.assert_awaited_once_with(deep=False)
 
     assert {"ok", "status", "summary", "engines"} <= set(payload)
     assert "discovered" not in payload

@@ -6,7 +6,10 @@ from wrr.doctor import doctor_profile_matrix, default_doctor_profiles, DoctorPro
 
 
 def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
-    """Matrix returns 7 profiles with expected structure."""
+    """Matrix returns 7 profiles with expected structure and runtime names."""
+    # Isolate host signals, not detect_runtime itself: explicit profile hints
+    # still flow through the real detector and report serialization.
+    monkeypatch.setattr("wrr.runtime.detect._detect_from_config", lambda _cwd: None)
     monkeypatch.setenv("WRR_V6_ROUTER", "0")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
@@ -18,7 +21,7 @@ def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
         trust_project=False,
         runtime_hint=None,
         cwd=tmp_path,
-        env=dict(os.environ),
+        env={"WRR_V6_ROUTER": "0"},
         env_files=None,
         plugin_paths=None
     )
@@ -42,28 +45,18 @@ def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
         assert "router_mode" in p
         assert "routable_engine_ids" in p
 
+    expected_runtimes = {
+        "default": "standalone",
+        "editable": "standalone",  # editable is a profile, not a runtime name
+        "standalone": "standalone",
+        "S2": "codex",
+        "S3": "hermes",
+        "cron-worker": "standalone",
+        "hermes": "hermes",
+    }
+    assert {p["id"]: p["runtime"]["name"] for p in report.profiles} == expected_runtimes
+
     assert "status" in report.summary
-
-
-def test_profile_matrix_maps_profiles_to_existing_runtime_names(monkeypatch, tmp_path):
-    """Each profile's runtime.name matches known runtime names."""
-    monkeypatch.setenv("WRR_V6_ROUTER", "0")
-
-    report = doctor_profile_matrix(
-        json=True,
-        deep=False,
-        trust_project=False,
-        runtime_hint=None,
-        cwd=tmp_path,
-        env=dict(os.environ),
-        env_files=None,
-        plugin_paths=None
-    )
-
-    known_runtimes = {"editable", "standalone", "codex", "hermes"}
-    for p in report.profiles:
-        runtime_name = p["runtime"]["name"]
-        assert runtime_name in known_runtimes
 
 
 def test_profile_matrix_does_not_leak_unrelated_or_secret_env(monkeypatch, tmp_path):

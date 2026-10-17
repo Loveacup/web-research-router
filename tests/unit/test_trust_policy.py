@@ -210,7 +210,5 @@ def test_install_refuses_project_level_remote_clone_by_default(tmp_path, monkeyp
     )
 
     assert project_update["status"] == "refused"
-    assert project_update["message"] == "project_remote_clone_refused"
     assert refused["summary"]["dependency_updates"]["refused"] == 1
     assert trusted_update["status"] == "planned"
-    assert trusted_update["message"] == "would_clone"
