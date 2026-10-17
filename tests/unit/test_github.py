@@ -186,9 +186,9 @@ def test_auto_trigger_promotes_github():
     assert config.github_triggered("SITE:GITHUB.COM")
     assert not config.github_triggered("plain")
     assert build_chain("search", None, "x site:github.com") == \
-        ["github", "exa", "brave", "community", "searxng"]
+        ["github", "exa", "deepseek", "brave", "community", "searxng"]
     assert build_chain("search", None, "plain") == \
-        ["exa", "brave", "github", "community", "searxng"]
+        ["exa", "deepseek", "brave", "github", "community", "searxng"]
 
 
 # ── 环境变量超时配置测试 ─────────────────────────────────────────────

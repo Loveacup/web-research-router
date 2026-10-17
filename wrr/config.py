@@ -45,7 +45,7 @@ def _env_bool_from_resolver(key: str, env_resolver: Callable[[str], Optional[str
 
 
 # ── Fallback 顺序（与历史 extension.ts / v3 __init__.py 一致）─────────────
-SEARCH_FALLBACK_ORDER = ("exa", "brave", "github", "community", "searxng")
+SEARCH_FALLBACK_ORDER = ("exa", "deepseek", "brave", "github", "community", "searxng")
 EXTRACT_FALLBACK_ORDER = ("exa", "brave")   # web_fetch：exa 干净正文 → brave 裸抓取
 SIMILAR_PROVIDERS = ("exa",)                 # findSimilar 仅 Exa 支持
 
@@ -57,9 +57,11 @@ GITHUB_ACTIVITY_CONCURRENCY = _env_int("WRR_GITHUB_ACTIVITY_CONCURRENCY", 5)
 GITHUB_ACTIVITY_LOOKUP = _env_bool("WRR_GITHUB_ACTIVITY_LOOKUP", True)
 
 EXA_TIMEOUT = _env_float("WRR_EXA_TIMEOUT", 30.0)
+DEEPSEEK_TIMEOUT = _env_float("WRR_DEEPSEEK_TIMEOUT", 10.0)
 
 ENGINE_TIMEOUT = {
     "exa": EXA_TIMEOUT,
+    "deepseek": DEEPSEEK_TIMEOUT,
     "brave": 10.0,
     "searxng": 10.0,
     "github": GITHUB_TIMEOUT,
@@ -377,21 +379,22 @@ def classify_intent(query: str) -> str:
 
 # mode → 基础引擎组合
 MODE_DISPATCH = {
-    "discovery": ("exa", "brave", "community"),
-    "broad":     ("exa", "brave", "community", "searxng"),  # 开放式兴趣 → 多源并行
-    "grounding": ("exa", "brave"),
-    "research":  ("exa", "brave", "community", "academic"),
-    "academic":  ("academic", "exa", "community"),
-    "platform":  ("community", "exa", "brave"),
-    "recovery":  ("brave", "exa", "searxng"),
-    # local（v5.2）：本地 4 引擎在前，exa/brave 在后补位。本地引擎在 CLI 环境
+    # deepseek 紧跟 exa：DeepSeek Search API 与 Exa 同级并行（主力双源）
+    "discovery": ("exa", "deepseek", "brave", "community"),
+    "broad":     ("exa", "deepseek", "brave", "community", "searxng"),  # 开放式兴趣 → 多源并行
+    "grounding": ("exa", "deepseek", "brave"),
+    "research":  ("exa", "deepseek", "brave", "community", "academic"),
+    "academic":  ("academic", "exa", "deepseek", "community"),
+    "platform":  ("community", "exa", "deepseek", "brave"),
+    "recovery":  ("brave", "exa", "deepseek", "searxng"),
+    # local（v5.2）：本地 4 引擎在前，exa/deepseek/brave 在后补位。本地引擎在 CLI 环境
     # 不可用时由 router gather 隔离跳过，正好 web 兜底；本地可用时权重碾压外网。
     "local":     ("local_supermemory", "local_session", "local_qmd",
-                  "local_obsidian", "exa", "brave"),
+                  "local_obsidian", "exa", "deepseek", "brave"),
 }
 
 # mode → {引擎: RRF 融合权重}（D1/D2 对齐 Alex）
-_W_DEFAULT = {"exa": 1.0, "brave": 0.9, "community": 0.30, "academic": 0.30,
+_W_DEFAULT = {"exa": 1.0, "deepseek": 1.0, "brave": 0.9, "community": 0.30, "academic": 0.30,
               "github": 0.25, "skill": 0.25, "searxng": 0.1}
 MODE_WEIGHTS = {
     "discovery": {**_W_DEFAULT, "community": 0.50},
@@ -404,7 +407,7 @@ MODE_WEIGHTS = {
     "local":     {**_W_DEFAULT,
                   "local_supermemory": 1.0, "local_session": 0.9,
                   "local_qmd": 0.9, "local_obsidian": 0.8,
-                  "exa": 0.3, "brave": 0.3, "community": 0.15},
+                  "exa": 0.3, "deepseek": 0.3, "brave": 0.3, "community": 0.15},
     # broad（v5.2）：开放式兴趣查询，4 引擎并行，社区权重大
     "broad":     {**_W_DEFAULT, "community": 0.55, "searxng": 0.30},
 }

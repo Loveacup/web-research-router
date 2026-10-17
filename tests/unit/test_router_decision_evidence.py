@@ -46,7 +46,7 @@ def _reg(*engines):
 
 def _full_reg():
     return _reg(*[FakeEngine(n, search_results=mk_results(2))
-                  for n in ("exa", "brave", "searxng", "github",
+                  for n in ("exa", "deepseek", "brave", "searxng", "github",
                             "community", "academic", "skill")])
 
 
@@ -58,12 +58,12 @@ def _shadow_context(expires_at=200.0):
         runtime="standalone",
         profile="default",
         registry_source="test",
-        routable_descriptor_ids=("exa", "brave"),
-        bridged_provider_ids=("exa", "brave"),
+        routable_descriptor_ids=("exa", "deepseek", "brave"),
+        bridged_provider_ids=("exa", "deepseek", "brave"),
         missing_provider_ids=(),
         adapter_errors=(),
         descriptor_reasons=(),
-        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        descriptor_provider_aliases=(("exa", "exa"), ("deepseek", "deepseek"), ("brave", "brave")),
         config_fingerprint="cfg-v1",
     )
 

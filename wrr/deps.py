@@ -9,7 +9,7 @@
   - install_guide: 缺失时怎样安装/配置
   - required: 是否必需（False = 可选，缺失不阻塞）
 
-从 v5.5 的 4 个 git repo 扩展到全量 13 个依赖。
+从 v5.5 的 4 个 git repo 扩展到全量 14 个依赖。
 """
 
 from __future__ import annotations
@@ -476,7 +476,7 @@ async def _run_subprocess(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 全量依赖清单（13 项）
+# 全量依赖清单（14 项）
 # ══════════════════════════════════════════════════════════════════════
 
 DEPENDENCY_MANIFEST: List[BaseDep] = [
@@ -489,6 +489,16 @@ DEPENDENCY_MANIFEST: List[BaseDep] = [
         install_guide=[
             "注册 https://exa.ai → 获取 API key",
             "export EXA_API_KEY=<your_key>",
+        ],
+    ),
+    EnvVarDep(
+        dep_id="deepseek_api_key",
+        var_name="DEEPSEEK_API_KEY",
+        source_url="https://platform.deepseek.com/api_keys",
+        description="DeepSeek Search API key",
+        install_guide=[
+            "注册 https://platform.deepseek.com/api_keys → 获取 API key",
+            "export DEEPSEEK_API_KEY=<your_key>",
         ],
     ),
     EnvVarDep(
@@ -955,6 +965,7 @@ def _dep_id(item: Mapping[str, Any], fallback: str) -> str:
 def _env_dep_id(var_name: str) -> str:
     return {
         "EXA_API_KEY": "exa_api_key",
+        "DEEPSEEK_API_KEY": "deepseek_api_key",
         "BRAVE_API_KEY": "brave_api_key",
         "GITHUB_TOKEN": "github_token",
         "SEARXNG_URL": "searxng_url",

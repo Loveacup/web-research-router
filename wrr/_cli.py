@@ -663,7 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--json", action="store_true", help="输出 JSON（机器可读）")
     common.add_argument("--env", metavar="PATH", help="指定 .env 路径（查询默认 $WRR_ENV 或 ~/.config/wrr/env.d/default.env）")
     common.add_argument("-q", "--quiet", action="store_true", help="不打印 provider 等元信息")
-    common.add_argument("--provider", choices=["exa", "brave", "searxng", "github", "community", "academic", "skill",
+    common.add_argument("--provider", choices=["exa", "deepseek", "brave", "searxng", "github", "community", "academic", "skill",
                                                "local_supermemory", "local_session", "local_qmd", "local_obsidian"],
                         help="强制单引擎（禁用 fallback）")
 
@@ -801,7 +801,7 @@ def build_parser() -> argparse.ArgumentParser:
             "control-plane doctor。"
         ),
     )
-    dp.add_argument("--engine", choices=["exa", "brave", "github", "skill", "searxng", "community", "academic",
+    dp.add_argument("--engine", choices=["exa", "deepseek", "brave", "github", "skill", "searxng", "community", "academic",
                                          "local_supermemory", "local_session", "local_qmd", "local_obsidian"],
                     help="仅检查指定引擎")
     dp.add_argument("--tier", type=int, choices=[0, 1, 2], help="仅检查指定 tier")

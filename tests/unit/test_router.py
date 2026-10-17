@@ -23,7 +23,7 @@ def run(coro):
 
 # ── build_chain ──────────────────────────────────────────────────────
 def test_build_chain_default_and_explicit():
-    assert build_chain("search", None) == ["exa", "brave", "github", "community", "searxng"]
+    assert build_chain("search", None) == ["exa", "deepseek", "brave", "github", "community", "searxng"]
     assert build_chain("extract", None) == ["exa", "brave"]
     assert build_chain("similar", None) == ["exa"]
     assert build_chain("search", "brave") == ["brave"]   # 显式 → 单元素
@@ -218,16 +218,21 @@ def test_route_preserves_community_subsource_diagnostics():
 def test_route_fallback_includes_all_events():
     """fallback 路径应记录所有引擎的 events。"""
     reg = _reg(FakeEngine("exa", error="exa down"),
+               FakeEngine("deepseek", error="deepseek down"),
                FakeEngine("brave", search_results=mk_results(1)))
     rr = run(route("search", SearchOptions("q"), reg))
     assert rr.actual_provider == "brave"
     assert rr.diagnostics is not None
-    assert len(rr.diagnostics.events) == 2
+    assert len(rr.diagnostics.events) == 3
     # exa 失败
     assert rr.diagnostics.events[0].engine == "exa"
     assert rr.diagnostics.events[0].ok is False
     assert "exa down" in rr.diagnostics.events[0].message
+    # deepseek 失败
+    assert rr.diagnostics.events[1].engine == "deepseek"
+    assert rr.diagnostics.events[1].ok is False
+    assert "deepseek down" in rr.diagnostics.events[1].message
     # brave 成功
-    assert rr.diagnostics.events[1].engine == "brave"
-    assert rr.diagnostics.events[1].ok is True
-    assert rr.diagnostics.events[1].count == 1
+    assert rr.diagnostics.events[2].engine == "brave"
+    assert rr.diagnostics.events[2].ok is True
+    assert rr.diagnostics.events[2].count == 1

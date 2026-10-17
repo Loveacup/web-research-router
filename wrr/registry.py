@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 
 from .engines.base import SearchEngine
 from .engines.exa import ExaEngine
+from .engines.deepseek import DeepSeekEngine
 from .engines.brave import BraveEngine
 from .engines.tavily import TavilyEngine
 from .engines.searxng import SearxngEngine
@@ -41,6 +42,7 @@ class EngineRegistry:
 def default_registry() -> EngineRegistry:
     reg = EngineRegistry()
     reg.register(ExaEngine())
+    reg.register(DeepSeekEngine())      # DeepSeek Search API，与 Exa 同级并行
     reg.register(BraveEngine())
     reg.register(TavilyEngine())        # native search adapter（无 route order 变更）
     reg.register(SearxngEngine())

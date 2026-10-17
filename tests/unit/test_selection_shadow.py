@@ -21,12 +21,12 @@ def _context(**overrides):
         runtime="standalone",
         profile="default",
         registry_source="test",
-        routable_descriptor_ids=("exa", "brave"),
-        bridged_provider_ids=("exa", "brave"),
+        routable_descriptor_ids=("exa", "deepseek", "brave"),
+        bridged_provider_ids=("exa", "deepseek", "brave"),
         missing_provider_ids=(),
         adapter_errors=(),
         descriptor_reasons=(),
-        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        descriptor_provider_aliases=(("exa", "exa"), ("deepseek", "deepseek"), ("brave", "brave")),
         config_fingerprint="cfg-v1",
     )
     values.update(overrides)
@@ -42,8 +42,8 @@ def test_exact_legacy_descriptor_selection_is_e0():
 
     assert comparison.code == "E0"
     assert comparison.safe is True
-    assert comparison.legacy_provider_ids == ("exa", "brave")
-    assert comparison.descriptor_provider_ids == ("exa", "brave")
+    assert comparison.legacy_provider_ids == ("exa", "deepseek", "brave")
+    assert comparison.descriptor_provider_ids == ("exa", "deepseek", "brave")
     assert comparison.omitted_provider_ids == ()
     assert comparison.added_provider_ids == ()
 
@@ -52,8 +52,8 @@ def test_justified_descriptor_subset_is_e1():
     comparison = compare_shadow_selection(
         SearchOptions("what is python"),
         _context(
-            routable_descriptor_ids=("exa",),
-            bridged_provider_ids=("exa",),
+            routable_descriptor_ids=("exa", "deepseek"),
+            bridged_provider_ids=("exa", "deepseek"),
             descriptor_reasons=(("brave", ("health:unhealthy",)),),
         ),
         evaluated_at=150.0,
@@ -61,7 +61,7 @@ def test_justified_descriptor_subset_is_e1():
 
     assert comparison.code == "E1"
     assert comparison.safe is True
-    assert comparison.descriptor_provider_ids == ("exa",)
+    assert comparison.descriptor_provider_ids == ("exa", "deepseek")
     assert comparison.omitted_provider_ids == ("brave",)
     assert comparison.reasons == ("brave:health:unhealthy",)
 
@@ -70,8 +70,8 @@ def test_unexplained_omission_is_u1():
     comparison = compare_shadow_selection(
         SearchOptions("what is python"),
         _context(
-            routable_descriptor_ids=("exa",),
-            bridged_provider_ids=("exa",),
+            routable_descriptor_ids=("exa", "deepseek"),
+            bridged_provider_ids=("exa", "deepseek"),
             missing_provider_ids=("brave",),
         ),
         evaluated_at=150.0,
@@ -89,12 +89,12 @@ def test_order_only_mismatch_is_e2_and_addition_is_u2():
     )
     reordered = replace(
         decision,
-        selected_provider_ids=("brave", "exa"),
+        selected_provider_ids=("brave", "deepseek", "exa"),
         selected_weights=tuple(reversed(decision.selected_weights)),
     )
     addition = replace(
         decision,
-        selected_provider_ids=("exa", "brave", "rogue"),
+        selected_provider_ids=("exa", "deepseek", "brave", "rogue"),
     )
 
     assert compare_shadow_decisions(reordered, reordered).code == "E2"
@@ -111,12 +111,12 @@ def test_repeated_evaluation_mismatch_is_u3():
     )
     changed = replace(
         decision,
-        selected_provider_ids=("brave", "exa"),
+        selected_provider_ids=("brave", "deepseek", "exa"),
         selected_weights=tuple(reversed(decision.selected_weights)),
     )
     changed_route_plan = replace(
         decision.legacy_plan,
-        engine_names=("brave", "exa"),
+        engine_names=("brave", "deepseek", "exa"),
         weights=tuple(reversed(decision.legacy_plan.weights)),
     )
 

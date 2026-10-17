@@ -634,9 +634,9 @@ def test_hackernews_time_enrichment_timeout_bounded():
 # ── 自动触发链 ───────────────────────────────────────────────────────
 def test_build_chain_promotes_community():
     assert build_chain("search", None, "x site:reddit.com") == \
-        ["community", "exa", "brave", "github", "searxng"]
+        ["community", "exa", "deepseek", "brave", "github", "searxng"]
     assert build_chain("search", None, "plain") == \
-        ["exa", "brave", "github", "community", "searxng"]
+        ["exa", "deepseek", "brave", "github", "community", "searxng"]
 
 
 # ── OpenCLI 断开快速失败（端到端时延）───────────────────────────────────

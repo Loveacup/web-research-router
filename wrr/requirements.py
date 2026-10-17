@@ -37,6 +37,13 @@ ENGINE_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
         "endpoints": [],
         "description": "Exa AI 搜索引擎",
     },
+    "deepseek": {
+        "tier": 1,
+        "env": ["DEEPSEEK_API_KEY"],
+        "commands": [],
+        "endpoints": ["https://api.deepseek.com/v1/tools/search"],
+        "description": "DeepSeek Search API（自研搜索引擎，与 Exa 同级并行）",
+    },
     "brave": {
         "tier": 1,
         "env_any": ["BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"],

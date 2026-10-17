@@ -14,6 +14,7 @@ from wrr.runtime.env import load_env
 
 V5_PROVIDER_IDS = {
     "exa",
+    "deepseek",
     "brave",
     "tavily",
     "searxng",

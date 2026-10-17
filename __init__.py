@@ -13,7 +13,7 @@ import uuid
 from contextlib import nullcontext
 from typing import ContextManager, cast
 
-__version__ = "6.1.2"
+__version__ = "6.2.0"
 
 logger = logging.getLogger("wrr.plugin")
 
@@ -104,7 +104,7 @@ class _ColdDecisionContextActivator:
         self._next_attempt_at = now + self._backoff_sec
 
 _SEARCH_PROVIDERS = [
-    "exa", "brave", "community", "academic", "github", "skill", "searxng",
+    "exa", "deepseek", "brave", "community", "academic", "github", "skill", "searxng",
     "local_supermemory", "local_session", "local_qmd", "local_obsidian",
 ]
 _FETCH_PROVIDERS = ["exa", "brave"]

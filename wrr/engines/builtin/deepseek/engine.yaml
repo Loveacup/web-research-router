@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "deepseek",
+  "name": "DeepSeek Search",
+  "kind": "web_api",
+  "adapter": "wrr.engines.deepseek:DeepSeekEngine",
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["web"]
+  },
+  "routing": {
+    "modes": ["auto", "web", "default"],
+    "weight": 1.0,
+    "triggers": []
+  },
+  "fusion": {
+    "rrf_k": 60,
+    "dedup_key": "canonical_url",
+    "weights_merge_policy": "multiply"
+  },
+  "requirements": {
+    "env": [
+      {
+        "dep_id": "deepseek_api_key",
+        "name": "DEEPSEEK_API_KEY",
+        "required": true,
+        "secret": true,
+        "source_url": "https://platform.deepseek.com/api_keys",
+        "description": "DeepSeek Search API key（/v1/tools/search，自研搜索引擎）"
+      }
+    ],
+    "binaries": [],
+    "repos": []
+  },
+  "health": {
+    "checks": [
+      {"type": "env_present", "env": "DEEPSEEK_API_KEY", "required": true}
+    ]
+  },
+  "requires_capabilities": {
+    "can_read_user_env": true
+  }
+}

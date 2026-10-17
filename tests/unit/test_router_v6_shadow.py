@@ -61,7 +61,7 @@ def test_unit_default_isolates_live_v6_router_env(monkeypatch):
     result = run(route_search_v5(SearchOptions("what is python"), _registry(("exa",))))
 
     assert result.actual_provider == "rrf:grounding"
-    assert _selected(result) == ["exa", "brave"]
+    assert _selected(result) == ["exa", "deepseek", "brave"]
 
 
 @pytest.mark.parametrize(
@@ -76,7 +76,7 @@ def test_unit_default_isolates_live_v6_router_env(monkeypatch):
     ],
 )
 def test_old_and_descriptor_backed_registries_select_same_engines(query, mode):
-    names = ("exa", "brave", "searxng", "github", "community", "academic", "skill")
+    names = ("exa", "deepseek", "brave", "searxng", "github", "community", "academic", "skill")
     old_registry = _registry(names)
     descriptor_backed = _registry(names)
 
@@ -92,7 +92,7 @@ def test_old_and_descriptor_backed_registries_select_same_engines(query, mode):
 
 def test_route_search_v5_accepts_injected_descriptor_backed_registry_helper():
     old_registry = _registry(())
-    descriptor_backed = _registry(("exa", "brave"))
+    descriptor_backed = _registry(("exa", "deepseek", "brave"))
 
     result = run(
         route_search_v5(
@@ -103,11 +103,11 @@ def test_route_search_v5_accepts_injected_descriptor_backed_registry_helper():
     )
 
     assert result.mode == "grounding"
-    assert _selected(result) == ["exa", "brave"]
+    assert _selected(result) == ["exa", "deepseek", "brave"]
 
 
 def test_explicit_provider_behavior_is_unchanged_with_descriptor_backed_registry():
-    registry = _registry(("exa", "brave"))
+    registry = _registry(("exa", "deepseek", "brave"))
 
     result = run(route_search_v5(SearchOptions("q", provider="brave"), registry))
 
@@ -117,7 +117,7 @@ def test_explicit_provider_behavior_is_unchanged_with_descriptor_backed_registry
 
 
 def test_v6_router_env_flag_uses_shadow_registry(monkeypatch):
-    shadow_registry = _registry(("exa", "brave"))
+    shadow_registry = _registry(("exa", "deepseek", "brave"))
 
     monkeypatch.setenv("WRR_V6_ROUTER", "1")
     monkeypatch.setattr(
@@ -128,7 +128,7 @@ def test_v6_router_env_flag_uses_shadow_registry(monkeypatch):
     result = run(route_search_v5(SearchOptions("what is python"), _registry(())))
 
     assert result.mode == "grounding"
-    assert _selected(result) == ["exa", "brave"]
+    assert _selected(result) == ["exa", "deepseek", "brave"]
 
 
 def test_without_v6_router_env_flag_keeps_legacy_registry(monkeypatch):
@@ -142,10 +142,12 @@ def test_without_v6_router_env_flag_keeps_legacy_registry(monkeypatch):
     result = run(route_search_v5(SearchOptions("what is python"), _registry(("exa",))))
 
     assert result.mode == "grounding"
-    assert _selected(result) == ["exa", "brave"]
+    assert _selected(result) == ["exa", "deepseek", "brave"]
     assert result.fallback_chain[0].ok is True
     assert result.fallback_chain[1].ok is False
-    assert result.fallback_chain[1].error == "unknown provider: brave"
+    assert result.fallback_chain[1].error == "unknown provider: deepseek"
+    assert result.fallback_chain[2].ok is False
+    assert result.fallback_chain[2].error == "unknown provider: brave"
 
 
 def _routable_probe_manifest(engine_id, marker):

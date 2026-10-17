@@ -1,8 +1,8 @@
 # Web Research Router (WRR)
 
-Semantic search router with mode-based routing, 12 registered engines (11 routed + Tavily backfill), and Reciprocal Rank Fusion.
+Semantic search router with mode-based routing, 13 registered engines (12 routed + Tavily backfill), and Reciprocal Rank Fusion.
 
-**Current version:** 6.1.2 — v6.1 Engine Health Policy is released. Production search still executes on the legacy v5 mode/RRF data plane (Stage S); the v6 descriptor registry participates only as a shadow selection and evidence source. The optional D7-S5 campaign sampler is packaged inside the plugin, disabled by default, and runs only when both `campaign.enabled` and `campaign_sampler.enabled` are explicitly true.
+**Current version:** 6.2.0 — adds the DeepSeek Search API engine as a primary web source running in parallel with Exa in every web mode. v6.1 Engine Health Policy remains released. Production search still executes on the legacy v5 mode/RRF data plane (Stage S); the v6 descriptor registry participates only as a shadow selection and evidence source. The optional D7-S5 campaign sampler is packaged inside the plugin, disabled by default, and runs only when both `campaign.enabled` and `campaign_sampler.enabled` are explicitly true.
 
 ## Design scope and progress
 
@@ -55,18 +55,18 @@ query triggers may append `github`, `skill`, `academic`, or `community`.
 
 | Mode | Use case | Base engines (in order) | Notable weights |
 |------|----------|-------------------------|-----------------|
-| discovery | "what's out there" | exa, brave, community | community 0.50 |
-| grounding | "what's the fact" | exa, brave | — |
-| research | deep investigation | exa (`deep-lite`), brave, community, academic | community 0.35, academic 0.30 |
-| academic | papers | academic (OpenAlex + Semantic Scholar; arXiv off by default), exa, community | academic 1.0 |
-| platform | platform/community questions | community, exa, brave | community 1.0 |
-| broad | exploratory queries | exa, brave, community, searxng | community 0.55, searxng 0.30 |
-| local | search my stuff | supermemory, session, qmd, obsidian, exa, brave | local 1.0/0.9/0.9/0.8, web 0.3 |
-| recovery | primary mode returned nothing | brave, exa, searxng | gated by `recovery_allowed(runtime)` |
+| discovery | "what's out there" | exa, deepseek, brave, community | community 0.50 |
+| grounding | "what's the fact" | exa, deepseek, brave | — |
+| research | deep investigation | exa (`deep-lite`), deepseek, brave, community, academic | community 0.35, academic 0.30 |
+| academic | papers | academic (OpenAlex + Semantic Scholar; arXiv off by default), exa, deepseek, community | academic 1.0 |
+| platform | platform/community questions | community, exa, deepseek, brave | community 1.0 |
+| broad | exploratory queries | exa, deepseek, brave, community, searxng | community 0.55, searxng 0.30 |
+| local | search my stuff | supermemory, session, qmd, obsidian, exa, deepseek, brave | local 1.0/0.9/0.9/0.8, web 0.3 |
+| recovery | primary mode returned nothing | brave, exa, deepseek, searxng | gated by `recovery_allowed(runtime)` |
 
-### 12 engines
+### 13 engines
 
-- **Public-web (8):** Exa, Brave, GitHub, Community (OpenCLI + Last30Days + RSS), Academic (OpenAlex + Semantic Scholar, optional arXiv), Skill, SearXNG, Tavily
+- **Public-web (9):** Exa, DeepSeek Search (`/v1/tools/search`, in-house index; weight 1.0 alongside Exa), Brave, GitHub, Community (OpenCLI + Last30Days + RSS), Academic (OpenAlex + Semantic Scholar, optional arXiv), Skill, SearXNG, Tavily
 - **Local (4):** Supermemory, Session, QMD, Obsidian
 
 Tavily is registered but not in any mode; it is only used as a bounded diversity
@@ -275,7 +275,7 @@ acceptance remain blocked.
 
 ## Packaging & install
 
-Three interchangeable entrypoints share one codebase at package version `6.1.2`:
+Three interchangeable entrypoints share one codebase at package version `6.2.0`:
 
 ```bash
 # 1) pip install — exposes the `wrr` console script ([project.scripts] wrr = wrr._cli:main).
@@ -288,7 +288,7 @@ wrr doctor --v6 --json --runtime standalone
 ./wrr-cli.py search "your query" --provider exa --count 5
 
 # 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
-#    plugin.yaml `version` is kept aligned with the package version (6.1.2).
+#    plugin.yaml `version` is kept aligned with the package version (6.2.0).
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ```
 
@@ -459,15 +459,32 @@ automation is wired into the search hot path; the fallback remains a v6.x candid
 
 See `RELEASE_NOTES_v6.1.1.md` for the full QA matrix.
 
-## Dependencies (13 total)
+### v6.2.0 — DeepSeek Search engine (released)
+
+- New engine `deepseek` (`wrr/engines/deepseek.py`, `DeepSeekEngine`): DeepSeek
+  Search API `POST https://api.deepseek.com/v1/tools/search`, bearer
+  `DEEPSEEK_API_KEY`, timeout `WRR_DEEPSEEK_TIMEOUT` (default 10 s).
+- Routing: `deepseek` follows `exa` in all 8 modes; RRF weight 1.0 (0.3 in
+  `local`), identical to Exa. Exa and DeepSeek run in parallel via the existing
+  `asyncio.gather` fan-out; no router changes.
+- Mapping: `snippet` ← DeepSeek `summary[:EXA_SEARCH_TEXT_MAX]`; `highlights`
+  empty; `date` → `source_ts` / `freshness_score`. `rerank_score` / `authority`
+  are logged at DEBUG only. Queries are truncated to the API's 128-character
+  limit; `count` clamped to 1–50.
+- Billing: $0.75 per 1,000 successful requests, 5 QPS; one request per search.
+
+See `RELEASE_NOTES_v6.2.0.md`.
+
+## Dependencies (14 total)
 
 Run `wrr-cli.py doctor` for self-check.
 
-### Environment variables (4)
+### Environment variables (5)
 
 | ID | Source | Required |
 |----|--------|----------|
 | `exa_api_key` | [exa.ai](https://exa.ai) | ✅ |
+| `deepseek_api_key` | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | ✅ |
 | `brave_api_key` | [brave.com/search/api](https://brave.com/search/api/) | ✅ |
 | `github_token` | [github.com/settings/tokens](https://github.com/settings/tokens) | ✅ |
 | `searxng_url` | [github.com/searxng/searxng](https://github.com/searxng/searxng) | 可选 |

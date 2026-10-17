@@ -21,7 +21,7 @@ class TestDepManifest:
     """全量依赖清单完整性测试。"""
 
     def test_manifest_is_non_empty(self):
-        assert len(DEPENDENCY_MANIFEST) == 13
+        assert len(DEPENDENCY_MANIFEST) == 14
 
     def test_all_deps_have_source_url(self):
         for dep in DEPENDENCY_MANIFEST:
@@ -38,7 +38,7 @@ class TestDepManifest:
 
     def test_required_deps_count(self):
         required = [d for d in DEPENDENCY_MANIFEST if d.required]
-        assert len(required) == 9  # 13 total, 4 optional (agent_reach now provenance/reference only)
+        assert len(required) == 10  # 14 total, 4 optional (agent_reach now provenance/reference only)
 
     def test_optional_deps(self):
         optional = {d.id for d in DEPENDENCY_MANIFEST if not d.required}
@@ -67,12 +67,12 @@ class TestDepRegistry:
     def test_by_type(self):
         reg = DepRegistry.get()
         env_vars = reg.by_type(DepType.ENV_VAR)
-        assert len(env_vars) == 4
+        assert len(env_vars) == 5
         names = {d.id for d in env_vars}
-        assert "exa_api_key" in names
-        assert "brave_api_key" in names
-        assert "github_token" in names
-        assert "searxng_url" in names
+        assert names == {
+            "exa_api_key", "deepseek_api_key", "brave_api_key",
+            "github_token", "searxng_url",
+        }
 
     def test_by_type_git_repo(self):
         reg = DepRegistry.get()
@@ -88,7 +88,7 @@ class TestDepRegistry:
 
     def test_all_deps_registered(self):
         reg = DepRegistry.get()
-        assert len(reg.all) == 13
+        assert len(reg.all) == 14
 
 
 class TestEnvVarDep:

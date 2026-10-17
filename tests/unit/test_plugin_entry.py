@@ -971,10 +971,10 @@ def _r3_context(ttl_sec=300, *, config_fingerprint="r3-test"):
     return DecisionContext(
         snapshot_version="r3-test", built_at=now, expires_at=now + ttl_sec,
         runtime="standalone", profile="default", registry_source="test",
-        routable_descriptor_ids=("exa", "brave"),
-        bridged_provider_ids=("exa", "brave"), missing_provider_ids=(),
+        routable_descriptor_ids=("exa", "deepseek", "brave"),
+        bridged_provider_ids=("exa", "deepseek", "brave"), missing_provider_ids=(),
         adapter_errors=(), descriptor_reasons=(),
-        descriptor_provider_aliases=(("exa", "exa"), ("brave", "brave")),
+        descriptor_provider_aliases=(("exa", "exa"), ("deepseek", "deepseek"), ("brave", "brave")),
         config_fingerprint=config_fingerprint,
     )
 
@@ -998,7 +998,7 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
             searches.append(self.name)
             return await super().search(options)
 
-    for name in ("exa", "brave"):
+    for name in ("exa", "deepseek", "brave"):
         registry.register(Engine(name, search_results=mk_results(2)))
     registry_calls, builds, created, sinks = [], [], [], []
     fail = [False]
@@ -1067,8 +1067,8 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
     assert len(builds) == 2  # failed handler cannot refresh
     assert registry_calls == [registry]
     assert len(sinks) == 1
-    assert len(searches) == 6
-    assert searches.count("exa") == searches.count("brave") == 3
+    assert len(searches) == 9
+    assert searches.count("exa") == searches.count("deepseek") == searches.count("brave") == 3
     lines = sinks[0].path.read_bytes().splitlines(keepends=True)
     rows = [json.loads(line) for line in lines]
     assert len(rows) == 3
@@ -1092,7 +1092,7 @@ def test_bound_handler_real_provider_router_sink_gate(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mod.uuid, "uuid4", fail_uuid)
     assert asyncio.run(handler({"query": "atomic", "mode": "grounding"}))
-    assert len(searches) == 8
+    assert len(searches) == 12
 
     reopened = CampaignLedger.open(ledger_path, campaign_id="plugin-real-join")
     try:
@@ -1119,7 +1119,7 @@ def test_register_opt_in_campaign_wires_real_admission_and_exact_join(
     import wrr.runtime.decision_evidence as evidence
 
     registry = registry_mod.EngineRegistry()
-    for name in ("exa", "brave"):
+    for name in ("exa", "deepseek", "brave"):
         if outcome == "error":
             registry.register(FakeEngine(name, error="injected engine failure"))
         else:
