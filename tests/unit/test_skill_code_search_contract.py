@@ -31,10 +31,8 @@ def _github(request: httpx.Request) -> httpx.Response:
             {"path": "skills/demo-skill/SKILL.md", "repository": {"full_name": "acme/skills"}}]})
     if path == "/repos/acme/skills/contents/skills/demo-skill/SKILL.md":
         return httpx.Response(200, json={"content": base64.b64encode(SKILL_MD.encode()).decode(), "encoding": "base64"})
-    if path == "/repos/acme/skills/contents/skills/demo-skill":
-        return httpx.Response(200, json=[{"name": "SKILL.md"}])
-    if path == "/repos/acme/skills/commits":
-        return httpx.Response(200, json=[])
+    if path == "/search/repositories":
+        return httpx.Response(200, json={"total_count": 0, "items": []})
     if path.startswith("/repos/"):
         return httpx.Response(200, json={"stargazers_count": 1, "forks_count": 0, "pushed_at": "2026-09-01T00:00:00Z"})
     return httpx.Response(404, json={})
@@ -62,8 +60,31 @@ def _code_search_queries(requests):
 def test_search_uses_filename_qualifier_and_finds_skill(seen):
     engine = sd.SkillDiscoveryEngine(client=GitHubClient(token="test-token"))
     results = asyncio.run(engine.search(SearchOptions(query="demo", count=1)))
-    assert _code_search_queries(seen) == ["demo filename:SKILL.md"]
+    assert sorted(_code_search_queries(seen)) == sorted([
+        "demo filename:SKILL.md",
+        "demo filename:SKILL.md repo:anthropics/skills repo:kepano/obsidian-skills repo:firecrawl/cli repo:vercel-labs/skills",
+    ])
+    # a single candidate yields no feedback token, so no phase-2 searches
+    assert not [r for r in seen if r.url.path == "/search/repositories"]
     assert [(r.title, r.url) for r in results] == [("demo-skill", "https://github.com/acme/skills/tree/HEAD/skills/demo-skill")]
+
+
+def test_phase2_channels_on_the_wire(seen, monkeypatch):
+    """Two repos share the query term, so phase 2 issues the path search and a star-sorted repo search."""
+    def two_repos(request):
+        seen.append(request)
+        if request.url.path == "/search/code" and "in:path" not in request.url.params["q"] \
+                and "repo:" not in request.url.params["q"]:
+            return httpx.Response(200, json={"total_count": 2, "items": [
+                {"path": "skills/demo-skill/SKILL.md", "repository": {"full_name": "acme/skills"}},
+                {"path": "demo-tool/SKILL.md", "repository": {"full_name": "other/demo"}}]})
+        return _github(request)
+    from httpx._client import AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: AsyncClient(*a, **{**k, "transport": httpx.MockTransport(two_repos)}))
+    asyncio.run(sd.SkillDiscoveryEngine(client=GitHubClient(token="test-token")).search(SearchOptions(query="demo", count=5)))
+    assert "demo in:path filename:SKILL.md" in _code_search_queries(seen)
+    repo = [r.url.params for r in seen if r.url.path == "/search/repositories"]
+    assert [(p["q"], p["sort"], p["order"]) for p in repo] == [("demo skill", "stars", "desc")]
 
 
 def test_health_check_probes_with_filename_qualifier(seen):

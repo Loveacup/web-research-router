@@ -2,15 +2,14 @@
 
 提供：
   - code_search(q)              code search（强制认证，10/min，1000 上限）
+  - repo_search(q)              repository search（search 配额 30/min，默认按 star 排序）
   - get_contents(repo, path)    取文件/目录内容（contents API）
-  - subdir_commit_count(...)    子目录提交数（commits?path=&since=，解 Link 头 last 页号）
   - graphql(query, variables)   GraphQL（批量补全，消 N+1）
 
 认证统一读 GITHUB_TOKEN；读 x-ratelimit-* 暴露剩余配额。单仓/单请求失败不抛到整链由调用方决定。
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -21,22 +20,6 @@ from ..errors import EngineError, EngineTimeoutError, RateLimitError
 GITHUB_API = "https://api.github.com"
 GITHUB_GRAPHQL = "https://api.github.com/graphql"
 GITHUB_API_VERSION = "2022-11-28"
-
-_LINK_LAST_RE = re.compile(r'[?&]page=(\d+)>;\s*rel="last"')
-
-
-def parse_link_last(resp) -> int:
-    """从 per_page=1 响应的 Link 头解析 rel="last" 页号 = since 以来提交总数。"""
-    headers = getattr(resp, "headers", {}) or {}
-    link = headers.get("Link") or headers.get("link") or ""
-    m = _LINK_LAST_RE.search(link)
-    if m:
-        return int(m.group(1))
-    try:
-        body = resp.json()
-    except Exception:
-        return 0
-    return len(body) if isinstance(body, list) else 0
 
 
 class GitHubClient:
@@ -93,6 +76,14 @@ class GitHubClient:
             "incomplete_results": bool(data.get("incomplete_results")),
         }
 
+    async def repo_search(self, query: str, per_page: int = 10, sort: str = "stars") -> Dict[str, Any]:
+        """repository search（search 配额，按 sort 降序）：返回 {items, total_count}。"""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await self._get(client, f"{GITHUB_API}/search/repositories",
+                                {"q": query, "sort": sort, "order": "desc", "per_page": per_page})
+            data = r.json() or {}
+        return {"items": data.get("items", []) or [], "total_count": data.get("total_count", 0)}
+
     async def get_contents(self, repo: str, path: str) -> Any:
         """contents API：文件返回 dict（含 base64 content），目录返回 list。"""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -111,20 +102,6 @@ class GitHubClient:
             data = r.json() or {}
         self._repo_cache[repo] = data
         return data
-
-    async def subdir_commit_count(self, repo: str, path: str, since: str) -> Optional[int]:
-        """子目录提交数：commits?path=&since=&per_page=1，读 Link 头 last 页号。
-
-        解大包「整体质量 ≠ 单 skill 质量」难点的核心 API（path 参数官方支持）。
-        失败返回 None（由调用方降级）。
-        """
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                r = await self._get(client, f"{GITHUB_API}/repos/{repo}/commits",
-                                    {"path": path, "since": since, "per_page": 1})
-                return parse_link_last(r)
-        except Exception:
-            return None
 
     async def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         """GraphQL：一次取多仓库/多字段，消 N+1。返回 data 块。"""

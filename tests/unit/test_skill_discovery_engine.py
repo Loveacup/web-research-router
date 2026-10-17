@@ -47,32 +47,6 @@ def test_is_true_skill():
     assert sd.is_true_skill({}) is False
 
 
-# ── 纯函数：skill_score 单调 ─────────────────────────────────────────
-def test_skill_score_weights():
-    assert config.SKILL_SCORE_WEIGHTS == (0.40, 0.35, 0.25)
-
-
-def test_skill_score_activity_monotonic():
-    fm = {"name": "a", "description": "b"}
-    files = []
-    s_low = sd.skill_score(1, fm, files)
-    s_mid = sd.skill_score(20, fm, files)
-    s_high = sd.skill_score(200, fm, files)
-    assert s_low < s_mid < s_high
-    assert sd.skill_score(0, fm, files) <= s_low
-
-
-def test_skill_score_frontmatter_and_engineering_lift():
-    minimal = {"name": "a", "description": "b"}
-    rich = {"name": "a", "description": "b", "version": "1", "license": "MIT",
-            "triggers": ["x"]}
-    # frontmatter 越完整分越高（其余相同）
-    assert sd.skill_score(10, rich, []) > sd.skill_score(10, minimal, [])
-    # 工程化文件存在 → 分更高
-    assert sd.skill_score(10, minimal, ["scripts", "references", "test_foo.py"]) \
-        > sd.skill_score(10, minimal, [])
-
-
 # ── 纯函数：hermes_compat ────────────────────────────────────────────
 def test_hermes_compat():
     full = {"name": "a", "description": "b", "type": "skill", "version": "1.0"}
@@ -94,12 +68,12 @@ class FakeClient:
     """普通对象（非 httpx），记录调用参数以便断言。"""
 
     def __init__(self):
-        self.subdir_calls = []
-        self.code_search_q = None
+        self.queries = []
+        self.content_paths = []
         self.incomplete = False
 
     async def code_search(self, query, per_page=30):
-        self.code_search_q = query
+        self.queries.append(query)
         return {
             "items": [
                 {"repository": {"full_name": "org/good"}, "path": "skills/foo/SKILL.md"},
@@ -111,16 +85,8 @@ class FakeClient:
         }
 
     async def get_contents(self, repo, path):
-        if path.endswith("SKILL.md"):
-            return _b64(_FOO_MD if "foo" in path else _BAR_MD)
-        # 目录 listing → 工程化信号
-        return [{"name": "SKILL.md", "type": "file"},
-                {"name": "scripts", "type": "dir"},
-                {"name": "references", "type": "dir"}]
-
-    async def subdir_commit_count(self, repo, path, since):
-        self.subdir_calls.append({"repo": repo, "path": path, "since": since})
-        return 12
+        self.content_paths.append(path)
+        return _b64(_FOO_MD if "foo" in path else _BAR_MD)
 
 
 def test_search_drops_skillless_and_emits_subdir_url():
@@ -134,12 +100,10 @@ def test_search_drops_skillless_and_emits_subdir_url():
     assert r.url == "https://github.com/org/good/tree/HEAD/skills/foo"   # 直指子目录
     assert r.source_tag == "skill"
     assert "hermes=✓" in r.snippet
-    # code search 拼上了 path 限定
-    assert config.SKILL_CODE_SEARCH_PATH in fake.code_search_q
-    # subdir_commit_count 以 path=子目录 调用（非仓库根）
-    paths = [c["path"] for c in fake.subdir_calls]
-    assert "skills/foo" in paths
-    assert "template/" not in paths and "" not in paths
+    assert fake.queries and all("filename:SKILL.md" in q.split() for q in fake.queries)
+    # 只读 SKILL.md，不列目录、不读排除目录
+    assert fake.content_paths and all(p.endswith("SKILL.md") and not p.startswith("template/")
+                                      for p in fake.content_paths)
 
 
 def test_search_tolerates_incomplete_results():
