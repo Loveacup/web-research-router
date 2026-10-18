@@ -68,3 +68,9 @@ WRR_V6_ROUTER=0 .venv/bin/pytest tests/unit -q -o addopts= -p no:cacheprovider -
 覆盖原对象保留、稳定排序、全拒绝、重复结果只评一次、无额外恢复、精确书目/本地/非公开范围绕过、完整输入先筛隐私、凭据 URL 参数、普通文档近似指令、Unicode 大小边界、截止时间与取消、401/403/429/503/重定向、畸形/缺失/非有限得分，以及 Stage S 证据一致性。
 
 集成验证期间修复了三个具体问题：Windows 盘符模式误匹配普通 HTTPS URL；旧引擎测试直接替换 HTTPX 客户端后泄漏至后续用例；筛选故障的质量状态必须使用既有 `degraded_success`，否则 Stage S 证据校验拒绝记录。未通过放宽生产异常处理、取消重定向限制或关闭隐私检查来让测试通过。
+
+## 授权部署
+
+部署预检发现 macmini 的 Hermes 运行环境缺少 `trafilatura`。当前 Hermes 读取 `python_dependencies`，不读取原 manifest 的 `dependencies`。已改用支持的字段，并补齐 `trafilatura>=2.3.1`，与 Python 包声明一致。插件入口及 campaign 合同测试为 63 passed；依赖通过 Hermes 的管理流程安装，不直接改写其共享环境。
+
+本机和 macmini 的 WRR 专用 `default.env` 已按授权启用 Jev；macmini 的 Hermes `.env` 同步启用。使用已有 `TYPESAFE_API_KEY`，文件权限均为 `0600`，其他配置保持不变。macmini CLI 同时补入该机 Hermes 已有的 DeepSeek key。仓库只保存配置示例，不保存真实凭据。

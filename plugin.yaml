@@ -9,9 +9,10 @@ provides_tools:
   - web_similar
 provides_hooks:
   - pre_llm_call
-dependencies:
+python_dependencies:
   - httpx>=0.28
   - PyYAML>=6
+  - trafilatura>=2.3.1
 config_schema:
   campaign:
     type: dict
