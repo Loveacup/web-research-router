@@ -44,6 +44,13 @@ def _isolate_v6_router_env(monkeypatch):
     monkeypatch.setenv("WRR_V6_ROUTER", "0")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_async_http_client(monkeypatch):
+    """Restore legacy tests' direct client assignments before the next test."""
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", httpx.AsyncClient)
+
+
 class FakeEngine(SearchEngine):
     """可编排的 fake 引擎：按构造参数决定 search/extract/similar 行为。"""
 

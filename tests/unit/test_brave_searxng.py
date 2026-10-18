@@ -80,7 +80,7 @@ def test_brave_key_fallback_name():
     os.environ["BRAVE_API_KEY"] = "k"
 
 
-def test_brave_extract_strips_html(monkeypatch):
+def test_brave_extract_retains_paragraph_text_without_scripts(monkeypatch):
     from httpx._client import AsyncClient
     html = "<html><body><script>x=1</script><p>Hello <b>World</b></p></body></html>"
     transport = httpx.MockTransport(lambda request: httpx.Response(200, text=html))

@@ -118,7 +118,7 @@ class DecisionSnapshot:
     供 route_search_v5 消费，也作为后续选择策略 parity 对比的稳定 seam。
     - source:            选择策略来源（当前恒为 "legacy"）
     - mode:              解析出的 WRR mode（显式 provider 时为 None）
-    - mode_reason:       "explicit" | "classify_intent" | "explicit_provider"
+    - mode_reason:       "explicit" | "classify_intent" | "explicit_provider" | "academic_lookup"
     - explicit_provider: 显式单引擎（无则 None）
     - engine_names:      待发射引擎组合（保序 tuple）
     - weights:           (engine, weight) 对的 tuple（显式 provider 时为空）
@@ -767,6 +767,8 @@ class RouteTrace:
     quality: Optional[RouteQuality] = None
     # P1 3b.1：selection-only privacy-bounded decision evidence；不授权执行。
     decision_evidence: Optional[DecisionEvidence | DecisionEvidenceV2] = None
+    # Post-retrieval selection only; never counted as another evidence source.
+    search_filter: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -785,6 +787,8 @@ class RouteTrace:
             d["health_cache_age_ms"] = round(self.health_cache_age_ms, 2)
         if self.quality is not None:
             d["quality"] = self.quality.to_dict()
+        if self.search_filter is not None:
+            d["search_filter"] = self.search_filter
         if self.decision_evidence is not None:
             if type(self.decision_evidence) is DecisionEvidence:
                 d["decision_evidence"] = DecisionEvidence.to_dict(

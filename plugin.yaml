@@ -1,5 +1,5 @@
 name: wrr-hermes
-version: 6.2.0
+version: 6.4.0
 description: Web Research Router for Hermes — 13 engines (12 routed + Tavily backfill) with mode-based routing, parallel execution, and RRF fusion
 author: Alex Cai
 entry: __init__.py

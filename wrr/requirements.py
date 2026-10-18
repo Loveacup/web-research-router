@@ -19,14 +19,16 @@ ENGINE_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
     "academic": {
         "tier": 0,
         "env": [],
-        "env_optional": ["PAPER_SEARCH_MCP_URL"],
+        "env_optional": ["OPENALEX_API_KEY"],
         "commands": [],
         "endpoints": [
             "https://api.openalex.org/works",
             "https://api.semanticscholar.org/graph/v1/paper/search",
+            "https://api.crossref.org/works",
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
             "http://export.arxiv.org/api/query",
         ],
-        "description": "学术搜索（OpenAlex + Semantic Scholar + arXiv；可选 paper-search-mcp）",
+        "description": "原生学术搜索（OpenAlex / S2、生医 Europe PMC、Crossref DOI、一跳引用；arXiv 可选）",
     },
 
     # Tier 1: API key/token 要求

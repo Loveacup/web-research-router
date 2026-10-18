@@ -1,7 +1,7 @@
-"""Brave 引擎：search（GET，params 自动编码）+ extract（裸 HTTP 抓取 + 剥标签）。"""
-import re
+"""Brave 引擎：search API + 受控 HTTP 抓取后的本地正文抽取。"""
 import httpx
 from typing import List
+from trafilatura import extract as extract_body, load_html
 
 from .base import SearchEngine
 from .. import config
@@ -56,11 +56,38 @@ class BraveEngine(SearchEngine):
         html = await fetch_html(
             options.url, timeout=self.timeout, allow_private_origin=options.allow_private_origin,
         )
-        # 极简正文提取：剥 script/style → 剥标签 → 折叠空白。
-        text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return make_extraction(options, text, method="httpx.html_tag_strip")
+        tree = load_html(html)
+        if tree is None and html.strip():
+            # load_html rejects single-block fragments as dubious HTML.
+            # Supply a document envelope, not a second extraction algorithm.
+            tree = load_html(f"<html><body>{html}</body></html>")
+        if tree is not None:
+            if tree.tag != "html":
+                document = tree.makeelement("html")
+                body = tree.makeelement("body")
+                document.append(body)
+                body.append(tree)
+                tree = document
+            # The external comparator also sees this tree. Remove semantic
+            # navigation before it can reinterpret navigation links as prose.
+            for element in reversed(tree.xpath('.//nav | .//*[@role="navigation"]')):
+                element.drop_tree()
+            # Precision pruning in trafilatura 2.3.1 drops empty inline tags
+            # together with their tails. Pygments starts <pre> with an empty
+            # span, whose tail can hold the entire main text (e.g. PEP 20).
+            # Unwrap only empty inline markers; preserve text and block breaks.
+            for element in list(tree.iter("span", "b", "strong", "i", "em", "q")):
+                if len(element) == 0 and element.text is None and element.tail:
+                    element.drop_tag()
+        # Parse only the fetched document. Metadata stays off: the parser must
+        # never download linked resources or bypass fetch_html's origin policy.
+        # Precision mode also disables upstream's whole-page baseline rescue.
+        text = (extract_body(
+            tree, output_format="txt", favor_precision=True,
+            include_comments=False, include_tables=True, with_metadata=False,
+        ) or "") if tree is not None else ""
+        # Successful heuristic extraction cannot attest that the source is complete.
+        return make_extraction(options, text, method="httpx.trafilatura")
 
     async def health_check(self, *, deep: bool = False) -> EngineCheckResult:
         """检查 Brave API key（主用或备用）是否存在。"""

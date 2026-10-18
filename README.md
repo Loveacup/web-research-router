@@ -2,7 +2,7 @@
 
 Semantic search router with mode-based routing, 13 registered engines (12 routed + Tavily backfill), and Reciprocal Rank Fusion.
 
-**Current version:** 6.2.0 — adds the DeepSeek Search API engine as a primary web source running in parallel with Exa in every web mode. v6.1 Engine Health Policy remains released. Production search still executes on the legacy v5 mode/RRF data plane (Stage S); the v6 descriptor registry participates only as a shadow selection and evidence source. The optional D7-S5 campaign sampler is packaged inside the plugin, disabled by default, and runs only when both `campaign.enabled` and `campaign_sampler.enabled` are explicitly true.
+**Current version:** 6.4.0 — optional Jev search-result filtering after retrieval/RRF, with bounded calls and explicit privacy/failure outcomes. Builds on 6.3.0 upstream compatibility, article extraction and scholarly retrieval. DeepSeek Search remains a primary web source alongside Exa. Production search still executes on the legacy v5 mode/RRF data plane (Stage S); the v6 descriptor registry participates only as a shadow selection and evidence source. The optional D7-S5 campaign sampler remains disabled by default and requires both `campaign.enabled` and `campaign_sampler.enabled`.
 
 ## Design scope and progress
 
@@ -16,9 +16,23 @@ The next contract work also covers network-skill trigger coordination (Obsidian
 MH-07 / NR-01–08): one collection path for a plain article, without implicit
 browser use, delegation, or report files. This coordination is not implemented.
 
+### Required checks before every optimization
+
+1. Review updates to projects whose capabilities WRR consumes or has absorbed:
+   compare the installed/reviewed version with upstream, including invocation,
+   output schema, authentication, and compatibility changes.
+2. Scan active/popular GitHub projects for useful capabilities WRR lacks.
+   Evaluate incremental value, provenance, license, cost, and operational risk;
+   popularity alone is not an integration criterion.
+3. Record findings, adoption/defer decisions, and verification boundaries in the
+   [upstream and capability review log](docs/upstream-review.md), and record
+   implemented upgrades in the release notes. Checking does not authorize
+   automatic upgrades of shared tools.
+
+
 ## Architecture
 
-Interactive diagrams (generated with archify from the code at this revision): `docs/architecture/wrr-components.html` (component map) and `docs/architecture/wrr-web-search.html` (Hermes `web_search` request sequence). Sources: the `*.json` specs beside them.
+Interactive diagrams (historical snapshot at revision `22d65e7`, v6.1.2): `docs/architecture/wrr-components.html` (component map) and `docs/architecture/wrr-web-search.html` (Hermes `web_search` request sequence). Sources: the `*.json` specs beside them. Current routing and capabilities are documented below; these diagrams have not been regenerated.
 
 
 ### Runtime paths
@@ -26,8 +40,8 @@ Interactive diagrams (generated with archify from the code at this revision): `d
 | Entrypoint | Router | Registry used for execution |
 |---|---|---|
 | Hermes plugin `web_search` | v5 `route_search_v5` with Stage S on (`__init__.py` sets `stage_s_enabled=True`) | legacy `default_registry()`; `WRR_V6_ROUTER` does **not** change execution |
-| `wrr search --route-mode <mode>` | v5 `route_search_v5`, Stage S off | legacy by default; v6 descriptor-backed registry when `WRR_V6_ROUTER=1` |
-| `wrr search` / `fetch` / `similar` (no `--route-mode`) | v4 sequential `route()` — first non-empty engine wins, no RRF | legacy |
+| `wrr search` (with or without `--route-mode`) | v5 `route_search_v5`, Stage S off; automatic mode when not explicit | legacy by default; v6 descriptor-backed registry when `WRR_V6_ROUTER=1` |
+| `wrr fetch` / `similar` | v4 sequential `route()` — first non-empty engine wins, no RRF | legacy |
 
 ### v6 descriptor bridge (shadow, opt-in)
 
@@ -48,8 +62,8 @@ not on importing Agent-Reach code.
 ### 8 routing modes
 
 Mode is chosen by `resolve_mode()`: explicit `route_mode` → legacy `mode` →
-`classify_intent(query)` (keyword rules, no LLM; priority recovery → local →
-broad → platform → academic → research → discovery → grounding). Base engines
+`classify_intent(query)` (keyword rules, no LLM; exact bibliographic lookup first,
+then recovery → local → broad → platform → academic → research → discovery → grounding). Base engines
 and RRF weights come from `wrr/config.py` `MODE_DISPATCH` / `MODE_WEIGHTS`;
 query triggers may append `github`, `skill`, `academic`, or `community`.
 
@@ -58,19 +72,91 @@ query triggers may append `github`, `skill`, `academic`, or `community`.
 | discovery | "what's out there" | exa, deepseek, brave, community | community 0.50 |
 | grounding | "what's the fact" | exa, deepseek, brave | — |
 | research | deep investigation | exa (`deep-lite`), deepseek, brave, community, academic | community 0.35, academic 0.30 |
-| academic | papers | academic (OpenAlex + Semantic Scholar; arXiv off by default), exa, deepseek, community | academic 1.0 |
+| academic | papers | academic (OpenAlex + S2; biomedical Europe PMC; Crossref fallback; arXiv opt-in), exa, deepseek, community | academic 1.0 |
 | platform | platform/community questions | community, exa, deepseek, brave | community 1.0 |
 | broad | exploratory queries | exa, deepseek, brave, community, searxng | community 0.55, searxng 0.30 |
 | local | search my stuff | supermemory, session, qmd, obsidian, exa, deepseek, brave | local 1.0/0.9/0.9/0.8, web 0.3 |
 | recovery | primary mode returned nothing | brave, exa, deepseek, searxng | gated by `recovery_allowed(runtime)` |
 
+Exact `doi:`, bare DOI/DOI URL, `references:` and `citations:` requests automatically
+select only `academic`, without paid web fan-out or unrelated recovery.
+Explicit `--provider` and `--route-mode` retain priority. Recovery and diversity
+backfill share the remaining request deadline; automatic recovery does not
+repeat already attempted engines.
+
+RRF caps each canonical URL to one contribution per known retrieval family
+(the maximum weighted rank contribution). `github` and `skill` share a family;
+recognized platform tags from community/last30days preserve upstream identity.
+Route quality also merges known engine aliases, but does not certify independent
+publishers or factual corroboration across search providers.
+
+### Optional Jev search-result filtering
+
+Set `WRR_JEV_FILTER=1` and provide `TYPESAFE_API_KEY` in the authorized WRR
+environment. Default is off; WRR does not discover another host's keys or enable
+cloud filtering merely because a key exists. `WRR_JEV_FILTER_TIMEOUT` defaults
+to 2 seconds, capped at 3 and by the remaining search deadline.
+
+The selector runs once after retrieval/fusion, including explicit-provider and
+recovery results, before decision evidence is recorded. It asks Jev separate
+typed relevance and instruction-injection questions over at most 20 candidates.
+“Same topic” alone is not enough: the snippet must help answer the question.
+Only bounded title/URL/snippet excerpts are sent; original result records and
+source attribution stay local and unchanged.
+
+Exact bibliographic lookups, local intents, and successful authenticated/custom
+providers (`github`, `skill`, `community`, local engines) bypass it. Only public
+web/academic provider scopes are eligible. Sensitive-looking queries/candidates
+and private/local URL shapes skip cloud evaluation. These conservative
+heuristics are not a complete privacy or injection detector.
+
+Timeout, API failure or malformed answers retain the original results and
+report `fail_open`; they do not trigger more searches. A valid decision rejecting
+every candidate returns an empty list with insufficient quality, not fabricated
+replacement evidence. `diagnostics.search_filter` reports evaluated/unjudged/
+clipped indices and the selection outcome; Jev is never another evidence source
+or a factual-verification certificate.
+
+Source methods: Hermes Jev's dual-question filter and GPT Researcher's
+answer-usefulness rubric. No GPT Researcher runtime, LangChain dependency,
+recursive research loop or report generator is installed. See
+[v6.4.0 upgrade record](RELEASE_NOTES_v6.4.0.md).
+
 ### 13 engines
 
-- **Public-web (9):** Exa, DeepSeek Search (`/v1/tools/search`, in-house index; weight 1.0 alongside Exa), Brave, GitHub, Community (OpenCLI + Last30Days + RSS), Academic (OpenAlex + Semantic Scholar, optional arXiv), Skill, SearXNG, Tavily
+- **Public-web (9):** Exa, DeepSeek Search (`/v1/tools/search`, in-house index; weight 1.0 alongside Exa), Brave, GitHub, Community (OpenCLI + Last30Days + RSS), Academic (OpenAlex + S2 + query-aware Europe PMC/Crossref, optional arXiv), Skill, SearXNG, Tavily
 - **Local (4):** Supermemory, Session, QMD, Obsidian
 
 Tavily is registered but not in any mode; it is only used as a bounded diversity
 backfill for `grounding` / `research` when Brave fails (rate-limit / timeout / empty).
+
+### Scholarly and scoped community queries
+
+```bash
+wrr search "doi:10.1038/nature14539"
+wrr search "references:10.1038/nature14539" --count 10
+wrr search "citations:W2919115771" --count 10
+wrr search "clinical randomized trial cancer immunotherapy" --provider academic
+wrr search "site:bilibili.com Python 教程" --provider community --count 5
+```
+
+DOI lookups verify **bibliographic identity**, not whether a paper supports a
+claim. Relationships are one hop, limited to 25 items, with seed and edge-direction
+checks. Unknown identifiers do not silently become topical searches. Publication
+date precision and retraction evidence remain in the result; citation counts are
+not truth scores. `OPENALEX_API_KEY` is optional and sent only as an authorization
+header; no paper-search-mcp server is required.
+
+Bilibili, Zhihu and Weibo run only when explicitly scoped by their query signals,
+using the existing authorized OpenCLI session. No automatic login, challenge
+bypass, or unconditional default fan-out. V2EX-only requests use web-engine
+`site:v2ex.com` search instead of the nonexistent OpenCLI `v2ex search`.
+
+last30days EN receives a bounded literal plan and matching `--search`; unsupported
+scopes are skipped, not widened. New dev.to/Techmeme candidates require the
+corresponding source modules in the installed upstream version. WRR does not
+upgrade shared tools. Set `WRR_LAST30DAYS_EN_PYTHON` to a supported interpreter
+(Python 3.12+ for the observed upstream version) when the host PATH lacks it.
 
 ## Quick start
 
@@ -86,7 +172,7 @@ ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ./wrr-cli.py search "your query" --provider exa --count 5
 ./wrr-cli.py fetch "https://example.com" --provider exa --max-chars 2000
 ./wrr-cli.py similar "https://example.com" --provider exa --count 5
-wrr search "your query" --route-mode research   # standalone CLI (wrr._cli:main); v5 mode routing needs --route-mode
+wrr search "your query" --route-mode research   # explicit override of automatic mode
 ```
 
 ### OMP native extension
@@ -202,9 +288,11 @@ automatically collecting a second body.
 
 Empty bodies, recognized challenge pages, and explicit summaries are rejected
 with a readable fallback reason. An explicit provider still disables fallback.
-Exa reports `exa.contents`; the existing Brave extraction fallback reports its
-actual method, `httpx.html_tag_strip`, rather than claiming professional article
-extraction. This content contract does not establish SSRF or redirect safety.
+Exa reports `exa.contents`; the Brave extraction fallback reports
+`httpx.trafilatura`. It extracts article text locally from the HTML obtained by
+the existing safe transport, excluding navigation and comments. Empty inline
+markers are unwrapped without losing their tail text. Extraction still does
+not prove completeness, fetch linked assets, or establish SSRF/redirect safety.
 
 ### Direct HTTP fetch authorization
 
@@ -275,7 +363,7 @@ acceptance remain blocked.
 
 ## Packaging & install
 
-Three interchangeable entrypoints share one codebase at package version `6.2.0`:
+Three interchangeable entrypoints share one codebase at package version `6.4.0`:
 
 ```bash
 # 1) pip install — exposes the `wrr` console script ([project.scripts] wrr = wrr._cli:main).
@@ -288,7 +376,7 @@ wrr doctor --v6 --json --runtime standalone
 ./wrr-cli.py search "your query" --provider exa --count 5
 
 # 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
-#    plugin.yaml `version` is kept aligned with the package version (6.2.0).
+#    plugin.yaml `version` is kept aligned with the package version (6.4.0).
 ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
 ```
 
@@ -475,7 +563,22 @@ See `RELEASE_NOTES_v6.1.1.md` for the full QA matrix.
 
 See `RELEASE_NOTES_v6.2.0.md`.
 
-## Dependencies (14 total)
+### v6.3.0 — Upstream compatibility and evidence retrieval
+
+- OpenCLI v2 success/error envelopes, last30days plan/JSON contracts, and scoped
+  Bilibili/Zhihu/Weibo search; invalid V2EX CLI search removed.
+- Local trafilatura article extraction through the existing safe transport.
+- Crossref exact DOI lookup, bounded OpenAlex citation edges, and biomedical
+  Europe PMC; metadata identity is not claim verification.
+- Known-family RRF vote caps, exact lookup routing, and deadline-bounded recovery
+  without rerunning failed primary engines.
+- Jev public-sample assessment recorded; no default cloud decision call enabled.
+
+See [upgrade and verification record](RELEASE_NOTES_v6.3.0.md) and
+[pinned source review](docs/upstream-review.md). Shared external installations
+and cross-host deployment are not upgraded by these code changes.
+
+## Dependencies (13 total)
 
 Run `wrr-cli.py doctor` for self-check.
 
@@ -489,13 +592,12 @@ Run `wrr-cli.py doctor` for self-check.
 | `github_token` | [github.com/settings/tokens](https://github.com/settings/tokens) | ✅ |
 | `searxng_url` | [github.com/searxng/searxng](https://github.com/searxng/searxng) | 可选 |
 
-### Git repositories (4)
+### Git repositories (3)
 
 | ID | Source | Required |
 |----|--------|----------|
 | `last30days_en` | [mvanhorn/last30days-skill](https://github.com/mvanhorn/last30days-skill) | ✅ |
 | `last30days_cn` | [Jesseovo/last30days-skill-cn](https://github.com/Jesseovo/last30days-skill-cn) | ✅ |
-| `paper_search_mcp` | [openags/paper-search-mcp](https://github.com/openags/paper-search-mcp) | 可选 |
 | `agent_reach` | [Panniantong/Agent-Reach](https://github.com/Panniantong/Agent-Reach) | 参考 |
 
 ### CLI tools (2)

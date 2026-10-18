@@ -9,6 +9,7 @@
 import asyncio
 import datetime as _dt
 import os
+import re
 import time
 import uuid as _uuid
 from dataclasses import replace
@@ -61,8 +62,23 @@ def build_chain(operation: str, explicit_provider: Optional[str],
     raise ValueError(f"unknown operation: {operation}")
 
 
+def _v2ex_only_query(query: str) -> bool:
+    if not re.search(r"\bv2ex\b", query, re.IGNORECASE):
+        return False
+    return not any(
+        (name in query.lower() if not name.isascii() else
+         re.search(rf"\b{re.escape(name)}\b", query, re.IGNORECASE))
+        for name in config.COMMUNITY_PLATFORM_NAMES
+    )
+
+
 async def _invoke(engine, operation: str, options) -> Any:
     if operation == "search":
+        query = getattr(options, "query", "")
+        if (engine.name in {"exa", "deepseek", "brave", "searxng", "tavily"}
+                and _v2ex_only_query(query)
+                and not re.search(r"(?:^|\s)-?site:", query, re.IGNORECASE)):
+            options = replace(options, query=f"site:v2ex.com {query}")
         return await engine.search(options)
     if operation == "extract":
         return await engine.extract(options)
@@ -197,7 +213,7 @@ async def route(operation: str, options, registry: SearchRegistry,
             events.append(event)
             continue
         remaining = budget - elapsed
-        per_engine = min(engine.timeout, max(0.1, remaining))
+        per_engine = min(engine.timeout, remaining)
         try:
             result = await asyncio.wait_for(_invoke(engine, operation, options), timeout=per_engine)
             step_elapsed = _elapsed_ms(step_start)
@@ -329,16 +345,20 @@ def _route_quality(mode, selected_engines, steps, has_results: bool) -> RouteQua
     }
     successful = [name for name in expected if name in successful_set]
     failed = [name for name in expected if name not in successful_set]
+    independent = len({_fusion.source_family(name) for name in successful})
     min_required = _QUALITY_MIN_SOURCES.get(mode, 1)
+    if mode == "academic" and expected == ["academic"]:
+        # A closed bibliographic lookup verifies metadata, not multiple-source claims.
+        min_required = 1
 
     if not has_results:
         verdict = "failed"
         reasons = ["no_valid_results"]
-    elif len(successful) < min_required:
+    elif independent < min_required:
         verdict = "insufficient"
-        reasons = [f"successful_sources_below_minimum:{len(successful)}<{min_required}"]
+        reasons = [f"successful_sources_below_minimum:{independent}<{min_required}"]
         # 稳定 token（非新 verdict）：多源要求下恰剩单一独立成功来源。
-        if min_required >= 2 and len(successful) == 1:
+        if min_required >= 2 and independent == 1:
             reasons.append("single_source_only")
     elif failed:
         verdict = "degraded_success"
@@ -352,7 +372,7 @@ def _route_quality(mode, selected_engines, steps, has_results: bool) -> RouteQua
         expected_sources=expected,
         successful_sources=successful,
         failed_sources=failed,
-        independent_source_count=len(successful),
+        independent_source_count=independent,
         min_required=min_required,
         reasons=reasons,
     )
@@ -394,6 +414,12 @@ def legacy_selection_plan(options) -> DecisionSnapshot:
     query = getattr(options, "query", "") or ""
     weights = config.MODE_WEIGHTS.get(mode, config.MODE_WEIGHTS["grounding"])
     engine_names = config.mode_engines(mode, query)
+    if not explicit_mode and config.academic_lookup_requested(query):
+        engine_names = ["academic"]
+        mode_reason = "academic_lookup"
+    elif _v2ex_only_query(query):
+        # No query-search adapter exists in OpenCLI's V2EX catalog.
+        engine_names = [name for name in engine_names if name != "community"]
     used = tuple((n, float(weights.get(n, 1.0))) for n in engine_names)
     return DecisionSnapshot(
         source="legacy",
@@ -426,6 +452,9 @@ def _event_from_step(step: FallbackStep, elapsed_ms: float, timeout_ms: Optional
 async def _run_engine(registry, name, options, budget):
     """跑单引擎 search，超时/异常隔离，返回 (name, results_or_None, FallbackStep, DiagnosticEvent)。"""
     start = time.monotonic()
+    if budget <= 0:
+        step = FallbackStep(name, False, 0, "budget exceeded (skipped)")
+        return name, None, step, _event_from_step(step, 0.0, 0.0)
     engine = registry.get(name)
     if engine is None:
         step = FallbackStep(name, False, 0, f"unknown provider: {name}")
@@ -436,8 +465,8 @@ async def _run_engine(registry, name, options, budget):
         return name, None, step, event
     per_engine = None
     try:
-        per_engine = min(engine.timeout, max(0.1, budget))
-        res = await asyncio.wait_for(engine.search(options), timeout=per_engine)
+        per_engine = min(engine.timeout, budget)
+        res = await asyncio.wait_for(_invoke(engine, "search", options), timeout=per_engine)
         elapsed = _elapsed_ms(start)
         if not res:
             step = FallbackStep(name, False, 0, "empty result")
@@ -824,6 +853,69 @@ def _record_error_evidence(
     _safe_record(sink, evidence)
 
 
+_PUBLIC_FILTER_PROVIDERS = frozenset({"exa", "deepseek", "brave", "searxng", "tavily", "academic"})
+
+
+async def _apply_search_filter(options, result: RouterResult, route_start: float) -> RouterResult:
+    """One optional post-retrieval decision; never another retrieval or evidence source."""
+    if not config.JEV_FILTER_ENABLED:
+        return result
+    query = getattr(options, "query", "") or ""
+    count = _safe_payload_count(result.payload)
+    reason = None
+    if config.academic_lookup_requested(query):
+        reason = "exact_bibliographic_lookup"
+    elif result.mode == "local" or config.local_triggered(query):
+        reason = "local_scope"
+    elif (not result.fallback_chain or any(
+        step.ok and step.provider not in _PUBLIC_FILTER_PROVIDERS
+        for step in result.fallback_chain
+    )):
+        # Logged-in/custom sources can return private material at public URLs.
+        reason = "non_public_provider_scope"
+    elif not count:
+        reason = "empty_candidates"
+    key = config.get_env("TYPESAFE_API_KEY")
+    remaining = max(0.0, config.budget_for("search") - (time.monotonic() - route_start))
+    if reason is None and not key:
+        reason = "missing_key"
+    if reason is None and remaining <= 0:
+        reason = "budget_exhausted"
+    trace = result.diagnostics
+    if trace is None:
+        trace = RouteTrace(mode=result.mode)
+        result.diagnostics = trace
+    if reason is not None:
+        trace.search_filter = {
+            "status": "skipped", "reason": reason, "input_count": count,
+            "selected_count": count, "evaluated_count": 0, "sent_count": 0,
+            "unjudged_ids": list(range(count)),
+        }
+        return result
+    from .search_filter import filter_results
+    outcome = await filter_results(
+        query, result.payload, api_key=key,
+        timeout=min(config.JEV_FILTER_TIMEOUT, remaining),
+    )
+    result.payload = outcome.results
+    trace.search_filter = outcome.diagnostics
+    trace.elapsed_ms = _elapsed_ms(route_start)
+    quality = trace.quality
+    if quality is not None:
+        if not result.payload:
+            trace.quality = replace(
+                quality, verdict="insufficient",
+                reasons=[*quality.reasons, "search_filter_empty"],
+            )
+        elif outcome.diagnostics["status"] == "fail_open":
+            trace.quality = replace(
+                quality,
+                verdict="degraded_success" if quality.verdict == "complete" else quality.verdict,
+                reasons=[*quality.reasons, "search_filter_unavailable"],
+            )
+    return result
+
+
 async def _route_search_v5_execute(
     options,
     registry: SearchRegistry,
@@ -865,7 +957,9 @@ async def _route_search_v5_execute(
             provider = config.DIVERSITY_BACKFILL_PROVIDER
             engine_names.append(provider)          # selected_engines 真实记录 tavily 被尝试
             _, bf_res, bf_step, bf_event = await _run_engine(
-                registry, provider, options, config.DIVERSITY_BACKFILL_TIMEOUT_SECONDS)
+                registry, provider, options,
+                min(config.DIVERSITY_BACKFILL_TIMEOUT_SECONDS,
+                    max(0.0, budget - (time.monotonic() - route_start))))
             steps.append(bf_step)
             events.append(bf_event)
             if bf_res:
@@ -879,9 +973,11 @@ async def _route_search_v5_execute(
             if web_mode == "local":
                 web_mode = "discovery"
             web_engines = config.mode_engines(web_mode, getattr(options, "query", "") or "")
+            attempted = {step.provider for step in steps}
+            web_engines = [name for name in web_engines if name not in attempted]
             web_weights = config.MODE_WEIGHTS.get(web_mode, config.MODE_WEIGHTS["grounding"])
             wpayload, wsteps, wevents = await _dispatch(registry, web_engines, options, web_weights,
-                                               web_mode, budget)
+                                               web_mode, max(0.0, budget - (time.monotonic() - route_start)))
             steps.extend(wsteps)
             events.extend(wevents)
             if wpayload is not None:
@@ -891,7 +987,7 @@ async def _route_search_v5_execute(
                 )[:options.count]
 
     # 主 mode 空 → recovery 兜底（Brave + Exa + SearXNG）
-    if payload is None and mode != "recovery":
+    if payload is None and mode != "recovery" and plan.mode_reason != "academic_lookup":
         if not config.recovery_allowed():
             reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
             error_state.terminal = "recovery_blocked"
@@ -910,8 +1006,10 @@ async def _route_search_v5_execute(
             )
         rec_weights = config.MODE_WEIGHTS["recovery"]
         rec_names = config.mode_engines("recovery", getattr(options, "query", "") or "")
+        attempted = {step.provider for step in steps}
+        rec_names = [name for name in rec_names if name not in attempted]
         rpayload, rsteps, revents = await _dispatch(registry, rec_names, options, rec_weights,
-                                           "recovery", budget)
+                                           "recovery", max(0.0, budget - (time.monotonic() - route_start)))
         steps.extend(rsteps)
         events.extend(revents)
         if rpayload is not None:
@@ -1024,9 +1122,10 @@ async def route_search_v5(
             descriptor_registry_factory=descriptor_registry_factory,
         )
         plan = legacy_selection_plan(options)
-        return await _route_search_v5_execute(
+        result = await _route_search_v5_execute(
             options, registry, plan, None, route_start, _ExecErrorState()
         )
+        return await _apply_search_filter(options, result, route_start)
 
     # Stage S ON：composition 可显式注入 request identity；旧 caller 仍 best-effort
     # mint UUIDv4。显式值不重 mint、不规范化；非法值由 evidence schema 拒绝并按
@@ -1082,6 +1181,7 @@ async def route_search_v5(
         result = await _route_search_v5_execute(
             options, registry, plan, shadow_comparison, route_start, error_state
         )
+        result = await _apply_search_filter(options, result, route_start)
     except AllEnginesFailedError:
         # Planning-time AllEnginesFailed is still an unexpected planning error;
         # execute() sets the private state before any expected execution terminal.

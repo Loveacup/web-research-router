@@ -1,33 +1,28 @@
-"""学术搜索引擎（v5.0，D2）。
+"""Native scholarly retrieval with bounded, isolated public API requests.
 
-OpenAlex 主力 + Semantic Scholar 引用质量 + arXiv 预印本（默认 lazy），多源并行
-→ DOI 优先去重合并 → 统一 academic_score 排序 → SearchResult 输出。骨架对齐
-community.py（asyncio.gather + 各源独立失败隔离）。
+OpenAlex and Semantic Scholar remain the general sources (arXiv is opt-in).
+Biomedical queries add Europe PMC; an empty general search may fall back to
+Crossref bibliographic metadata. Exact DOIs use identifier-matched Crossref
+records, never title search. Explicit references:/citations: queries use one
+verified OpenAlex seed and one relationship page, without graph expansion.
 
-评分（引擎内部，4 维加权，权重取自 config.ACADEMIC_SCORE_WEIGHTS）：
-    academic_score = 0.35*velocity + 0.25*authority + 0.20*recency + 0.20*relevance
-  - velocity   ：年均引用对数压缩（citation_velocity）——不用绝对引用数，避免老论文碾压新论文。
-  - authority  ：venue 权威 + S2 influentialCitationCount 占比；预印本无 venue → 自然偏低。
-  - recency    ：连续时间衰减（_fusion.recency_decay，半衰期 365d）；预印本 ×1.2 boost 封顶 1.0。
-  - relevance  ：源返回相关性 rank → 分位。
-
-去重：DOI 优先 → arXiv ID 兜底 → OpenAlex id 兜底 → 标题归一；引用数取 max + 标注来源，
-优先 OpenAlex 字段，保留正式版（有 venue）为代表。
-
-HTTP 集中在模块级 async 函数（_fetch_openalex / _fetch_s2 / _fetch_arxiv），便于单测
-monkeypatch，零网络。研究依据见 /tmp/wrr-research-report.md §3 与 STDD §5.1。
+Citation counts and ranking signals are discovery aids, not truth assessments.
+Metadata verification confirms a bibliographic identifier, not a paper's claims.
 """
 import asyncio
 import math
 import re
+from html import unescape
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
 from .base import SearchEngine
 from ._fusion import recency_decay
+from ._academic_query import AcademicQuery, academic_query, biomedical_scope
 from .. import config
 from ..errors import EngineError
 from ..schemas import SearchOptions, SearchResult, EngineCheckResult
@@ -64,7 +59,7 @@ def _parse_date(val) -> Optional[datetime]:
 
 def _year_date(year) -> Optional[datetime]:
     y = _int(year)
-    if y <= 0:
+    if not 1 <= y <= 9999:
         return None
     return datetime(y, 1, 1, tzinfo=timezone.utc)
 
@@ -74,7 +69,7 @@ def _clean_doi(doi: str) -> str:
     if not doi:
         return ""
     d = doi.strip().lower()
-    return re.sub(r"^https?://(dx\.)?doi\.org/", "", d)
+    return re.sub(r"^(?:doi:\s*|https?://(?:dx\.)?doi\.org/)", "", d)
 
 
 def _rank_relevance(idx: int, total: int) -> float:
@@ -144,7 +139,7 @@ def academic_score(paper: Dict[str, Any], now: Optional[datetime] = None) -> flo
 
 # ── 去重（DOI 优先 → arXiv → openalex → 标题）─────────────────────────
 def _dedup_key(p: Dict[str, Any]) -> str:
-    doi = (p.get("doi") or "").strip().lower()
+    doi = _clean_doi(p.get("doi") or "")
     if doi:
         return "doi:" + doi
     ax = (p.get("arxiv_id") or "").strip().lower()
@@ -166,9 +161,17 @@ def _merge_into(base: Dict[str, Any], other: Dict[str, Any]) -> None:
     if other.get("source"):
         cs[other["source"]] = _int(other.get("cited_by_count"))
 
+    for field in ("retraction_evidence", "evidence"):
+        values = base.setdefault(field, [])
+        for value in other.get(field) or []:
+            if value not in values:
+                values.append(value)
+    if not base.get("pub_date") and other.get("pub_date"):
+        base["pub_date"] = other["pub_date"]
+        base["pub_date_precision"] = other.get("pub_date_precision", 10)
     # 缺字段补全（任一源有就补）
     for f in ("tldr", "abstract", "venue", "doi", "doi_url", "landing_url",
-              "arxiv_id", "openalex_id", "pub_date"):
+              "arxiv_id", "openalex_id"):
         if not base.get(f) and other.get(f):
             base[f] = other[f]
 
@@ -183,10 +186,13 @@ def _merge_into(base: Dict[str, Any], other: Dict[str, Any]) -> None:
 
     # OpenAlex 字段优先（日更最快、口径最一致）
     if other.get("source") == "openalex":
-        for f in ("doi", "doi_url", "venue", "venue_rank", "pub_date",
+        for f in ("doi", "doi_url", "venue", "venue_rank",
                   "openalex_id", "landing_url"):
             if other.get(f):
                 base[f] = other[f]
+        if other.get("pub_date"):
+            base["pub_date"] = other["pub_date"]
+            base["pub_date_precision"] = other.get("pub_date_precision", 10)
         base["source"] = "openalex"
 
 
@@ -200,6 +206,8 @@ def dedup_by_doi(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             _merge_into(merged[key], p)
         else:
             rep = dict(p)
+            for field in ("evidence", "retraction_evidence"):
+                rep[field] = list(p.get(field) or [])
             rep["cite_sources"] = {p["source"]: _int(p.get("cited_by_count"))} \
                 if p.get("source") else {}
             merged[key] = rep
@@ -236,6 +244,7 @@ def _parse_openalex_work(work: Dict[str, Any], idx: int, total: int) -> Optional
         "abstract": _reconstruct_abstract(work.get("abstract_inverted_index")),
         "doi_url": doi_url,
         "landing_url": landing,
+        "retraction_evidence": ["retracted (OpenAlex)"] if work.get("is_retracted") is True else [],
     }
 
 
@@ -249,13 +258,15 @@ def _parse_s2_paper(p: Dict[str, Any], idx: int, total: int) -> Optional[Dict[st
     venue = (p.get("venue") or "").strip()
     tldr_obj = p.get("tldr") or {}
     tldr = (tldr_obj.get("text") if isinstance(tldr_obj, dict) else "") or ""
-    pub_date = _parse_date(p.get("publicationDate")) or _year_date(p.get("year"))
+    supplied_date = _parse_date(p.get("publicationDate"))
+    pub_date = supplied_date or _year_date(p.get("year"))
     is_preprint = (not venue) and bool(arxiv_id)
     return {
         "title": title,
         "cited_by_count": _int(p.get("citationCount")),
         "influential_citations": _int(p.get("influentialCitationCount")),
         "pub_date": pub_date,
+        "pub_date_precision": 10 if supplied_date else 4,
         "is_preprint": is_preprint,
         "venue": venue,
         "venue_rank": 0.0 if (is_preprint or not venue) else 0.5,
@@ -313,6 +324,105 @@ def _parse_arxiv_atom(text: str, count: int) -> List[Dict[str, Any]]:
     return out
 
 
+def _metadata_text(value: Any) -> str:
+    """Strip markup from deposited abstract metadata, not fetch paper text."""
+    return unescape(re.sub(r"<[^>]+>", " ", str(value or ""))).strip()
+
+
+def _crossref_publication(work: Dict[str, Any]) -> tuple[Optional[datetime], int]:
+    for field in ("published-online", "published-print", "published", "issued"):
+        obj = work.get(field) or {}
+        parts = obj.get("date-parts") if isinstance(obj, dict) else None
+        if not isinstance(parts, list) or not parts or not isinstance(parts[0], list):
+            continue
+        values = parts[0]
+        try:
+            date = datetime(int(values[0]), int(values[1]) if len(values) > 1 else 1,
+                            int(values[2]) if len(values) > 2 else 1, tzinfo=timezone.utc)
+            return date, (10 if len(values) >= 3 else (7 if len(values) == 2 else 4))
+        except (ValueError, TypeError, IndexError, OverflowError):
+            continue
+    return None, 0
+
+
+def _parse_crossref_work(work: Dict[str, Any], idx: int, total: int) -> Optional[Dict[str, Any]]:
+    titles = work.get("title") or []
+    title = (titles[0] if isinstance(titles, list) and titles else "").strip()
+    doi = _clean_doi(work.get("DOI") or "")
+    if not title or not doi:
+        return None
+    venues = work.get("container-title") or []
+    venue = venues[0] if isinstance(venues, list) and venues else ""
+    retractions = []
+    # update-to describes this notice's target, NOT retraction of this work.
+    for update in work.get("update-to") or []:
+        if isinstance(update, dict) and update.get("type") == "retraction":
+            retractions.append(f"retraction notice for {update.get('DOI', '')} (Crossref)")
+    for update in work.get("updated-by") or []:
+        if isinstance(update, dict) and update.get("type") == "retraction":
+            retractions.append(f"retracted; notice {update.get('DOI', '')} (Crossref)")
+    for notice in (work.get("relation") or {}).get("is-retracted-by") or []:
+        if isinstance(notice, dict):
+            retractions.append(f"retracted; notice {notice.get('id', '')} (Crossref)")
+    pub_date, precision = _crossref_publication(work)
+    return {
+        "title": title, "doi": doi, "doi_url": f"https://doi.org/{doi}",
+        "landing_url": work.get("URL") or "", "source": "crossref",
+        "source_relevance": _rank_relevance(idx, total),
+        "cited_by_count": _int(work.get("is-referenced-by-count")),
+        "influential_citations": 0, "pub_date": pub_date, "pub_date_precision": precision,
+        "is_preprint": work.get("type") == "posted-content",
+        "venue": venue, "venue_rank": 0.0, "arxiv_id": "", "openalex_id": "",
+        "abstract": _metadata_text(work.get("abstract")), "tldr": "",
+        "evidence": ["bibliographic metadata (Crossref); not claim verification"],
+        "retraction_evidence": retractions,
+    }
+
+
+def _parse_europe_pmc_work(work: Dict[str, Any], idx: int, total: int) -> Optional[Dict[str, Any]]:
+    title = (work.get("title") or "").strip()
+    native_id = str(work.get("id") or work.get("pmid") or work.get("pmcid") or "")
+    native_source = str(work.get("source") or "MED")
+    if not title or not native_id:
+        return None
+    journal_info = work.get("journalInfo") or {}
+    venue = (journal_info.get("journal") or {}).get("title") or work.get("journalTitle") or ""
+    pub_types = (work.get("pubTypeList") or {}).get("pubType") or []
+    if isinstance(pub_types, str):
+        pub_types = [pub_types]
+    retractions = []
+    if "Retracted Publication" in pub_types or str(work.get("isRetracted") or "").upper() == "Y":
+        retractions.append("retracted (Europe PMC)")
+    if "Retraction of Publication" in pub_types:
+        retractions.append("retraction notice (Europe PMC)")
+    for correction in (work.get("commentCorrectionList") or {}).get("commentCorrection") or []:
+        if isinstance(correction, dict) and correction.get("type") == "Retraction in":
+            retractions.append(f"retracted; notice {correction.get('id', '')} (Europe PMC)")
+    doi = _clean_doi(work.get("doi") or "")
+    supplied_date = _parse_date(work.get("firstPublicationDate"))
+    return {
+        "title": title, "doi": doi, "doi_url": f"https://doi.org/{doi}" if doi else "",
+        "landing_url": f"https://europepmc.org/article/{quote(native_source, safe='')}/{quote(native_id, safe='')}",
+        "source": "europe_pmc", "source_relevance": _rank_relevance(idx, total),
+        "cited_by_count": _int(work.get("citedByCount")), "influential_citations": 0,
+        "pub_date": supplied_date or _year_date(work.get("pubYear")),
+        "pub_date_precision": 10 if supplied_date else 4,
+        "is_preprint": native_source == "PPR" or "Preprint" in pub_types,
+        "venue": venue, "venue_rank": 0.5 if venue else 0.0,
+        "abstract": _metadata_text(work.get("abstractText")), "tldr": "",
+        "arxiv_id": "", "openalex_id": "", "retraction_evidence": retractions,
+    }
+
+
+
+
+def _openalex_headers() -> Dict[str, str]:
+    key = config.get_env("OPENALEX_API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+
+
 # ── HTTP（模块级，便于单测 monkeypatch）──────────────────────────────
 def _per_page(count: int, cap: int) -> int:
     return min(max(count, 1), cap)
@@ -327,9 +437,9 @@ async def _fetch_openalex(options: SearchOptions, client: httpx.AsyncClient | No
     }
     if client is None:
         async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
-            r = await client.get(config.OPENALEX_API, params=params)
+            r = await client.get(config.OPENALEX_API, params=params, headers=_openalex_headers())
     else:
-        r = await client.get(config.OPENALEX_API, params=params)
+        r = await client.get(config.OPENALEX_API, params=params, headers=_openalex_headers())
     r.raise_for_status()
     data = r.json() or {}
     works = data.get("results") or []
@@ -374,6 +484,116 @@ async def _fetch_arxiv(options: SearchOptions, client: httpx.AsyncClient | None 
     return _parse_arxiv_atom(text, options.count)
 
 
+async def _fetch_europe_pmc(options: SearchOptions, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    response = await client.get(config.EUROPE_PMC_API, params={
+        "query": options.query, "format": "json", "resultType": "core",
+        "pageSize": _per_page(options.count, 25),
+    })
+    response.raise_for_status()
+    works = response.json().get("resultList", {}).get("result") or []
+    return [p for i, work in enumerate(works[:25])
+            if isinstance(work, dict) and (p := _parse_europe_pmc_work(work, i, len(works)))]
+
+
+async def _fetch_crossref(options: SearchOptions, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    parsed = academic_query(options.query)
+    exact = parsed is not None and parsed.kind == "doi"
+    url = config.CROSSREF_API.rstrip("/")
+    params = {"mailto": config.OPENALEX_MAILTO}
+    if exact:
+        url += "/" + quote(parsed.identifier, safe="")
+    else:
+        params.update({"query": options.query, "rows": _per_page(options.count, 25)})
+    response = await client.get(url, params=params)
+    if exact and response.status_code == 404:
+        return []
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("message"), dict):
+        raise EngineError("academic: Crossref returned malformed bibliographic metadata")
+    message = payload["message"]
+    if exact:
+        if _clean_doi(message.get("DOI") or "") != parsed.identifier:
+            return []
+        works = [message]
+    else:
+        works = message.get("items") or []
+    out = []
+    for i, work in enumerate(works[:25]):
+        if not isinstance(work, dict):
+            continue
+        paper = _parse_crossref_work(work, i, len(works))
+        if paper:
+            if exact:
+                paper["evidence"].append(f"DOI identifier matched: {parsed.identifier} (Crossref)")
+            out.append(paper)
+    return out
+
+
+def _openalex_id(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    parsed = academic_query("references:" + value)
+    return parsed.identifier if parsed and parsed.identifier_type == "openalex" else ""
+
+
+async def _fetch_relationship(query: AcademicQuery, options: SearchOptions,
+                              client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    """One seed lookup + one page (25 maximum); never follows graph edges."""
+    base = config.OPENALEX_API.rstrip("/")
+    seed_identifier = (f"https://doi.org/{query.identifier}"
+                       if query.identifier_type == "doi" else query.identifier)
+    headers = _openalex_headers()
+    response = await client.get(base + "/" + quote(seed_identifier, safe=""),
+                                headers=headers, params={"mailto": config.OPENALEX_MAILTO})
+    if response.status_code == 404:
+        return []
+    response.raise_for_status()
+    seed = response.json()
+    if not isinstance(seed, dict):
+        raise EngineError("academic: OpenAlex returned malformed seed metadata")
+    seed_id = _openalex_id(seed.get("id"))
+    if not seed_id:
+        raise EngineError("academic: OpenAlex seed response has no valid work ID")
+    if query.identifier_type == "doi":
+        if _clean_doi(seed.get("doi") or (seed.get("ids") or {}).get("doi") or "") != query.identifier:
+            return []
+    elif seed_id != query.identifier:
+        return []
+    # cites finds works citing the seed; cited_by finds works cited by it.
+    edge = "cites" if query.kind == "citations" else "cited_by"
+    response = await client.get(base, headers=headers, params={
+        "filter": f"{edge}:{seed_id}", "per_page": _per_page(options.count, 25),
+        "mailto": config.OPENALEX_MAILTO,
+    })
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise EngineError("academic: OpenAlex returned a malformed relationship page")
+    works = payload["results"]
+    seed_references = {_openalex_id(v) for v in seed.get("referenced_works") or []}
+    out = []
+    for i, work in enumerate(works[:25]):
+        if not isinstance(work, dict):
+            continue
+        work_id = _openalex_id(work.get("id"))
+        if not work_id or work_id == seed_id:
+            continue
+        if query.kind == "references" and work_id not in seed_references:
+            continue
+        if query.kind == "citations" and seed_id not in {
+                _openalex_id(v) for v in work.get("referenced_works") or []}:
+            continue
+        paper = _parse_openalex_work(work, i, len(works))
+        if paper:
+            paper["evidence"] = [
+                f"{'referenced by' if query.kind == 'references' else 'cites'} seed {seed_id}; "
+                f"requested {query.identifier}; one-hop OpenAlex relationship"
+            ]
+            out.append(paper)
+    return out
+
+
 # ── 输出映射 ─────────────────────────────────────────────────────────
 def _to_result(p: Dict[str, Any]) -> SearchResult:
     cited = _int(p.get("cited_by_count"))
@@ -388,6 +608,13 @@ def _to_result(p: Dict[str, Any]) -> SearchResult:
     venue = (p.get("venue") or "").strip()
     if venue:
         snippet += " · " + venue
+    if p.get("pub_date"):
+        snippet += " · published " + p["pub_date"].date().isoformat()[:p.get("pub_date_precision", 10)]
+    for evidence in (p.get("evidence") or []) + (p.get("retraction_evidence") or []):
+        snippet += " · " + evidence
+    sources = sorted(set(p.get("cite_sources") or {}) | {p.get("source", "")})
+    snippet += " · sources: " + ", ".join(s for s in sources if s)
+    snippet += " · citation counts are not claim verification"
     doi = (p.get("doi") or "").strip()
     url = (p.get("doi_url") or (f"https://doi.org/{doi}" if doi else "")
            or p.get("landing_url") or p.get("openalex_id") or "")
@@ -396,6 +623,8 @@ def _to_result(p: Dict[str, Any]) -> SearchResult:
         url=url,
         snippet=snippet,
         source_tag=f"academic:{p.get('source', '')}",
+        source_ts=(p["pub_date"].timestamp()
+                   if p.get("pub_date") and p.get("pub_date_precision", 10) == 10 else 0.0),
     )
 
 
@@ -404,19 +633,44 @@ class AcademicEngine(SearchEngine):
     tier = 0  # 无本地配置要求
 
     async def search(self, options: SearchOptions) -> List[SearchResult]:
+        if options.count <= 0:
+            return []
         now = datetime.now(timezone.utc)
-        async with httpx.AsyncClient(timeout=config.ACADEMIC_SOURCE_TIMEOUT) as client:
-            # 主力 openalex + 补充 s2；arxiv 仅当显式开启（默认 lazy）
-            fetchers = [_fetch_openalex(options, client), _fetch_s2(options, client)]
-            if config.ACADEMIC_INCLUDE_ARXIV:
-                fetchers.append(_fetch_arxiv(options, client))
-            gathered = await asyncio.gather(*fetchers, return_exceptions=True)
-
+        query = academic_query(options.query)
+        if query is None and re.match(r"^\s*(references|citations|doi)\s*:", options.query, re.I):
+            raise EngineError("academic: expected a complete DOI or OpenAlex relationship identifier")
         papers: List[Dict[str, Any]] = []
-        for res in gathered:
-            if isinstance(res, Exception) or not res:
-                continue                                  # 各源独立失败隔离
-            papers.extend(res)
+        async with asyncio.timeout(config.ACADEMIC_SOURCE_TIMEOUT * 2):
+            async with httpx.AsyncClient(
+                timeout=config.ACADEMIC_SOURCE_TIMEOUT,
+                limits=httpx.Limits(max_connections=5, max_keepalive_connections=5),
+                follow_redirects=False,
+            ) as client:
+                if query is not None:
+                    try:
+                        papers = (await _fetch_crossref(options, client) if query.kind == "doi"
+                                  else await _fetch_relationship(query, options, client))
+                    except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+                        raise EngineError(
+                            f"academic: {query.kind} metadata lookup failed ({type(exc).__name__})"
+                        ) from None
+                    if not papers:
+                        return []
+                else:
+                    fetchers = [_fetch_openalex(options, client), _fetch_s2(options, client)]
+                    if config.ACADEMIC_INCLUDE_ARXIV:
+                        fetchers.append(_fetch_arxiv(options, client))
+                    if biomedical_scope(options.query):
+                        fetchers.append(_fetch_europe_pmc(options, client))
+                    gathered = await asyncio.gather(*fetchers, return_exceptions=True)
+                    for res in gathered:
+                        if not isinstance(res, Exception) and res:
+                            papers.extend(res)
+                    if not papers:
+                        try:
+                            papers = await _fetch_crossref(options, client)
+                        except Exception:
+                            pass
         if not papers:
             raise EngineError("academic: all sources failed or returned no results")
 
@@ -425,78 +679,37 @@ class AcademicEngine(SearchEngine):
         return [_to_result(p) for p in scored[:options.count]]
 
     async def health_check(self, *, deep: bool = False) -> EngineCheckResult:
-        """探测 OpenAlex / Semantic Scholar / arXiv 公开 API 可达性；可选检查 paper-search-mcp。"""
-        import httpx
-        sources_ok: list[str] = []
-        sources_fail: list[str] = []
-        details: list[str] = []
-
+        """Probe native APIs; auth/rate-limit responses are not usable sources."""
         probes = {
-            "openalex": "https://api.openalex.org/works?per_page=1",
-            "semantic_scholar": "https://api.semanticscholar.org/graph/v1/paper/search?query=test&limit=1",
-            "arxiv": "http://export.arxiv.org/api/query?search_query=all:test&max_results=1",
+            "openalex": (config.OPENALEX_API, {"per_page": 1, "mailto": config.OPENALEX_MAILTO}),
+            "semantic_scholar": (config.SEMANTIC_SCHOLAR_API, {"query": "test", "limit": 1}),
+            "crossref": (config.CROSSREF_API, {"rows": 1}),
+            "europe_pmc": (config.EUROPE_PMC_API, {"query": "cancer", "format": "json", "pageSize": 1}),
         }
+        if config.ACADEMIC_INCLUDE_ARXIV:
+            probes["arxiv"] = (config.ARXIV_API, {"search_query": "all:test", "max_results": 1})
 
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            for name, url in probes.items():
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            async def probe(name, url, params):
                 try:
-                    resp = await client.get(url)
-                    if resp.status_code < 500:
-                        sources_ok.append(name)
-                    else:
-                        sources_fail.append(f"{name}({resp.status_code})")
-                except Exception as e:
-                    sources_fail.append(f"{name}({type(e).__name__})")
+                    response = await client.get(
+                        url, params=params, headers=_openalex_headers() if name == "openalex" else {},
+                    )
+                    return name, response.status_code, ""
+                except httpx.HTTPError as exc:
+                    return name, 0, type(exc).__name__
 
-        # paper-search-mcp (optional)
-        mcp_url = config.get_env("PAPER_SEARCH_MCP_URL")
-        if mcp_url:
-            try:
-                async with httpx.AsyncClient(timeout=3.0) as client:
-                    resp = await client.get(f"{mcp_url.rstrip('/')}/health")
-                if resp.status_code < 500:
-                    sources_ok.append("paper-search-mcp")
-                else:
-                    details.append(f"paper-search-mcp returned {resp.status_code}")
-            except Exception:
-                details.append("paper-search-mcp configured but unreachable")
-
-        active = "+".join(sources_ok) if sources_ok else "none"
-        if not sources_fail and sources_ok:
-            return EngineCheckResult(
-                engine=self.name,
-                status="ok",
-                tier=self.tier,
-                summary=f"Academic sources OK ({len(sources_ok)}/{len(probes)})",
-                active_backend=active,
-                evidence={"sources_ok": sources_ok},
-            )
-        elif sources_ok:
-            return EngineCheckResult(
-                engine=self.name,
-                status="warn",
-                tier=self.tier,
-                summary=f"Some sources unreachable ({len(sources_ok)}/{len(probes)} ok)",
-                details="; ".join(sources_fail + details),
-                active_backend=active,
-                repair=[
-                    "Check network connectivity to academic APIs",
-                    "Verify no firewall blocking api.openalex.org / api.semanticscholar.org / export.arxiv.org",
-                    "Optional: set PAPER_SEARCH_MCP_URL for MCP-based access",
-                ],
-                evidence={"sources_ok": sources_ok, "sources_fail": sources_fail},
-            )
-        else:
-            return EngineCheckResult(
-                engine=self.name,
-                status="fail",
-                tier=self.tier,
-                summary="All academic sources unreachable",
-                details="; ".join(sources_fail + details),
-                repair=[
-                    "Check network connectivity",
-                    "All sources (api.openalex.org / api.semanticscholar.org / export.arxiv.org) are unreachable",
-                    "Verify DNS resolution and firewall rules",
-                ],
-                evidence={"sources_ok": [], "sources_fail": sources_fail},
-            )
+            checked = await asyncio.gather(*(probe(name, url, params)
+                                             for name, (url, params) in probes.items()))
+        sources_ok = [name for name, status, _ in checked if 200 <= status < 300]
+        sources_fail = [f"{name}({error or status})" for name, status, error in checked
+                        if not 200 <= status < 300]
+        status = "ok" if not sources_fail else ("warn" if sources_ok else "fail")
+        return EngineCheckResult(
+            engine=self.name, status=status, tier=self.tier,
+            summary=f"Academic native APIs usable ({len(sources_ok)}/{len(probes)})",
+            details="; ".join(sources_fail),
+            active_backend="+".join(sources_ok) if sources_ok else "none",
+            repair=["Check academic API connectivity, API keys and rate limits"] if sources_fail else [],
+            evidence={"sources_ok": sources_ok, "sources_fail": sources_fail},
+        )

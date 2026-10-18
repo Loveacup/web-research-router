@@ -226,7 +226,7 @@ def test_same_origin_redirect_cannot_rebind_after_initial_resolution(monkeypatch
             return httpx.Response(200, text='Rebound private service')
         if request.url.path == '/start':
             return httpx.Response(302, headers={'location': '/finish'})
-        return httpx.Response(200, text='Authorized fixture')
+        return httpx.Response(200, text='<p>Authorized fixture</p>')
 
     from httpx._client import AsyncClient
     monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: AsyncClient(
@@ -379,7 +379,7 @@ def test_idna_dns_name_matches_http_origin(monkeypatch):
 
     async def transport(request):
         requests.append(request)
-        return httpx.Response(200, text='Correct IDNA origin')
+        return httpx.Response(200, text='<p>Correct IDNA origin</p>')
 
     from httpx._client import AsyncClient
     monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: AsyncClient(

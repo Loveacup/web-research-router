@@ -476,7 +476,7 @@ async def _run_subprocess(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 全量依赖清单（14 项）
+# 全量依赖清单
 # ══════════════════════════════════════════════════════════════════════
 
 DEPENDENCY_MANIFEST: List[BaseDep] = [
@@ -557,19 +557,6 @@ DEPENDENCY_MANIFEST: List[BaseDep] = [
         install_guide=[
             "git clone https://github.com/Jesseovo/last30days-skill-cn ~/code/last30days-skill-cn",
             "export WRR_LAST30DAYS_CN=~/code/last30days-skill-cn/skills/last30days/scripts/last30days.py",
-        ],
-    ),
-    GitRepoDep(
-        dep_id="paper_search_mcp",
-        capability="academic_search",
-        source_url="https://github.com/openags/paper-search-mcp",
-        description="学术论文 MCP 搜索服务（可选增强）",
-        required=False,
-        calling_pattern=CallingPattern.HTTP,
-        install_guide=[
-            "git clone https://github.com/openags/paper-search-mcp",
-            "cd paper-search-mcp && pip install -e .",
-            "python -m paper_search_mcp  # 启动服务",
         ],
     ),
     GitRepoDep(

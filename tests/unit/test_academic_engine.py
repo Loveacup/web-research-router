@@ -6,6 +6,10 @@
 import asyncio
 import math
 from datetime import datetime, timezone
+import httpx
+import pytest
+
+from wrr.engines._academic_query import academic_query, biomedical_query, biomedical_scope
 
 from wrr.engines import academic as ac
 from wrr.engines._fusion import recency_decay
@@ -173,6 +177,7 @@ def test_search_all_failed_raises(monkeypatch):
     monkeypatch.setattr(config, "ACADEMIC_INCLUDE_ARXIV", False)
     monkeypatch.setattr(ac, "_fetch_openalex", _fake_raise(RuntimeError("down")))
     monkeypatch.setattr(ac, "_fetch_s2", _fake_async([]))
+    monkeypatch.setattr(ac, "_fetch_crossref", _fake_async([]))
     try:
         run(ac.AcademicEngine().search(SearchOptions("x")))
         assert False, "all failed should raise"
@@ -220,3 +225,319 @@ def test_parse_s2_paper_preprint_and_tldr():
     assert p["tldr"] == "a language model"
     assert p["arxiv_id"] == "2005.14165"
     assert p["landing_url"] == "https://arxiv.org/abs/2005.14165"
+
+
+@pytest.mark.parametrize(("query", "kind", "identifier", "identifier_type"), [
+    ("10.1038/NATURE14539", "doi", "10.1038/nature14539", "doi"),
+    ("doi:10.1038/nature14539", "doi", "10.1038/nature14539", "doi"),
+    ("https://dx.doi.org/10.1038%2Fnature14539", "doi", "10.1038/nature14539", "doi"),
+    ("References: doi:10.1038/nature14539", "references", "10.1038/nature14539", "doi"),
+    ("citations:https://openalex.org/w2741809807", "citations", "W2741809807", "openalex"),
+    ("references:W123", "references", "W123", "openalex"),
+])
+def test_academic_query_complete_identifiers(query, kind, identifier, identifier_type):
+    parsed = academic_query(query)
+    assert (parsed.kind, parsed.identifier, parsed.identifier_type) == (kind, identifier, identifier_type)
+
+
+@pytest.mark.parametrize("query", [
+    "Deep learning paper", "references:Deep Learning", "W123",
+    "https://evil.example/10.1038/nature14539",
+    "references:https://doi.org/W123", "references:https://openalex.org/10.1038/abc",
+    "https://doi.org/10.1038/nature14539?redirect=1",
+    "https://doi.org/10.1038/nature14539#section",
+    "citations:https://openalex.org@evil.example/W123",
+    "10.1038/nature14539 and related papers",
+])
+def test_academic_query_does_not_guess_titles_or_arbitrary_urls(query):
+    assert academic_query(query) is None
+
+
+def _mock_academic_http(monkeypatch, handler):
+    original = httpx.AsyncClient
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return handler(request)
+
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(ac.httpx, "AsyncClient",
+                        lambda **kwargs: original(transport=transport, **kwargs))
+    monkeypatch.setattr(config, "ACADEMIC_INCLUDE_ARXIV", False)
+    return requests
+
+
+@pytest.mark.parametrize(("status", "message"), [
+    (404, {}),
+    (200, {"DOI": "10.1234/unrelated", "title": ["Topical but wrong"]}),
+    (200, {"title": ["No identifier"]}),
+])
+def test_exact_doi_unknown_or_mismatch_never_becomes_topical_result(monkeypatch, status, message):
+    requests = _mock_academic_http(
+        monkeypatch, lambda request: httpx.Response(status, json={"message": message}),
+    )
+    out = run(ac.AcademicEngine().search(SearchOptions("https://doi.org/10.1234/requested")))
+    assert out == []
+    assert len(requests) == 1
+    assert requests[0].url.host == "api.crossref.org"
+    assert "query" not in requests[0].url.params
+    assert "/works/10.1234/requested" == requests[0].url.path
+
+
+def test_exact_doi_matched_metadata_is_not_claim_verification(monkeypatch):
+    _mock_academic_http(monkeypatch, lambda request: httpx.Response(200, json={"message": {
+        "DOI": "10.1234/Requested", "title": ["A registered work"],
+        "published-online": {"date-parts": [[2024, 2, 3]]},
+        "created": {"date-parts": [[2020, 1, 1]]}, "is-referenced-by-count": 700,
+    }}))
+    result, = run(ac.AcademicEngine().search(SearchOptions("doi:10.1234/requested")))
+    assert result.url == "https://doi.org/10.1234/requested"
+    assert result.source_tag == "academic:crossref"
+    assert "DOI identifier matched: 10.1234/requested (Crossref)" in result.snippet
+    assert "not claim verification" in result.snippet
+    assert "published 2024-02-03" in result.snippet
+    assert "2020" not in result.snippet
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_exact_doi_source_failures_do_not_return_other_sources(monkeypatch, status):
+    requests = _mock_academic_http(monkeypatch, lambda request: httpx.Response(status))
+    with pytest.raises(EngineError, match="metadata lookup failed"):
+        run(ac.AcademicEngine().search(SearchOptions("10.1234/requested")))
+    assert len(requests) == 1
+
+
+def _work(identifier, **fields):
+    return {"id": f"https://openalex.org/{identifier}", "title": identifier,
+            "referenced_works": [], **fields}
+
+
+@pytest.mark.parametrize(("kind", "edge", "relationship"), [
+    ("references", "cited_by", "referenced by"),
+    ("citations", "cites", "cites"),
+])
+def test_relationship_direction_seed_and_edge_evidence_bounded(monkeypatch, kind, edge, relationship):
+    seed = _work("W1", doi="https://doi.org/10.1234/seed",
+                 referenced_works=["https://openalex.org/W2"])
+    related = (_work("W2") if kind == "references"
+               else _work("W2", referenced_works=["https://openalex.org/W1"]))
+    unrelated = _work("W3")  # not a reference and does not cite W1
+
+    def respond(request):
+        if request.url.path != "/works":
+            return httpx.Response(200, json=seed)
+        assert request.url.params["filter"] == f"{edge}:W1"
+        assert request.url.params["per_page"] == "25"
+        return httpx.Response(200, json={"results": [related, related, unrelated, seed]})
+
+    monkeypatch.setattr(config, "get_env", lambda key: "test-key" if key == "OPENALEX_API_KEY" else "")
+    requests = _mock_academic_http(monkeypatch, respond)
+    result, = run(ac.AcademicEngine().search(SearchOptions(f"{kind}:10.1234/seed", count=100)))
+    assert result.title == "W2"
+    assert f"{relationship} seed W1" in result.snippet
+    assert "requested 10.1234/seed; one-hop OpenAlex" in result.snippet
+    assert len(requests) == 2
+    assert all(r.headers["Authorization"] == "Bearer test-key" for r in requests)
+    assert all("test-key" not in str(r.url) for r in requests)
+
+
+@pytest.mark.parametrize("query", ["references:W1", "citations:10.1234/seed"])
+def test_relationship_seed_mismatch_never_queries_graph(monkeypatch, query):
+    requests = _mock_academic_http(
+        monkeypatch, lambda request: httpx.Response(200, json=_work("W999", doi="10.1234/wrong")),
+    )
+    assert run(ac.AcademicEngine().search(SearchOptions(query))) == []
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("kind", ["references", "citations"])
+def test_unknown_relationship_seed_returns_no_related_evidence(monkeypatch, kind):
+    requests = _mock_academic_http(monkeypatch, lambda request: httpx.Response(404))
+    assert run(ac.AcademicEngine().search(SearchOptions(f"{kind}:W1"))) == []
+    assert len(requests) == 1
+
+
+def test_relationship_failure_never_uses_topical_search(monkeypatch):
+    def respond(request):
+        if request.url.path == "/works":
+            return httpx.Response(429)
+        return httpx.Response(200, json=_work("W1"))
+    requests = _mock_academic_http(monkeypatch, respond)
+    with pytest.raises(EngineError, match="metadata lookup failed"):
+        run(ac.AcademicEngine().search(SearchOptions("citations:W1")))
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("query", ["references:a paper title", "citations:", "doi:random"])
+def test_invalid_explicit_identifier_rejected_without_network(monkeypatch, query):
+    requests = _mock_academic_http(monkeypatch, lambda request: httpx.Response(500))
+    with pytest.raises(EngineError, match="complete DOI"):
+        run(ac.AcademicEngine().search(SearchOptions(query)))
+    assert requests == []
+
+
+@pytest.mark.parametrize("query", ["clinical cancer therapy", "基因治疗 综述", "CRISPR RNA vaccines"])
+def test_biomedical_search_adds_europe_pmc_and_merges_evidence(monkeypatch, query):
+    monkeypatch.setattr(ac, "_fetch_openalex", _fake_async([
+        _paper(title="Clinical study", doi="10.1234/study", cited_by_count=50),
+    ]))
+    monkeypatch.setattr(ac, "_fetch_s2", _fake_raise(RuntimeError("s2 unavailable")))
+
+    def respond(request):
+        assert request.url.host == "www.ebi.ac.uk"
+        assert request.url.params["query"] == query
+        assert request.url.params["resultType"] == "core"
+        return httpx.Response(200, json={"resultList": {"result": [{
+            "id": "12345", "source": "MED", "title": "Clinical study duplicate",
+            "doi": "10.1234/STUDY", "citedByCount": 60,
+            "firstPublicationDate": "2024-03-14",
+            "abstractText": "<p>Deposited abstract.</p>",
+            "pubTypeList": {"pubType": ["Retracted Publication"]},
+            "journalInfo": {"journal": {"title": "Medical Journal"}},
+        }]}})
+
+    requests = _mock_academic_http(monkeypatch, respond)
+    result, = run(ac.AcademicEngine().search(SearchOptions(query)))
+    assert result.title == "Clinical study"
+    assert "Deposited abstract." in result.snippet
+    assert "60cit" in result.snippet
+    assert "retracted (Europe PMC)" in result.snippet
+    assert "published 2024-03-14" in result.snippet
+    assert "europe_pmc, openalex" in result.snippet
+    assert len(requests) == 1
+
+
+def test_non_biomedical_search_does_not_add_europe_pmc_or_unneeded_fallback(monkeypatch):
+    monkeypatch.setattr(ac, "_fetch_openalex", _fake_async([_paper(doi="10.1234/algo")]))
+    monkeypatch.setattr(ac, "_fetch_s2", _fake_async([]))
+    requests = _mock_academic_http(monkeypatch, lambda request: httpx.Response(500))
+    assert len(run(ac.AcademicEngine().search(SearchOptions("graph algorithms paper")))) == 1
+    assert requests == []
+
+
+def test_biomedical_failure_does_not_erase_surviving_primary_source(monkeypatch):
+    monkeypatch.setattr(ac, "_fetch_openalex", _fake_async([_paper(title="Survived")]))
+    monkeypatch.setattr(ac, "_fetch_s2", _fake_async([]))
+    requests = _mock_academic_http(monkeypatch, lambda request: httpx.Response(503))
+    result, = run(ac.AcademicEngine().search(SearchOptions("clinical therapy")))
+    assert result.title == "Survived"
+    assert len(requests) == 1
+
+
+def test_empty_primary_search_uses_bounded_crossref_metadata_fallback(monkeypatch):
+    monkeypatch.setattr(ac, "_fetch_openalex", _fake_raise(RuntimeError("down")))
+    monkeypatch.setattr(ac, "_fetch_s2", _fake_async([]))
+
+    def respond(request):
+        assert request.url.host == "api.crossref.org"
+        assert request.url.params["query"] == "graph algorithms"
+        assert request.url.params["rows"] == "25"
+        return httpx.Response(200, json={"message": {"items": [
+            {"title": ["Metadata only"], "DOI": "10.1234/meta"},
+            {"title": ["Metadata duplicate"], "DOI": "10.1234/META"},
+        ]}})
+
+    requests = _mock_academic_http(monkeypatch, respond)
+    result, = run(ac.AcademicEngine().search(SearchOptions("graph algorithms", count=100)))
+    assert result.title == "Metadata only"
+    assert "bibliographic metadata (Crossref)" in result.snippet
+    assert "DOI identifier matched" not in result.snippet
+    assert len(requests) == 1
+
+
+def test_openalex_retraction_evidence_survives_dedup():
+    p = ac._parse_openalex_work(_work("W1", doi="10.1234/a", is_retracted=True), 0, 1)
+    other = _paper(title="Other source", doi="https://doi.org/10.1234/A", source="semantic_scholar")
+    merged, = ac.dedup_by_doi([other, p])
+    assert "retracted (OpenAlex)" in ac._to_result(merged).snippet
+
+
+def test_crossref_dates_and_retraction_notice_direction():
+    notice = ac._parse_crossref_work({
+        "title": ["Retraction notice"], "DOI": "10.1234/notice",
+        "published-online": {"date-parts": [[2024, 2, 31]]},
+        "published-print": {"date-parts": [[2024, 3]]},
+        "update-to": [{"DOI": "10.1234/original", "type": "retraction"}],
+    }, 0, 1)
+    assert notice["pub_date"] == datetime(2024, 3, 1, tzinfo=timezone.utc)
+    assert notice["retraction_evidence"] == ["retraction notice for 10.1234/original (Crossref)"]
+    original = ac._parse_crossref_work({
+        "title": ["Original"], "DOI": "10.1234/original",
+        "updated-by": [{"DOI": "10.1234/notice", "type": "retraction"}],
+    }, 0, 1)
+    assert original["retraction_evidence"] == ["retracted; notice 10.1234/notice (Crossref)"]
+    assert ac._year_date(99999) is None
+
+
+def test_health_does_not_label_401_or_429_usable(monkeypatch):
+    def respond(request):
+        status = {"api.openalex.org": 401, "api.semanticscholar.org": 429}.get(request.url.host, 200)
+        return httpx.Response(status, json={})
+    requests = _mock_academic_http(monkeypatch, respond)
+    result = run(ac.AcademicEngine().health_check())
+    assert result.status == "warn"
+    assert result.evidence["sources_ok"] == ["crossref", "europe_pmc"]
+    assert result.evidence["sources_fail"] == ["openalex(401)", "semantic_scholar(429)"]
+    assert "openalex" not in result.active_backend
+    assert len(requests) == 4
+
+
+@pytest.mark.parametrize("query", [
+    "clinical randomized trial", "PubMed cancer", "Europe PMC immunotherapy",
+    "生医论文", "临床试验综述", "CRISPR RNA delivery", "cancer treatment evidence",
+])
+def test_biomedical_academic_routing_has_research_intent(query):
+    assert biomedical_query(query)
+    assert biomedical_scope(query)
+
+
+@pytest.mark.parametrize("query", [
+    "how should I treat a cold?", "癌症怎么治", "vaccine side effects",
+    "what are clinical symptoms of flu?", "randomized graph algorithms",
+    "systematic review of database indexes",
+])
+def test_biomedical_routing_does_not_capture_general_health_or_unrelated_research(query):
+    assert not biomedical_query(query)
+
+
+def test_broad_biomedical_topic_still_adds_scope_after_explicit_academic_route():
+    assert biomedical_scope("cancer treatment")
+    assert not biomedical_query("cancer treatment")
+
+
+def test_publication_precision_does_not_invent_dates_or_exact_timestamps():
+    paper = ac._parse_s2_paper({"title": "Year only", "year": 2022}, 0, 1)
+    result = ac._to_result(paper)
+    assert "published 2022" in result.snippet
+    assert "2022-01-01" not in result.snippet
+    assert result.source_ts == 0
+    paper = ac._parse_crossref_work({
+        "title": ["Month only"], "DOI": "10.1234/month",
+        "published-online": {"date-parts": [[2023, 7]]},
+    }, 0, 1)
+    result = ac._to_result(paper)
+    assert "published 2023-07" in result.snippet
+    assert "2023-07-01" not in result.snippet
+    assert result.source_ts == 0
+    paper = ac._parse_crossref_work({
+        "title": ["Day supplied"], "DOI": "10.1234/day",
+        "published-online": {"date-parts": [[2023, 7, 9]]},
+    }, 0, 1)
+    assert ac._to_result(paper).source_ts == datetime(2023, 7, 9, tzinfo=timezone.utc).timestamp()
+
+
+def test_dedup_does_not_mutate_source_evidence_lists():
+    original = _paper(doi="10.1234/a", evidence=["first"])
+    other = _paper(doi="10.1234/a", source="europe_pmc", evidence=["second"])
+    merged, = ac.dedup_by_doi([original, other])
+    assert merged["evidence"] == ["first", "second"]
+    assert original["evidence"] == ["first"]
+
+
+@pytest.mark.parametrize("payload", [[], {"message": []}, {"message": None}])
+def test_exact_doi_malformed_metadata_never_becomes_evidence(monkeypatch, payload):
+    requests = _mock_academic_http(monkeypatch, lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(EngineError, match="malformed bibliographic metadata"):
+        run(ac.AcademicEngine().search(SearchOptions("10.1234/a")))
+    assert len(requests) == 1

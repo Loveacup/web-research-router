@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-research-router"
-version = "6.2.0"
+version = "6.4.0"
 description = "Semantic search router with 13 engines (12 routed + Tavily backfill), mode-based routing, and RRF fusion"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "httpx>=0.28",
     "PyYAML>=6",
+    "trafilatura>=2.3.1",
 ]
 
 [project.optional-dependencies]

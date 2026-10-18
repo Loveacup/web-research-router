@@ -13,7 +13,7 @@ import uuid
 from contextlib import nullcontext
 from typing import ContextManager, cast
 
-__version__ = "6.2.0"
+__version__ = "6.4.0"
 
 logger = logging.getLogger("wrr.plugin")
 

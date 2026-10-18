@@ -81,6 +81,10 @@ OPERATION_BUDGET_SECONDS = {
     "extract": EXTRACT_BUDGET_SECONDS,
 }
 
+# Optional public-web candidate filtering, not another search engine.
+JEV_FILTER_ENABLED = _env_bool("WRR_JEV_FILTER", False)
+JEV_FILTER_TIMEOUT = min(3.0, _env_float("WRR_JEV_FILTER_TIMEOUT", 2.0))
+
 # ── 结果数量 / 字符上限 ──────────────────────────────────────────────
 DEFAULT_SEARCH_COUNT = 10
 MAX_SEARCH_COUNT = 20
@@ -169,10 +173,11 @@ COMMUNITY_DEFAULT_SOURCES = ("reddit", "twitter", "xiaohongshu")
 COMMUNITY_INCLUDE_LAST30DAYS = False           # 重型源；默认仅 site:hn/zhihu/weibo 或研究关键词时启用
 COMMUNITY_DEDUP_THRESHOLD = 0.80               # 标题相似度去重阈值
 COMMUNITY_TRIGGER_SITES = ("reddit.com", "news.ycombinator.com", "twitter.com",
-                           "x.com", "zhihu.com", "weibo.com")
+                           "x.com", "zhihu.com", "zhuanlan.zhihu.com", "weibo.com",
+                           "bilibili.com", "b23.tv")
 COMMUNITY_PLATFORM_NAMES = ("reddit", "hacker news", "hackernews", "hn",
-                            "twitter", "zhihu", "微博", "weibo",
-                            "小红书", "xiaohongshu")
+                            "twitter", "zhihu", "知乎", "微博", "weibo",
+                            "bilibili", "哔哩哔哩", "b站", "小红书", "xiaohongshu")
 
 # Community RSS source defaults (P3-1: AI HOT, P3-2: WeChat RSS)
 AIHOT_RSS_FEED: str = os.environ.get("WRR_AIHOT_RSS_FEED", "https://aihot.virxact.com/feed.xml")
@@ -285,10 +290,25 @@ SKILL_KEYWORDS = ["找 skill", "skill 推荐", "推荐 skill", "skill.md",
                   "agent skill", "find skill"]
 
 
+def academic_lookup_requested(query: str) -> bool:
+    """Explicit bibliographic lookup, including malformed reserved prefixes."""
+    from .engines._academic_query import academic_query
+    q = (query or "").strip()
+    return (
+        academic_query(q) is not None
+        or q.lower().startswith(("doi:", "references:", "citations:"))
+    )
+
+
 def academic_triggered(query: str) -> bool:
-    """查询命中学术关键词 → 提升 academic 引擎。"""
+    """Promote explicit scholarly requests, not general health advice."""
+    from .engines._academic_query import biomedical_query
     q = (query or "").lower()
-    return any(k.lower() in q for k in ACADEMIC_KEYWORDS)
+    return (
+        academic_lookup_requested(query)
+        or biomedical_query(query)
+        or any(k.lower() in q for k in ACADEMIC_KEYWORDS)
+    )
 
 
 def skill_triggered(query: str) -> bool:
@@ -360,6 +380,8 @@ def broad_interest_triggered(query: str) -> bool:
 def classify_intent(query: str) -> str:
     """查询意图分类，返回 7 mode 之一（v5.2 含 local/broad）。显式 mode 由 router 覆盖。"""
     q = (query or "").lower()
+    if academic_lookup_requested(query):
+        return "academic"
     if recovery_triggered(q):       # recovery 优先（"找不到刚才的文件"）
         return "recovery"
     if local_triggered(q):          # 本地记忆/笔记
@@ -470,6 +492,8 @@ ACADEMIC_SOURCE_TIMEOUT = 8.0
 ACADEMIC_RECENCY_HALFLIFE_DAYS = 365.0
 OPENALEX_MAILTO = "anyisouth@gmail.com"
 OPENALEX_API = "https://api.openalex.org/works"
+CROSSREF_API = "https://api.crossref.org/works"
+EUROPE_PMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 ARXIV_API = "http://export.arxiv.org/api/query"
 

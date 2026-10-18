@@ -125,7 +125,7 @@ def test_detect_sources_default_and_triggers():
     assert eng._detect_sources("x site:reddit.com") == ["reddit"]
     assert eng._detect_sources("y site:x.com") == ["twitter"]
     assert eng._detect_sources("z site:news.ycombinator.com") == ["hackernews"]
-    assert eng._detect_sources("w site:zhihu.com") == ["last30days_cn"]
+    assert eng._detect_sources("w site:zhihu.com") == ["zhihu"]
     assert eng._detect_sources("site:v2ex.com python") == []
     assert "xiaohongshu" in eng._detect_sources("小红书 美食")
 
@@ -275,12 +275,12 @@ def test_search_last30days_mixed_stdout_and_cn_platform_arrays_mapped():
     cm._run_cmd = fake_run
     try:
         out = run(cm.CommunityEngine().search(
-            SearchOptions("ai site:zhihu.com", count=5)))
+            SearchOptions("最近 ai", count=5)))
     finally:
         cm._run_cmd = orig
     assert len(out) == 2
     assert {r.title for r in out} == {"中文视频", "知乎回答"}
-    assert {r.source_tag for r in out} == {"last30days_cn"}
+    assert {r.source_tag for r in out} == {"bilibili", "zhihu"}
 
 
 def test_item_to_result_drops_incomplete():

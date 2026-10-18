@@ -3,10 +3,10 @@
 整合 OpenCLI 社区渠道 + last30days 技能，多源并行搜索 → 统一评分 → 去重 → 排序。
 
 源家族：
-  - OpenCLI 渠道（agent-reach 复用浏览器登录态）：reddit / twitter / xiaohongshu
-    调用 `opencli <chan> search <query> -f json --limit N`，返回结构化 JSON 数组。
-  - last30days（重型研究 CLI，按需启用）：last30days_en / last30days_cn
-    调用 `python3 <last30days.py> --emit json --quick <query>`，解析其 clusters。
+  - OpenCLI keyword search channels reuse only the existing authorized session.
+    v1 rows and v2 success/error envelopes share the source-result seam.
+  - last30days EN/CN is opt-in; EN receives a bounded literal query plan.
+    Agent results, raw candidates, and legacy platform arrays are normalized.
 
 评分（与既有引擎一致的三维加权）：
     score = 0.40*engagement + 0.35*recency + 0.25*quality
@@ -16,8 +16,8 @@
 
 去重：URL 规范化相等 或 标题 Jaccard 相似度 > 阈值。各源**独立失败**互不影响。
 
-注：OpenCLI 渠道是经实测的快速核心；last30days 为重型工具（常超预算被跳过），
-默认仅在 site:news.ycombinator.com|zhihu.com|weibo.com 触发或研究意图关键词时启用。
+last30days remains within the existing source/request deadlines; platform-specific
+OpenCLI sources are selected only by their respective query signals.
 """
 import asyncio
 import math
@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .base import SearchEngine
 from . import _fusion
 from .community_sources import (SOURCE_ADAPTERS as _SOURCE_ADAPTERS,
-                                SourceFetchResult, SourceOutcome)
+                                SourceFetchResult, SourceOutcome, _http_url)
 from .configured_sources import load_source_config, run_isolated_command
 from .. import config
 from ..errors import EngineError
@@ -129,10 +129,21 @@ COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
         "feed_urls": config.WECHAT_RSS_FEEDS,
         "engagement": None, "comments": None, "time": "published_at", "eng_max": 1000,
     },
-    "v2ex": {
-        "kind": "opencli", "cli": ["opencli", "v2ex", "search"],
-        "engagement": "replies", "comments": "replies", "time": "created",
-        "title": "title", "url": "url", "snippet": "content", "eng_max": 1000,
+    "bilibili": {
+        "kind": "opencli", "cli": ["opencli", "bilibili", "search"],
+        "cli_extra_args": ["--type", "video"],
+        "engagement": "score", "comments": None, "time": "pubdate_ts",
+        "title": "title", "url": "url", "snippet": "desc", "eng_max": 100000,
+    },
+    "zhihu": {
+        "kind": "opencli", "cli": ["opencli", "zhihu", "search"],
+        "engagement": "votes", "comments": None, "time": None,
+        "title": "title", "url": "url", "snippet": "title", "eng_max": 10000,
+    },
+    "weibo": {
+        "kind": "opencli", "cli": ["opencli", "weibo", "search"],
+        "engagement": None, "comments": None, "time": "time",
+        "title": "title", "url": "url", "snippet": "title", "eng_max": 10000,
     },
     "hackernews": {
         "kind": "opencli", "cli": ["opencli", "hackernews", "search"],
@@ -143,12 +154,12 @@ COMMUNITY_SOURCES: Dict[str, Dict[str, Any]] = {
         "title": "title", "url": "url", "snippet": "title", "eng_max": 1000,
     },
     "last30days_en": {
-        "kind": "last30days", "cli": [_L30_EN_PYTHON, _L30_EN],
-        "engagement": "score", "comments": None, "time": None, "eng_max": 100,
+        "kind": "last30days", "cli": [_L30_EN_PYTHON, _L30_EN], "query_plan": True,
+        "engagement": "score", "comments": None, "time": "published_at", "eng_max": 100,
     },
     "last30days_cn": {
         "kind": "last30days", "cli": [_L30_CN_PYTHON, _L30_CN],
-        "engagement": "score", "comments": None, "time": None, "eng_max": 100,
+        "engagement": "score", "comments": None, "time": "published_at", "eng_max": 100,
     },
 }
 
@@ -497,8 +508,12 @@ class CommunityEngine(SearchEngine):
             add("twitter")
         if "site:news.ycombinator.com" in q:
             add("hackernews")
-        if "site:zhihu.com" in q or "site:weibo.com" in q:
-            add("last30days_cn")
+        if re.search(r"site:(?:www\.)?(?:bilibili\.com|b23\.tv)\b|哔哩哔哩|b站|\bbilibili\b", q):
+            add("bilibili")
+        if re.search(r"site:(?:www\.|zhuanlan\.)?zhihu\.com\b|知乎|\bzhihu\b", q):
+            add("zhihu")
+        if re.search(r"site:(?:www\.)?weibo\.com\b|微博|\bweibo\b", q):
+            add("weibo")
         # 平台关键词
         if any(k in q for k in ("小红书", "xiaohongshu", "xhs")):
             add("xiaohongshu")
@@ -649,10 +664,9 @@ class CommunityEngine(SearchEngine):
     async def _fetch_via_adapter(self, adapter, cfg, options) -> SourceFetchResult:
         """统一取回 SourceFetchResult。
 
-        opencli 适配器提供带分类的 `fetch_result`；last30days/RSS 等无分类适配器
-        （及测试注入的裸 `fetch` 适配器）沿用既有 `fetch` 语义，包装为 READY/EMPTY，
-        从不触发 breaker，语义保持不变。在调用点解析模块级 `_run_cmd`，保留单测
-        monkeypatch 语义。
+        Adapters with `fetch_result` retain their request-local failure category.
+        Legacy/test adapters exposing only `fetch` retain READY/EMPTY behavior.
+        The module runner remains injectable and configured sources stay isolated.
         """
         runner = _run_cmd
         if any(cfg is value for value in self._configured_sources.values()):
@@ -673,14 +687,15 @@ class CommunityEngine(SearchEngine):
         title = str(item.get(cfg.get("title", "title")) or item.get("title")
                     or item.get("text") or "").strip()
         url = str(item.get(cfg.get("url", "url")) or item.get("url") or "").strip()
-        if not title or not url:
+        if not title or not _http_url(url):
             return None
         snippet_field = cfg.get("snippet", "snippet")
         snippet = str(item.get(snippet_field) or item.get("selftext")
                       or item.get("text") or title or "")
         sc = calculate_score(item, cfg, now)
+        source_tag = item.get("_source") if cfg.get("kind") == "last30days" else None
         return (sc, SearchResult(title=title[:200], url=url,
-                                 snippet=snippet[:500], source_tag=source))
+                                 snippet=snippet[:500], source_tag=source_tag or source))
 
     async def health_check(self, *, deep: bool = False) -> EngineCheckResult:
         """检查 opencli 是否可用。

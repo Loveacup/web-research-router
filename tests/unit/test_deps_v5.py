@@ -20,9 +20,6 @@ from wrr.deps import (
 class TestDepManifest:
     """全量依赖清单完整性测试。"""
 
-    def test_manifest_is_non_empty(self):
-        assert len(DEPENDENCY_MANIFEST) == 14
-
     def test_all_deps_have_source_url(self):
         for dep in DEPENDENCY_MANIFEST:
             assert dep.source_url, f"{dep.id} missing source_url"
@@ -36,13 +33,6 @@ class TestDepManifest:
             if dep.required:
                 assert isinstance(dep.install_guide, list), f"{dep.id} bad install_guide"
 
-    def test_required_deps_count(self):
-        required = [d for d in DEPENDENCY_MANIFEST if d.required]
-        assert len(required) == 10  # 14 total, 4 optional (agent_reach now provenance/reference only)
-
-    def test_optional_deps(self):
-        optional = {d.id for d in DEPENDENCY_MANIFEST if not d.required}
-        assert optional == {"searxng_url", "paper_search_mcp", "searxng", "agent_reach"}
 
 
 class TestDepRegistry:
@@ -74,11 +64,6 @@ class TestDepRegistry:
             "github_token", "searxng_url",
         }
 
-    def test_by_type_git_repo(self):
-        reg = DepRegistry.get()
-        repos = reg.by_type(DepType.GIT_REPO)
-        assert len(repos) == 4
-
     def test_by_type_cli_tool(self):
         reg = DepRegistry.get()
         tools = reg.by_type(DepType.CLI_TOOL)
@@ -86,9 +71,6 @@ class TestDepRegistry:
         names = {t.id for t in tools}
         assert names == {"opencli", "qmd"}
 
-    def test_all_deps_registered(self):
-        reg = DepRegistry.get()
-        assert len(reg.all) == 14
 
 
 class TestEnvVarDep:

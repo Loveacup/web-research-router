@@ -129,7 +129,7 @@ def test_skill_token_present():
 
 # ── Academic 引擎测试 ──────────────────────────────────────────────
 def test_academic_always_ok():
-    """Academic: 公开 API 可达 → ok；模拟 3 源全通。"""
+    """Academic: enabled native public APIs reachable → ok."""
     async def mock_get(url, **kwargs):
         m = MagicMock()
         m.status_code = 200
@@ -141,7 +141,7 @@ def test_academic_always_ok():
     assert result.status == "ok"
     assert result.engine == "academic"
     assert result.tier == 0
-    assert "3/3" in result.summary
+    assert "4/4" in result.summary
     assert "openalex" in result.active_backend
 
 

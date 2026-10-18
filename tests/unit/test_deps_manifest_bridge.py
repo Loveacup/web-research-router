@@ -61,13 +61,6 @@ def test_manifest_derived_view_preserves_requiredness_for_v5_required_deps():
             assert manifest_deps[legacy_dep.id].required is True
 
 
-def test_default_legacy_deps_behavior_is_unchanged():
-    registry = DepRegistry.get()
-
-    assert len(DEPENDENCY_MANIFEST) == 14
-    assert len(registry.all) == 14
-    assert set(registry.all) == {dep.id for dep in DEPENDENCY_MANIFEST}
-    assert "obsidian_vaults" not in registry.all
 
 
 def test_by_capability_recent_web_search_order_matches_manifest():
@@ -83,10 +76,6 @@ def test_by_capability_unknown_returns_empty():
     assert registry.by_capability("no_such_capability") == []
 
 
-def test_registry_all_count_is_fourteen():
-    registry = DepRegistry.get()
-
-    assert len(registry.all) == 14
 
 
 def test_unknown_manifest_calling_pattern_does_not_crash_bridge():

@@ -96,6 +96,27 @@ def percentile_rank(value: float, dist: Sequence[float]) -> float:
     return min(1.0, max(0.0, below / (n - 1)))
 
 
+def source_family(source: str) -> str:
+    """Known retrieval families, not a claim of independent publishers or truth.
+
+    Skill discovery and GitHub search both retrieve from GitHub. Unknown
+    providers retain their names; no unobserved upstream index is guessed.
+    """
+    return {"skill": "github", "x": "twitter"}.get(source, source)
+
+
+def _result_family(source: str, doc: SearchResult) -> str:
+    # Aggregators may expose an actual upstream platform. Only recognized
+    # provenance tags can replace the wrapper identity.
+    if source in {"last30days_en", "last30days_cn", "community"}:
+        platform = doc.source_tag
+        if platform in {
+            "reddit", "twitter", "x", "hackernews", "github", "devto", "techmeme",
+            "bilibili", "zhihu", "weibo", "xiaohongshu", "youtube",
+        }:
+            return source_family(platform)
+    return source_family(source)
+
 # ── RRF 跨源融合 ─────────────────────────────────────────────────────
 def rrf_fuse(per_source: Dict[str, List[SearchResult]],
              k: int = RRF_K_DEFAULT,
@@ -103,7 +124,7 @@ def rrf_fuse(per_source: Dict[str, List[SearchResult]],
              recency_mult: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
     """跨源 Reciprocal Rank Fusion。
 
-    RRF(d) = Σ_s  w_s · recency_mult_s(d) / (k + rank_s(d))
+    RRF(d) = Σ_family max_s_in_family(w_s · recency_mult_s(d) / (k + rank_s(d)))
 
     - per_source: {source_name: [SearchResult 已按源内秩降序]}
     - weights:    {source_name: 融合权重}，缺省 1.0
@@ -127,12 +148,20 @@ def rrf_fuse(per_source: Dict[str, List[SearchResult]],
 
         for rank, doc in enumerate(items, start=1):
             key = canonical_url(doc.url) or f"{source}:{doc.title}"
-            slot = bucket.setdefault(key, {"doc": doc, "rrf": 0.0, "sources": set()})
+            slot = bucket.setdefault(
+                key, {"doc": doc, "rrf": 0.0, "sources": set(), "family_scores": {}},
+            )
             mult = recency_mult.get(doc.url, 1.0)
-            slot["rrf"] += w * mult * local_mult / (k + rank)
+            family = _result_family(source, doc)
+            contribution = w * mult * local_mult / (k + rank)
+            previous = slot["family_scores"].get(family, 0.0)
+            if contribution > previous:
+                slot["family_scores"][family] = contribution
+                slot["rrf"] += contribution - previous
             slot["sources"].add(source)
             # 代表条目：取已有快照或更靠前者（首见即代表，已是源内最高秩）
     for slot in bucket.values():
+        del slot["family_scores"]
         slot["doc"] = replace(
             slot["doc"],
             fusion_sources=sorted(slot["sources"]),
