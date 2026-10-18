@@ -74,3 +74,15 @@ WRR_V6_ROUTER=0 .venv/bin/pytest tests/unit -q -o addopts= -p no:cacheprovider -
 部署预检发现 macmini 的 Hermes 运行环境缺少 `trafilatura`。当前 Hermes 读取 `python_dependencies`，不读取原 manifest 的 `dependencies`。已改用支持的字段，并补齐 `trafilatura>=2.3.1`，与 Python 包声明一致。插件入口及 campaign 合同测试为 63 passed；依赖通过 Hermes 的管理流程安装，不直接改写其共享环境。
 
 本机和 macmini 的 WRR 专用 `default.env` 已按授权启用 Jev；macmini 的 Hermes `.env` 同步启用。使用已有 `TYPESAFE_API_KEY`，文件权限均为 `0600`，其他配置保持不变。macmini CLI 同时补入该机 Hermes 已有的 DeepSeek key。仓库只保存配置示例，不保存真实凭据。
+
+### 部署验收
+
+- 功能提交 `e26ce50`、Hermes manifest 修复 `64917ed` 已推送至 `origin/main`，macmini 通过 fast-forward 更新，没有覆盖工作树修改。
+- 本机 CLI 使用持久化环境文件实跑，Exa、DeepSeek 成功，Jev `status=ok`。macmini CLI 同样实跑成功，Exa、DeepSeek、Brave 均返回结果，Jev `status=ok`。
+- macmini 通过 `hermes pm repair` 准备依赖。实际 Hermes Python 3.14 管理环境已能导入 `trafilatura`，未直接向共享 venv 写包。
+- 在该机真实 Hermes 环境中加载 WRR 插件，沿用原有 `allow_tool_override=true`，调用注册的 `web_search`：版本 6.4.0、Jev 开关为 true、筛选成功，Stage S 决策证据存在。没有用 mock 代替检索或 Jev。
+- `hermes plugins doctor --ci` 报内置工具覆盖授权错误；实际宿主配置已有授权，上述真实注册调用通过。未为绕过 doctor 改动权限。
+
+Hermes 管理命令发现此前中断的源代码更新，并自动完成其收尾；本轮没有发起 `hermes update`。启动时还报告既有实验 campaign 的 cohort 不匹配，普通搜索不受阻；没有改动实验配置或重置 ledger。上述两项与 Jev 检索后筛选分别记录，不将普通搜索通过宣称为实验 campaign 验收通过。
+
+Gateway 重启最初等待 2 个在途任务，管理命令在 120 秒后超时。用户选择等待，未强杀任务。通过进程退出事件确认旧 gateway 退出，随后 `hermes gateway status` 确认 launchd 新 PID 为 14258；共享 HTTP 监听端口已响应请求。双机安装元数据和模块版本均为 6.4.0。真实工具验证使用 Hermes 注册入口，未冒充 Telegram 对话端到端验收。
