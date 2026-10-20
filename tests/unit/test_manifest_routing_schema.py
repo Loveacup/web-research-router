@@ -8,7 +8,6 @@ from wrr.engines.loader import (
     discover_engine_plugins,
     merge_routing_config,
     parse_engine_manifest,
-    trigger_matches,
 )
 from wrr.engines.registry import EngineRegistry
 from wrr.runtime.detect import detect_runtime
@@ -65,42 +64,6 @@ def test_builtin_manifest_schema_has_actions_domains_triggers_and_fusion_default
         assert "triggers" in manifest.routing
         assert manifest.fusion["rrf_k"] == config.RRF_K
         assert manifest.fusion == config.FUSION_DEFAULTS
-
-
-def test_manifest_trigger_rules_reproduce_current_trigger_behaviour():
-    manifests = _builtin_by_id()
-    samples = {
-        "github": [
-            "foo site:github.com",
-            "SITE:GITHUB.COM project",
-            "plain query",
-        ],
-        "community": [
-            "foo site:reddit.com",
-            "Windows Terminal 操作指南和快捷键怎么用",
-            "python 3.14 release date",
-        ],
-        "academic": [
-            "graph neural network survey paper",
-            "arxiv retrieval methodology",
-            "plain query",
-        ],
-        "skill": [
-            "有没有 data viz 的 skill",
-            "skill 推荐",
-            "plain query",
-        ],
-    }
-    expected = {
-        "github": config.github_triggered,
-        "community": config.community_triggered,
-        "academic": config.academic_triggered,
-        "skill": config.skill_triggered,
-    }
-
-    for engine_id, queries in samples.items():
-        for query in queries:
-            assert trigger_matches(manifests[engine_id], query) is expected[engine_id](query)
 
 
 def test_manifest_parser_rejects_bad_domains_and_bad_trigger_match():

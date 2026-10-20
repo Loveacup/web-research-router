@@ -9,7 +9,7 @@ const outputLimit = 1024 * 1024;
 
 function childEnvironment() {
   const env = { WRR_RUNTIME: "omp" };
-  for (const key of ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "WRR_ENV", "WRR_V6_ROUTER", "WRR_COMMUNITY_CONFIG"]) {
+  for (const key of ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "WRR_ENV", "WRR_COMMUNITY_CONFIG"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   for (const key of (process.env.WRR_SHARED_ENV_KEYS ?? "").split(",").map(key => key.trim()).filter(Boolean)) {

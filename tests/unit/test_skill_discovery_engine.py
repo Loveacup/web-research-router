@@ -8,7 +8,6 @@ import base64
 
 from wrr.engines import skill_discovery as sd
 from wrr.schemas import SearchOptions
-from wrr import config
 
 
 def run(coro):
@@ -114,7 +113,3 @@ def test_search_tolerates_incomplete_results():
     assert len(out) == 1 and out[0].title == "Foo Skill"
 
 
-def test_skill_triggered_config():
-    assert config.skill_triggered("有没有 data viz 的 skill")
-    assert config.skill_triggered("skill 推荐")
-    assert not config.skill_triggered("plain query")

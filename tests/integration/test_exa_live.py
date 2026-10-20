@@ -31,6 +31,6 @@ def test_exa_mode_routing():
     assert mode2 == "fast", f"Expected fast, got {mode2}"
     
     # 显式覆盖
-    opt3 = SearchOptions(query="test", count=3, mode="auto")
+    opt3 = SearchOptions(query="test", count=3, exa_mode="auto")
     mode3 = get_search_mode(opt3)
     assert mode3 == "auto", f"Expected auto, got {mode3}"

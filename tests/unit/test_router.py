@@ -1,238 +1,129 @@
-"""router fallback 控制流单测（对齐执行包 Step4 验收）。"""
+"""Sequential fetch/similar fallback and public diagnostic contracts."""
 import asyncio
 
 import pytest
 
 from conftest import FakeEngine, mk_results
-from wrr.registry import EngineRegistry
-from wrr.router import route, build_chain
-from wrr.schemas import SearchOptions, ExtractOptions, SimilarOptions
+from wrr import config
 from wrr.errors import AllEnginesFailedError, EngineError
+from wrr.registry import EngineRegistry
+from wrr.router import build_chain, route
+from wrr.schemas import ExtractOptions, SimilarOptions
 
 
 def _reg(*engines):
-    r = EngineRegistry()
-    for e in engines:
-        r.register(e)
-    return r
+    registry = EngineRegistry()
+    for engine in engines:
+        registry.register(engine)
+    return registry
 
 
 def run(coro):
     return asyncio.run(coro)
 
 
-# ── build_chain ──────────────────────────────────────────────────────
 def test_build_chain_default_and_explicit():
-    assert build_chain("search", None) == ["exa", "deepseek", "brave", "github", "community", "searxng"]
     assert build_chain("extract", None) == ["exa", "brave"]
     assert build_chain("similar", None) == ["exa"]
-    assert build_chain("search", "brave") == ["brave"]   # 显式 → 单元素
+    assert build_chain("extract", "brave") == ["brave"]
 
 
-# ── search fallback ──────────────────────────────────────────────────
-def test_search_normal_no_degrade():
-    reg = _reg(FakeEngine("exa", search_results=mk_results(2)),
-               FakeEngine("brave", error="should not call"),
-               FakeEngine("searxng", error="should not call"))
-    rr = run(route("search", SearchOptions("q"), reg))
-    assert rr.actual_provider == "exa"
-    assert len(rr.payload) == 2
+@pytest.mark.parametrize("operation,options", [
+    ("extract", ExtractOptions("https://x")),
+    ("similar", SimilarOptions("https://x")),
+])
+def test_first_nonempty_provider_stops_fallback(operation, options, monkeypatch):
+    if operation == "similar":
+        monkeypatch.setattr(config, "SIMILAR_PROVIDERS", ["exa", "brave"])
+    registry = _reg(FakeEngine("exa", extract_text="body", similar_results=mk_results(2)),
+                    FakeEngine("brave", error="must not run"))
+    result = run(route(operation, options, registry))
+    assert result.actual_provider == "exa"
+    assert len(result.fallback_chain) == 1
+    assert result.diagnostics.events[0].ok is True
+    assert result.quality.verdict == ("degraded" if operation == "extract" else "complete")
 
 
-def test_search_exception_falls_to_brave():
-    reg = _reg(FakeEngine("exa", error="exa down"),
-               FakeEngine("brave", search_results=mk_results(1)),
-               FakeEngine("searxng", search_results=mk_results(1)))
-    rr = run(route("search", SearchOptions("q"), reg))
-    assert rr.actual_provider == "brave"
-    assert rr.degraded_from == "exa"
+@pytest.mark.parametrize("first", [FakeEngine("exa", error="down"),
+                                      FakeEngine("exa", extract_text="")])
+def test_extract_failure_or_empty_text_falls_back(first):
+    result = run(route("extract", ExtractOptions("https://x"),
+                       _reg(first, FakeEngine("brave", extract_text="hello"))))
+    assert result.actual_provider == "brave"
+    assert result.payload.text == "hello"
+    assert result.degraded_from == "exa"
+    assert result.quality.verdict == "degraded_success"
+    assert [event.engine for event in result.diagnostics.events] == ["exa", "brave"]
 
 
-def test_search_empty_falls_through():
-    reg = _reg(FakeEngine("exa", search_results=[]),
-               FakeEngine("brave", search_results=[]),
-               FakeEngine("searxng", search_results=mk_results(1)))
-    rr = run(route("search", SearchOptions("q"), reg))
-    assert rr.actual_provider == "searxng"
-
-
-def test_search_all_fail_raises():
-    reg = _reg(FakeEngine("exa", error="down"),
-               FakeEngine("brave", error="down"),
-               FakeEngine("searxng", error="down"))
-    try:
-        run(route("search", SearchOptions("q"), reg))
-        assert False, "should raise"
-    except AllEnginesFailedError:
-        pass
-
-
-def test_all_fail_error_retains_engine_request_diagnostics():
-    class DiagnosticFailEngine(FakeEngine):
-        async def search(self, options):
-            error = EngineError("community: no completed sources")
-            error.details = {
-                "partial": False,
-                "cutoff_reason": "request_deadline",
-                "sources": [{"source": "twitter", "outcome": "cutoff"}],
-            }
-            raise error
-
-    reg = _reg(DiagnosticFailEngine("community", timeout=20.0))
-    with pytest.raises(AllEnginesFailedError) as caught:
-        run(route(
-            "search", SearchOptions("q", provider="community"), reg,
-            explicit_provider="community"))
-
-    event = caught.value.diagnostics.events[0]
-    assert event.details["cutoff_reason"] == "request_deadline"
-    assert event.details["sources"][0]["outcome"] == "cutoff"
+def test_similar_empty_result_falls_back(monkeypatch):
+    monkeypatch.setattr(config, "SIMILAR_PROVIDERS", ["exa", "brave"])
+    result = run(route("similar", SimilarOptions("https://x"), _reg(
+        FakeEngine("exa", similar_results=[]),
+        FakeEngine("brave", similar_results=mk_results(3)),
+    )))
+    assert result.actual_provider == "brave"
+    assert len(result.payload) == 3
 
 
 def test_explicit_provider_disables_fallback():
-    reg = _reg(FakeEngine("exa", search_results=mk_results(1)),
-               FakeEngine("brave", error="brave down"),
-               FakeEngine("searxng", search_results=mk_results(1)))
-    try:
-        run(route("search", SearchOptions("q", provider="brave"), reg, explicit_provider="brave"))
-        assert False, "explicit brave failure must not fall back"
-    except AllEnginesFailedError:
-        pass
+    registry = _reg(FakeEngine("exa", extract_text="must not run"),
+                    FakeEngine("brave", error="down"))
+    with pytest.raises(AllEnginesFailedError) as caught:
+        run(route("extract", ExtractOptions("https://x"), registry, explicit_provider="brave"))
+    assert [event.engine for event in caught.value.diagnostics.events] == ["brave"]
 
 
-def test_explicit_provider_gets_full_engine_timeout():
-    """显式 --provider 时不受 10s 总预算限制，应使用 engine.timeout。"""
+def test_explicit_provider_gets_full_engine_timeout(monkeypatch):
     import wrr.router as router
 
     captured = []
-    orig_wait_for = router.asyncio.wait_for
 
     async def fake_wait_for(awaitable, timeout):
         captured.append(timeout)
         return await awaitable
 
-    router.asyncio.wait_for = fake_wait_for
-    try:
-        reg = _reg(FakeEngine("github", search_results=mk_results(1), timeout=20.0))
-        rr = run(route("search", SearchOptions("q", provider="github"), reg, explicit_provider="github"))
-    finally:
-        router.asyncio.wait_for = orig_wait_for
-    assert rr.actual_provider == "github"
+    monkeypatch.setattr(router.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setitem(config.ENGINE_TIMEOUT, "brave", 20.0)
+    result = run(route("extract", ExtractOptions("https://x"),
+                       _reg(FakeEngine("brave", extract_text="body", timeout=20.0)),
+                       explicit_provider="brave"))
+    assert result.actual_provider == "brave"
     assert captured[0] >= 19.9
-
-
-def test_community_trigger_gets_community_budget():
-    import wrr.router as router
-
-    captured = []
-    orig_wait_for = router.asyncio.wait_for
-
-    async def fake_wait_for(awaitable, timeout):
-        captured.append(timeout)
-        return await awaitable
-
-    router.asyncio.wait_for = fake_wait_for
-    try:
-        reg = _reg(FakeEngine("community", search_results=mk_results(1), timeout=20.0))
-        rr = run(route("search", SearchOptions("site:reddit.com q"), reg))
-    finally:
-        router.asyncio.wait_for = orig_wait_for
-    assert rr.actual_provider == "community"
-    assert captured[0] >= 19.9
-
-
-# ── extract fallback ─────────────────────────────────────────────────
-def test_extract_empty_text_falls_back():
-    reg = _reg(FakeEngine("exa", extract_text=""),
-               FakeEngine("brave", extract_text="hello"))
-    rr = run(route("extract", ExtractOptions("https://x"), reg))
-    assert rr.actual_provider == "brave"
-    assert rr.payload.text == "hello"
-
-
-# ── similar ──────────────────────────────────────────────────────────
-def test_similar_single_provider():
-    reg = _reg(FakeEngine("exa", similar_results=mk_results(3)))
-    rr = run(route("similar", SimilarOptions("https://x"), reg))
-    assert rr.actual_provider == "exa"
-    assert len(rr.payload) == 3
 
 
 def test_unknown_provider_in_chain_fails_gracefully():
-    reg = _reg(FakeEngine("exa", error="down"))   # brave/searxng 未注册
-    try:
-        run(route("search", SearchOptions("q"), reg))
-        assert False
-    except AllEnginesFailedError as e:
-        assert "unknown provider" in str(e)
+    with pytest.raises(AllEnginesFailedError) as caught:
+        run(route("extract", ExtractOptions("https://x"), _reg(FakeEngine("exa", error="down"))))
+    assert "unknown provider: brave" in str(caught.value)
+    assert caught.value.diagnostics.quality.verdict == "failed"
 
 
-# ── diagnostics 追踪 ─────────────────────────────────────────────────
-def test_route_success_includes_diagnostics():
-    """成功 route 应包含 diagnostics 字段。"""
-    reg = _reg(FakeEngine("exa", search_results=mk_results(2)))
-    rr = run(route("search", SearchOptions("q"), reg))
-    assert rr.diagnostics is not None
-    assert rr.diagnostics.mode_reason == "v4_fallback_chain"
-    assert "exa" in rr.diagnostics.selected_engines
-    assert len(rr.diagnostics.events) >= 1
-    assert rr.diagnostics.events[0].engine == "exa"
-    assert rr.diagnostics.events[0].ok is True
-    assert rr.diagnostics.events[0].count == 2
+def test_all_fail_error_retains_safe_request_diagnostics():
+    class DiagnosticFailEngine(FakeEngine):
+        async def extract(self, options):
+            error = EngineError("no completed sources")
+            error.details = {
+                "partial": False,
+                "cutoff_reason": "request_deadline",
+                "sources": [{"source": "fixture", "outcome": "cutoff", "token": "secret"}],
+                "credential": "secret",
+            }
+            raise error
 
-
-def test_route_preserves_community_subsource_diagnostics():
-    """Community 的请求级逐源诊断必须进入公开 RouteTrace。"""
-    from wrr.engines.community import (
-        CommunitySearchResults, CommunitySourceDiagnostic,
-    )
-    from wrr.engines.community_sources import SourceOutcome
-
-    payload = CommunitySearchResults(
-        mk_results(1),
-        source_diagnostics=[
-            CommunitySourceDiagnostic(
-                "reddit", SourceOutcome.READY, 12.5, items_count=1),
-            CommunitySourceDiagnostic(
-                "twitter", SourceOutcome.CUTOFF, 20.0,
-                cutoff_reason="request_deadline"),
-        ],
-        partial=True,
-        cutoff_reason="request_deadline",
-    )
-    reg = _reg(FakeEngine("community", search_results=payload, timeout=20.0))
-
-    rr = run(route(
-        "search", SearchOptions("q", provider="community"), reg,
-        explicit_provider="community"))
-
-    event = rr.diagnostics.events[0]
-    assert event.details == {
-        "partial": True,
+    with pytest.raises(AllEnginesFailedError) as caught:
+        run(route("extract", ExtractOptions("https://x"),
+                  _reg(DiagnosticFailEngine("exa")), explicit_provider="exa"))
+    assert caught.value.diagnostics.events[0].details == {
+        "partial": False,
         "cutoff_reason": "request_deadline",
-        "sources": [d.to_dict() for d in payload.source_diagnostics],
+        "sources": [{"source": "fixture", "outcome": "cutoff"}],
     }
-    assert event.to_dict()["details"]["sources"][1]["outcome"] == "cutoff"
 
 
-def test_route_fallback_includes_all_events():
-    """fallback 路径应记录所有引擎的 events。"""
-    reg = _reg(FakeEngine("exa", error="exa down"),
-               FakeEngine("deepseek", error="deepseek down"),
-               FakeEngine("brave", search_results=mk_results(1)))
-    rr = run(route("search", SearchOptions("q"), reg))
-    assert rr.actual_provider == "brave"
-    assert rr.diagnostics is not None
-    assert len(rr.diagnostics.events) == 3
-    # exa 失败
-    assert rr.diagnostics.events[0].engine == "exa"
-    assert rr.diagnostics.events[0].ok is False
-    assert "exa down" in rr.diagnostics.events[0].message
-    # deepseek 失败
-    assert rr.diagnostics.events[1].engine == "deepseek"
-    assert rr.diagnostics.events[1].ok is False
-    assert "deepseek down" in rr.diagnostics.events[1].message
-    # brave 成功
-    assert rr.diagnostics.events[2].engine == "brave"
-    assert rr.diagnostics.events[2].ok is True
-    assert rr.diagnostics.events[2].count == 1
+def test_route_success_includes_diagnostics():
+    result = run(route("similar", SimilarOptions("https://x"),
+                       _reg(FakeEngine("exa", similar_results=mk_results(2)))))
+    assert result.diagnostics.mode_reason == "v4_fallback_chain"
+    assert result.diagnostics.selected_engines == ["exa"]
+    assert result.diagnostics.events[0].count == 2

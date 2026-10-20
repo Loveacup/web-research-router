@@ -39,12 +39,6 @@ def mock_doctor_checks(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_v6_router_env(monkeypatch):
-    """Unit tests must not inherit the live gateway's descriptor-router switch."""
-    monkeypatch.setenv("WRR_V6_ROUTER", "0")
-
-
-@pytest.fixture(autouse=True)
 def _isolate_async_http_client(monkeypatch):
     """Restore legacy tests' direct client assignments before the next test."""
     import httpx

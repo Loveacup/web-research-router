@@ -115,7 +115,7 @@ class DecisionSnapshot:
     """一次搜索路由的选择决策快照（frozen / 可哈希）。
 
     纯选择结果，不含执行副作用；由 legacy_selection_plan(options) 产出，
-    供 route_search_v5 消费，也作为后续选择策略 parity 对比的稳定 seam。
+    供旧选择快照的离线比较使用。
     - source:            选择策略来源（当前恒为 "legacy"）
     - mode:              解析出的 WRR mode（显式 provider 时为 None）
     - mode_reason:       "explicit" | "classify_intent" | "explicit_provider" | "academic_lookup"

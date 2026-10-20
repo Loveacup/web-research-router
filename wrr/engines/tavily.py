@@ -2,7 +2,6 @@
 
 契约：仅 search + health_check。缺 key / HTTP 错误一律 fail-closed，绝不返回伪成功。
 - 429/432 → RateLimitError（可触发 fallback）；其他 HTTP / transport error → EngineError。
-- router backfill 是下一 slice，本文件不碰 MODE_DISPATCH/weights/route order。
 """
 import httpx
 from typing import List

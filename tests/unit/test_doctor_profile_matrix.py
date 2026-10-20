@@ -10,7 +10,6 @@ def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
     # Isolate host signals, not detect_runtime itself: explicit profile hints
     # still flow through the real detector and report serialization.
     monkeypatch.setattr("wrr.runtime.detect._detect_from_config", lambda _cwd: None)
-    monkeypatch.setenv("WRR_V6_ROUTER", "0")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     monkeypatch.delenv("OPENCLI_TOKEN", raising=False)
@@ -21,7 +20,7 @@ def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
         trust_project=False,
         runtime_hint=None,
         cwd=tmp_path,
-        env={"WRR_V6_ROUTER": "0"},
+        env={},
         env_files=None,
         plugin_paths=None
     )
@@ -42,7 +41,6 @@ def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
         assert "id" in p
         assert "label" in p
         assert "runtime" in p
-        assert "router_mode" in p
         assert "routable_engine_ids" in p
 
     expected_runtimes = {
@@ -61,7 +59,6 @@ def test_profile_matrix_default_shape_without_real_env(monkeypatch, tmp_path):
 
 def test_profile_matrix_does_not_leak_unrelated_or_secret_env(monkeypatch, tmp_path):
     """Matrix does not expose secret env values."""
-    monkeypatch.setenv("WRR_V6_ROUTER", "0")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret123456")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws_secret_xyz")
     monkeypatch.setenv("UNRELATED_VAR", "unrelated_value")
@@ -85,8 +82,6 @@ def test_profile_matrix_does_not_leak_unrelated_or_secret_env(monkeypatch, tmp_p
 
 def test_profile_matrix_env_file_applies_to_all_profiles(monkeypatch, tmp_path):
     """Env file is loaded for all profiles."""
-    monkeypatch.setenv("WRR_V6_ROUTER", "0")
-
     env_file = tmp_path / ".env.test"
     env_file.write_text("GITHUB_TOKEN=ghp_from_file\nEXA_API_KEY=exa_from_file\n")
 
@@ -108,8 +103,6 @@ def test_profile_matrix_env_file_applies_to_all_profiles(monkeypatch, tmp_path):
 
 def test_profile_matrix_rejects_deep(monkeypatch, tmp_path):
     """Matrix raises ValueError when deep=True."""
-    monkeypatch.setenv("WRR_V6_ROUTER", "0")
-
     with pytest.raises(ValueError, match="does not support --deep"):
         doctor_profile_matrix(
             json=True,

@@ -85,9 +85,6 @@ OPERATION_BUDGET_SECONDS = {
     "extract": EXTRACT_BUDGET_SECONDS,
 }
 
-# Optional public-web candidate filtering, not another search engine.
-JEV_FILTER_ENABLED = _env_bool("WRR_JEV_FILTER", False)
-JEV_FILTER_TIMEOUT = min(3.0, _env_float("WRR_JEV_FILTER_TIMEOUT", 2.0))
 
 # ── 结果数量 / 字符上限 ──────────────────────────────────────────────
 DEFAULT_SEARCH_COUNT = 10
@@ -133,13 +130,9 @@ EXA_MODE_TIMEOUT = {
 }
 
 # ── GitHub 引擎（P1 轻量版：activity + popularity + freshness）─────────
-GITHUB_TRIGGER = "site:github.com"            # 查询命中 → 把 github 提到链首
 GITHUB_SCORE_WEIGHTS = (0.40, 0.35, 0.25)     # (activity, popularity, freshness)
 
 
-def github_triggered(query: str) -> bool:
-    """查询是否含 site:github.com（自动触发 github 引擎）。"""
-    return GITHUB_TRIGGER in (query or "").lower()
 
 
 def github_fast_mode(env_resolver: Optional[Callable[[str], Optional[str]]] = None) -> bool:
@@ -153,20 +146,6 @@ def github_fast_mode(env_resolver: Optional[Callable[[str], Optional[str]]] = No
             or _env_bool_from_resolver("WRR_GITHUB_FAST_MODE", env_resolver))
 
 
-# ── Recovery 兜底策略：按 runtime 决定是否允许自动 fallback ───────────
-RECOVERY_ALLOWED_RUNTIMES = {"hermes", "claude_code", "codex", "omp"}
-
-
-def recovery_allowed(runtime_name: Optional[str] = None) -> bool:
-    """当前 runtime 是否允许 search 主 mode 失败后自动 recovery 兜底。"""
-    if runtime_name is None:
-        from wrr.runtime.detect import detect_runtime
-        runtime_name = detect_runtime().name
-    allowed_env = os.environ.get("WRR_RECOVERY_ALLOWED_RUNTIMES")
-    if allowed_env:
-        allowed = {x.strip() for x in allowed_env.split(",") if x.strip()}
-        return runtime_name in allowed
-    return runtime_name in RECOVERY_ALLOWED_RUNTIMES
 
 
 # ── 社区聚合引擎（Phase 1：OpenCLI 渠道 + last30days）─────────────────
@@ -176,12 +155,6 @@ COMMUNITY_TOTAL_TIMEOUT = 15.0                 # 总超时（秒）
 COMMUNITY_DEFAULT_SOURCES = ("reddit", "twitter", "xiaohongshu")
 COMMUNITY_INCLUDE_LAST30DAYS = False           # 重型源；默认仅 site:hn/zhihu/weibo 或研究关键词时启用
 COMMUNITY_DEDUP_THRESHOLD = 0.80               # 标题相似度去重阈值
-COMMUNITY_TRIGGER_SITES = ("reddit.com", "news.ycombinator.com", "twitter.com",
-                           "x.com", "zhihu.com", "zhuanlan.zhihu.com", "weibo.com",
-                           "bilibili.com", "b23.tv")
-COMMUNITY_PLATFORM_NAMES = ("reddit", "hacker news", "hackernews", "hn",
-                            "twitter", "zhihu", "知乎", "微博", "weibo",
-                            "bilibili", "哔哩哔哩", "b站", "小红书", "xiaohongshu")
 
 # Community RSS source defaults (P3-1: AI HOT, P3-2: WeChat RSS)
 AIHOT_RSS_FEED: str = os.environ.get("WRR_AIHOT_RSS_FEED", "https://aihot.virxact.com/feed.xml")
@@ -206,22 +179,12 @@ def early_news_triggered(query: str) -> bool:
     q = (query or "").lower()
     return any(kw.lower() in q for kw in EARLY_NEWS_KEYWORDS)
 
-def community_triggered(query: str) -> bool:
-    """查询是否含社区站点 site: 过滤、平台名称或实践意图（v5.4 自动触发 community）。"""
-    import re
-    q = (query or "").lower()
-    if any(f"site:{s}" in q for s in COMMUNITY_TRIGGER_SITES):
-        return True
-    if any(re.search(rf"\b{re.escape(p)}\b", q, flags=re.ASCII) for p in COMMUNITY_PLATFORM_NAMES):
-        return True
-    # v5.4: 实践意图关键词 → 自动触发社区引擎
-    return any(kw.lower() in q for kw in PRACTICAL_KEYWORDS)
 
 
-# ── Policy-sensitive 机器信号（加法式，正交于 route mode）────────────────
+# ── Policy-sensitive 机器信号 ─────────────────────────────────────────
 # 识别政策/法规/监管/政府/法律等高风险查询，仅输出布尔信号供机器消费（如
-# formatter 输出契约）；绝不进入 classify_intent / MODE_DISPATCH / mode_engines，
-# 不改变任何路由选择。含 false-positive guards：RL 的 "policy gradient"、办公
+# formatter 输出契约）；不改变任何路由选择。
+# 含 false-positive guards：RL 的 "policy gradient"、办公
 # "legal pad"、普通 timeout 等不得触发。
 POLICY_SENSITIVE_CN_KEYWORDS = ("政策", "法规", "法律", "监管", "政府", "合规",
                                 "立法", "条例", "法案", "规章", "备案", "执法")
@@ -237,7 +200,7 @@ POLICY_SENSITIVE_GUARD_PHRASES = ("policy gradient", "legal pad", "legal-size",
 def policy_sensitive_triggered(query: str) -> bool:
     """查询是否触及政策/法规/监管/政府/法律等高风险语义（纯机器信号）。
 
-    仅输出布尔信号；绝不改变 classify_intent / mode_engines / 路由结果。
+    仅输出布尔信号；不改变路由结果。
     英文关键词按词边界匹配（避免 substring 误伤），中文按子串匹配；guard
     短语先行剔除，规避 "policy gradient" / "legal pad" 等假阳性。
     """
@@ -252,7 +215,7 @@ def policy_sensitive_triggered(query: str) -> bool:
     return any(kw in q for kw in POLICY_SENSITIVE_CN_KEYWORDS)
 
 
-USER_AGENT = "wrr-hermes/4.0"
+USER_AGENT = "wrr/7.0"
 
 # ── MCP 备份：保留 mcp_* 工具作为备份，默认不自动调用，仅在输出附 hint ──
 BACKUP_HINT = (
@@ -261,10 +224,6 @@ BACKUP_HINT = (
 )
 
 
-# ══════════════════════════════════════════════════════════════════════
-# v5.0 路由：mode 分发 + 触发词提升 + RRF 融合（加法式，不改 v4 fallback）
-# 真相源：/tmp/wrr-v5.0-stdd-final.md。STDD §3–§6。
-# ══════════════════════════════════════════════════════════════════════
 
 RRF_K = 60                                     # Cormack 2009 默认，业界标准
 FUSION_DEFAULTS = {
@@ -273,185 +232,10 @@ FUSION_DEFAULTS = {
     "weights_merge_policy": "multiply",
 }
 
-# 连续时间衰减半衰期 τ（小时），按平台
-RECENCY_TAU = {
-    "twitter": 12.0, "reddit": 12.0,
-    "v2ex": 48.0, "hackernews": 48.0, "last30days_en": 48.0,
-    "zhihu": 720.0, "weibo": 48.0, "xiaohongshu": 48.0, "last30days_cn": 720.0,
-    "default": 72.0,
-}
-
-# 意图分类关键词
-RESEARCH_KEYWORDS = EXA_RESEARCH_KEYWORDS
-DISCOVERY_KEYWORDS = ["有哪些", "盘点", "趋势", "trending", "探索", "推荐", "找", "best", "top",
-                      "有没有", "类似", "替代", "取代", "开源", "project", "projects",
-                      "工具", "框架", "库", "平台", "sdk", "插件", "plugin",
-                      "list of", "awesome", "curated"]
-
-# 触发词（academic/skill；github/community 已在上方定义）
-ACADEMIC_KEYWORDS = EXA_ACADEMIC_KEYWORDS
-SKILL_KEYWORDS = ["找 skill", "skill 推荐", "推荐 skill", "skill.md",
-                  "agent skill", "find skill"]
-
-
-def academic_lookup_requested(query: str) -> bool:
-    """Explicit bibliographic lookup, including malformed reserved prefixes."""
-    from .engines._academic_query import academic_query
-    q = (query or "").strip()
-    return (
-        academic_query(q) is not None
-        or q.lower().startswith(("doi:", "references:", "citations:"))
-    )
-
-
-def academic_triggered(query: str) -> bool:
-    """Promote explicit scholarly requests, not general health advice."""
-    from .engines._academic_query import biomedical_query
-    q = (query or "").lower()
-    return (
-        academic_lookup_requested(query)
-        or biomedical_query(query)
-        or any(k.lower() in q for k in ACADEMIC_KEYWORDS)
-    )
-
-
-def skill_triggered(query: str) -> bool:
-    """查询命中 skill 发现意图 → 提升 skill 引擎。"""
-    q = (query or "").lower()
-    if "skill" in q and any(t in q for t in ("找", "推荐", "有没有", "find", "recommend", "discover")):
-        return True
-    return any(k.lower() in q for k in SKILL_KEYWORDS)
-
-
-# ── 本地搜索层触发词（v5.2）──────────────────────────────────────────
-# 分层：memory / notes / session 为强信号；scope 为弱信号（需搭配知识类名词）。
-LOCAL_MEMORY_KEYWORDS = ["我之前", "之前我们", "上次", "刚才", "记得我", "我记得",
-                         "记忆里", "supermemory", "长期记忆", "偏好"]
-LOCAL_NOTES_KEYWORDS = ["查笔记", "我的笔记", "笔记里", "知识库", "obsidian", "vault",
-                        "qmd", "文档里", "本地文档", "项目文档", "历史报告", "本地搜索"]
-LOCAL_SESSION_KEYWORDS = ["历史对话", "会话记录", "聊天记录", "这次会话",
-                          "上个 session", "刚才聊", "之前聊"]
-LOCAL_SCOPE_KEYWORDS = ["本地", "我的", "我们讨论过", "之前决定", "以前的结论"]
-# scope 弱信号需搭配的知识类名词（避免"本地部署 redis"误伤）
-_LOCAL_SCOPE_COMBO = ["笔记", "知识库", "文档", "记忆", "历史", "之前", "决定",
-                      "note", "memory", "doc"]
-
-# ── 恢复/存档搜索触发词 ──
-RECOVERY_KEYWORDS = ["找不到", "丢失", "删除", "不见了", "recover", "恢复",
-                     "找回来", "复原", "找回", "被删", "消失", "404",
-                     "已删除", "已移除", "missing", "deleted", "gone"]
-
-# ── 开放式兴趣查询（"今天有啥好玩的"→多源探索）──
-BROAD_INTEREST_KEYWORDS = ["今天可能感兴趣", "今天有啥", "今天有什么", "今天热点",
-                           "今日资讯", "今日热点", "最近有啥", "有什么新鲜",
-                           "interesting today", "what's new", "what's happening"]
-
-# v5.4: 实践意图关键词 — 工具使用/操作指南/推荐类查询自动触发社区引擎
-PRACTICAL_KEYWORDS = ["怎么用", "如何使用", "使用方法", "操作指南", "教程", "快捷键",
-                      "实战", "实践", "经验", "踩坑", "避坑", "最佳实践",
-                      "推荐", "值得", "哪个好", "怎么选",
-                      "how to", "guide", "tutorial", "shortcuts", "keybindings",
-                      "best practice", "tips", "tricks", "gotchas", "worth it"]
-
-
-def local_triggered(query: str) -> bool:
-    """查询是否应进入 local mode（本地优先）。
-
-    保守策略：强信号（memory/notes/session 关键词）直接命中；弱 scope 词
-    （本地/我的）必须搭配知识类名词才触发，否则"本地部署/localhost"误入 local。
-    """
-    q = (query or "").lower()
-    strong = LOCAL_MEMORY_KEYWORDS + LOCAL_NOTES_KEYWORDS + LOCAL_SESSION_KEYWORDS
-    if any(k.lower() in q for k in strong):
-        return True
-    if any(k in q for k in LOCAL_SCOPE_KEYWORDS):
-        return any(c in q for c in _LOCAL_SCOPE_COMBO)
-    return False
-
-
-def recovery_triggered(query: str) -> bool:
-    """查询是否在寻找丢失/删除/不可达的内容 → recovery mode。"""
-    q = (query or "").lower()
-    return any(k.lower() in q for k in RECOVERY_KEYWORDS)
-
-
-def broad_interest_triggered(query: str) -> bool:
-    """查询是否为开放式兴趣探索 → broad mode（多源并行）。"""
-    q = (query or "").lower()
-    return any(k.lower() in q for k in BROAD_INTEREST_KEYWORDS)
-
-
-def classify_intent(query: str) -> str:
-    """查询意图分类，返回 7 mode 之一（v5.2 含 local/broad）。显式 mode 由 router 覆盖。"""
-    q = (query or "").lower()
-    if academic_lookup_requested(query):
-        return "academic"
-    if recovery_triggered(q):       # recovery 优先（"找不到刚才的文件"）
-        return "recovery"
-    if local_triggered(q):          # 本地记忆/笔记
-        return "local"
-    if broad_interest_triggered(q): # 开放式探索 → discovery + platform
-        return "broad"
-    if community_triggered(q):
-        return "platform"
-    if academic_triggered(q):
-        return "academic"
-    if any(k.lower() in q for k in RESEARCH_KEYWORDS):
-        return "research"
-    if any(k.lower() in q for k in DISCOVERY_KEYWORDS):
-        return "discovery"
-    return "grounding"
-
-
-# mode → 基础引擎组合
-MODE_DISPATCH = {
-    # deepseek 紧跟 exa：DeepSeek Search API 与 Exa 同级并行（主力双源）
-    "discovery": ("exa", "deepseek", "brave", "community"),
-    "broad":     ("exa", "deepseek", "brave", "community", "searxng"),  # 开放式兴趣 → 多源并行
-    "grounding": ("exa", "deepseek", "brave"),
-    "research":  ("exa", "deepseek", "brave", "community", "academic"),
-    "academic":  ("academic", "exa", "deepseek", "community"),
-    "platform":  ("community", "exa", "deepseek", "brave"),
-    "recovery":  ("brave", "exa", "deepseek", "searxng"),
-    # local（v5.2）：本地 4 引擎在前，exa/deepseek/brave 在后补位。本地引擎在 CLI 环境
-    # 不可用时由 router gather 隔离跳过，正好 web 兜底；本地可用时权重碾压外网。
-    "local":     ("local_supermemory", "local_session", "local_qmd",
-                  "local_obsidian", "exa", "deepseek", "brave"),
-}
-
-# mode → {引擎: RRF 融合权重}（D1/D2 对齐 Alex）
-_W_DEFAULT = {"exa": 1.0, "deepseek": 1.0, "brave": 0.9, "community": 0.30, "academic": 0.30,
-              "github": 0.25, "skill": 0.25, "searxng": 0.1}
-MODE_WEIGHTS = {
-    "discovery": {**_W_DEFAULT, "community": 0.50},
-    "grounding": {**_W_DEFAULT, "community": 0.40},
-    "research":  {**_W_DEFAULT, "community": 0.35, "academic": 0.30},
-    "academic":  {**_W_DEFAULT, "academic": 1.0, "community": 0.25},
-    "platform":  {**_W_DEFAULT, "community": 1.0},
-    "recovery":  {**_W_DEFAULT},
-    # local（v5.2）：本地引擎权重高于外网，外网仅低权补位
-    "local":     {**_W_DEFAULT,
-                  "local_supermemory": 1.0, "local_session": 0.9,
-                  "local_qmd": 0.9, "local_obsidian": 0.8,
-                  "exa": 0.3, "deepseek": 0.3, "brave": 0.3, "community": 0.15},
-    # broad（v5.2）：开放式兴趣查询，4 引擎并行，社区权重大
-    "broad":     {**_W_DEFAULT, "community": 0.55, "searxng": 0.30},
-}
-
-
-# ── Diversity backfill：Brave 因 rate_limit/timeout/empty 失败、仅剩单一独立来源
-#    时，条件性调用一次 Tavily 作为独立补源。纯 policy 常量；绝不入 MODE_DISPATCH /
-#    MODE_WEIGHTS / SEARCH_FALLBACK_ORDER / recovery，仅供 router tripwire 消费。
-DIVERSITY_BACKFILL_MODES = ("grounding", "research")
-DIVERSITY_BACKFILL_PROVIDER = "tavily"
-DIVERSITY_BACKFILL_TIMEOUT_SECONDS = _env_float("WRR_DIVERSITY_BACKFILL_TIMEOUT", 3.0)
-
-
 # ── 本地搜索层配置（v5.2）────────────────────────────────────────────
 LOCAL_MAX_RESULTS_PER_ENGINE = 10       # 单引擎结果上限（与 count 取 min）
-LOCAL_MIN_RESULTS = 3                    # local mode 本地结果充足阈值（P1 web 补位用）
 
-# Obsidian 文件扫描限流（强约束：防全盘 find 拖垮 local mode）
+# Obsidian 文件扫描限流，避免全盘扫描。
 LOCAL_OBSIDIAN_MAX_FILES = 2000         # 单次扫描文件数上限
 LOCAL_OBSIDIAN_MAX_BYTES = 65536        # 单文件读取前缀字节上限
 LOCAL_OBSIDIAN_EXCLUDE_DIRS = (".git", ".obsidian", "node_modules", ".trash",
@@ -470,22 +254,6 @@ def obsidian_vault_paths() -> List[Path]:
     return [Path(os.path.expanduser(p.strip()))
             for p in raw.split(os.pathsep) if p.strip()]
 
-# 触发词 → 引擎（promote 用）
-TRIGGER_ENGINES = (
-    ("github", github_triggered),
-    ("skill", skill_triggered),
-    ("academic", academic_triggered),
-    ("community", community_triggered),
-)
-
-
-def mode_engines(mode: str, query: str = "") -> list:
-    """返回该 mode 的并行引擎组合 = 基础组合 ∪ 触发提升（去重，保序）。"""
-    base = list(MODE_DISPATCH.get(mode, MODE_DISPATCH["grounding"]))
-    for name, trig in TRIGGER_ENGINES:
-        if trig(query) and name not in base:
-            base.append(name)
-    return base
 
 
 # ── 学术引擎（v5.0）──────────────────────────────────────────────────

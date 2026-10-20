@@ -108,42 +108,6 @@ def test_missing_explicit_env_never_uses_default_credentials(monkeypatch, tmp_pa
     assert "wrong-account" not in json.dumps(output)
 
 
-def test_descriptor_search_does_not_reopen_host_credentials(monkeypatch, tmp_path):
-    import builtins
-    from wrr.engines.exa import ExaEngine
-    from wrr.errors import AllEnginesFailedError
-    from wrr.schemas import SearchOptions
-
-    host_env = tmp_path / ".hermes" / ".env"
-    host_env.parent.mkdir()
-    host_env.write_text("EXA_API_KEY=descriptor-host-sentinel\n")
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("WRR_RUNTIME", "hermes")
-    monkeypatch.setenv("WRR_V6_ROUTER", "1")
-    monkeypatch.delenv("WRR_ENV", raising=False)
-    monkeypatch.delenv("EXA_API_KEY", raising=False)
-    monkeypatch.chdir(tmp_path)
-    opened = []
-    original_open = builtins.open
-    # pathlib uses io.open, while the legacy CLI loader uses builtins.open.
-    import io
-    original_io_open = io.open
-
-    def record(opener, path, *args, **kwargs):
-        if str(path) == str(host_env):
-            opened.append(str(path))
-        return opener(path, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: record(original_open, p, *a, **k))
-    monkeypatch.setattr(io, "open", lambda p, *a, **k: record(original_io_open, p, *a, **k))
-
-    async def empty_provider(self, options):
-        return []
-
-    monkeypatch.setattr(ExaEngine, "search", empty_provider)
-    with pytest.raises(AllEnginesFailedError):
-        asyncio.run(_cli._run("search", SearchOptions("needle", provider="exa"), "exa"))
-    assert opened == []
 
 
 def test_explicit_source_failure_never_falls_back_across_hosts(monkeypatch, capsys):

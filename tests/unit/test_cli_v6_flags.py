@@ -228,7 +228,6 @@ def test_doctor_v6_profile_matrix_json_shape():
         assert "id" in p
         assert "label" in p
         assert "runtime" in p
-        assert "router_mode" in p
         assert "routable_engine_ids" in p
         assert isinstance(p["routable_engine_ids"], list)
 
@@ -287,7 +286,7 @@ def test_test_subcommand_accepts_unit_argument():
         parser.parse_args(["test", "unknown"])
 
 
-def test_cli_test_unit_runs_pytest_with_v6_router_disabled():
+def test_cli_test_unit_runs_pytest():
     cli = _load_cli_module()
     parser = cli.build_parser()
     ns = parser.parse_args(["test", "unit"])
@@ -297,7 +296,6 @@ def test_cli_test_unit_runs_pytest_with_v6_router_disabled():
         cli.cmd_test_unit(ns)
         called_args, called_kwargs = mocked.call_args
         assert called_args[0] == ["pytest", "tests/unit", "-q"]
-        assert called_kwargs["env"]["WRR_V6_ROUTER"] == "0"
 
 
 

@@ -7,7 +7,6 @@ from conftest import FakeAsyncClient
 from wrr.engines import github as gh
 from wrr.schemas import SearchOptions
 from wrr.errors import EngineError
-from wrr.router import build_chain
 from wrr import config
 
 
@@ -178,17 +177,6 @@ def test_fetch_activity_disabled_returns_none():
     finally:
         config.GITHUB_ACTIVITY_LOOKUP = True
     assert counts == [None]
-
-
-# ── 自动触发 ─────────────────────────────────────────────────────────
-def test_auto_trigger_promotes_github():
-    assert config.github_triggered("foo site:github.com")
-    assert config.github_triggered("SITE:GITHUB.COM")
-    assert not config.github_triggered("plain")
-    assert build_chain("search", None, "x site:github.com") == \
-        ["github", "exa", "deepseek", "brave", "community", "searxng"]
-    assert build_chain("search", None, "plain") == \
-        ["exa", "deepseek", "brave", "github", "community", "searxng"]
 
 
 # ── 环境变量超时配置测试 ─────────────────────────────────────────────

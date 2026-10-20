@@ -11,16 +11,12 @@ def test_search_options_defaults():
     o = SearchOptions(query="q")
     assert o.count == config.DEFAULT_SEARCH_COUNT
     assert o.provider is None
-    assert o.mode is None
-    assert o.route_mode is None
     assert o.exa_mode is None
 
 
-def test_search_options_supports_orthogonal_route_and_exa_modes():
-    o = SearchOptions(query="q", route_mode="research", exa_mode="fast")
-    assert o.route_mode == "research"
+def test_search_options_supports_native_exa_mode():
+    o = SearchOptions(query="q", exa_mode="fast")
     assert o.exa_mode == "fast"
-    assert o.mode is None
 
 
 def test_search_result_to_dict():

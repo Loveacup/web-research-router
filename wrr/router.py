@@ -1,4 +1,4 @@
-"""Fallback 路由（search / extract / similar 共用）+ 总预算控制。
+"""Sequential fetch/extract and similar fallback with per-engine and total budgets.
 
 规则（对齐执行包关键约束）：
   - 显式 provider → 单元素链，禁用 fallback
@@ -7,54 +7,29 @@
   - per-engine timeout + 按操作的总预算 config.budget_for(op)（超预算的后续引擎标记跳过）
 """
 import asyncio
-import datetime as _dt
-import os
-import re
 import time
-import uuid as _uuid
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 from . import config
 from .engines import _fusion
 from .engines.base import SearchEngine
-from .errors import (AllEnginesFailedError, EngineError, EngineTimeoutError,
-                     FetchPolicyError, RateLimitError, TerminalReason)
-from .evidence_v2 import project_decision_evidence_v2
+from .errors import AllEnginesFailedError, EngineError, FetchPolicyError, TerminalReason
 from .extraction import extraction_error, qualify_extraction
-from .runtime.decision_context_provider import DecisionContextObservation
-from .schemas import (DecisionContext, DecisionEvidence, DecisionEvidenceV2,
-                      DecisionSnapshot, DiagnosticEvent,
-                      FallbackStep, RouteQuality, RouteTrace, RouterResult, SearchResult)
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .runtime.decision_evidence import DecisionEvidenceSink
+from .schemas import DiagnosticEvent, FallbackStep, RouteQuality, RouteTrace, RouterResult
 
 
-class SearchRegistry(Protocol):
-    """Minimal registry interface consumed by router hot paths."""
+class FallbackRegistry(Protocol):
+    """Minimal registry interface consumed by sequential fallback."""
 
     def get(self, name: str) -> Optional[SearchEngine]:
         ...
 
 
-def build_chain(operation: str, explicit_provider: Optional[str],
-                query: Optional[str] = None) -> List[str]:
+def build_chain(operation: str, explicit_provider: Optional[str]) -> List[str]:
+    if operation not in ("extract", "similar"):
+        raise ValueError(f"unknown operation: {operation}")
     if explicit_provider:
         return [explicit_provider]
-    if operation == "search":
-        chain = list(config.SEARCH_FALLBACK_ORDER)
-        promote = []
-        # P3-3: explicit site:github.com wins over early-news community promotion.
-        if query and config.github_triggered(query):
-            promote.append("github")           # site:github.com
-        if query and config.early_news_triggered(query):
-            promote.append("community")      # P3-3: early-news → RSS/community first
-        if query and config.community_triggered(query):
-            promote.append("community")      # site:reddit/hn/twitter/zhihu/weibo
-        if promote:
-            chain = promote + [p for p in chain if p not in promote]
-        return chain
     if operation == "extract":
         return list(config.EXTRACT_FALLBACK_ORDER)
     if operation == "similar":
@@ -62,24 +37,7 @@ def build_chain(operation: str, explicit_provider: Optional[str],
     raise ValueError(f"unknown operation: {operation}")
 
 
-def _v2ex_only_query(query: str) -> bool:
-    if not re.search(r"\bv2ex\b", query, re.IGNORECASE):
-        return False
-    return not any(
-        (name in query.lower() if not name.isascii() else
-         re.search(rf"\b{re.escape(name)}\b", query, re.IGNORECASE))
-        for name in config.COMMUNITY_PLATFORM_NAMES
-    )
-
-
 async def _invoke(engine, operation: str, options) -> Any:
-    if operation == "search":
-        query = getattr(options, "query", "")
-        if (engine.name in {"exa", "deepseek", "brave", "searxng", "tavily"}
-                and _v2ex_only_query(query)
-                and not re.search(r"(?:^|\s)-?site:", query, re.IGNORECASE)):
-            options = replace(options, query=f"site:v2ex.com {query}")
-        return await engine.search(options)
     if operation == "extract":
         return await engine.extract(options)
     if operation == "similar":
@@ -88,13 +46,13 @@ async def _invoke(engine, operation: str, options) -> Any:
 
 
 def _is_empty(operation: str, result) -> bool:
-    if operation in ("search", "similar"):
+    if operation == "similar":
         return not result                       # 空 list
     return not getattr(result, "text", "")      # extract：空 text
 
 
 def _count(operation: str, result) -> int:
-    if operation in ("search", "similar"):
+    if operation == "similar":
         return len(result)
     return len(getattr(result, "text", "") or "")
 
@@ -168,7 +126,7 @@ def _result_diagnostic_details(result) -> Optional[Dict[str, Any]]:
     })
 
 
-async def route(operation: str, options, registry: SearchRegistry,
+async def route(operation: str, options, registry: FallbackRegistry,
                 explicit_provider: Optional[str] = None) -> RouterResult:
     if (operation == "extract" and getattr(options, "allow_private_origin", None) is not None
             and explicit_provider != "brave"):
@@ -176,13 +134,11 @@ async def route(operation: str, options, registry: SearchRegistry,
             "fetch denied: a private-origin grant requires explicit provider brave",
             terminal_reason=TerminalReason.FETCH_POLICY_DENIED,
         )
-    chain = build_chain(operation, explicit_provider, getattr(options, "query", None))
+    chain = build_chain(operation, explicit_provider)
     budget = config.budget_for(operation)
     # Explicit single provider → allow full engine timeout, no fallback-chain budget cap.
     if explicit_provider and len(chain) == 1:
         budget = config.ENGINE_TIMEOUT.get(explicit_provider, budget)
-    if operation == "search" and chain and chain[0] == "community":
-        budget = max(budget, config.ENGINE_TIMEOUT.get("community", config.DEFAULT_ENGINE_TIMEOUT))
     steps: List[FallbackStep] = []
     events: List[DiagnosticEvent] = []
     start = time.monotonic()
@@ -282,7 +238,7 @@ async def route(operation: str, options, registry: SearchRegistry,
             events=events,
             elapsed_ms=route_elapsed,
             timeout_ms=budget * 1000.0,
-            quality=_route_quality(None, chain, steps, False),
+            quality=_route_quality(chain, steps, False),
         )
         raise AllEnginesFailedError(
             f"All engines failed for {operation}:\n{reasons}",
@@ -292,7 +248,6 @@ async def route(operation: str, options, registry: SearchRegistry,
 
     route_elapsed = _elapsed_ms(start)
     quality = _route_quality(
-        None,
         [step.provider for step in steps],
         steps,
         payload is not None,
@@ -312,918 +267,31 @@ async def route(operation: str, options, registry: SearchRegistry,
                         diagnostics=trace)
 
 
-# ══════════════════════════════════════════════════════════════════════
-# v5.0：mode 分发 + 多引擎并行 + 跨源 RRF 融合（加法式，与 route() 并存）
-# 真相源：/tmp/wrr-v5.0-stdd-final.md。STDD §3。
-# ══════════════════════════════════════════════════════════════════════
-
-_V5_MODES = ("discovery", "grounding", "research", "academic", "platform",
-             "recovery", "local", "broad")
-
-_QUALITY_MIN_SOURCES = {
-    "grounding": 2,
-    "academic": 2,
-    "research": 2,
-    "broad": 2,
-    "discovery": 1,
-    "platform": 1,
-    "local": 1,
-    "recovery": 1,
-}
+def _elapsed_ms(start: float) -> float:
+    return (time.monotonic() - start) * 1000.0
 
 
-def _unique(items) -> List[str]:
-    return list(dict.fromkeys(items))
-
-
-def _route_quality(mode, selected_engines, steps, has_results: bool) -> RouteQuality:
-    """按 D2 contract 计算 route-level quality；不改变路由控制流。"""
-    expected = _unique(selected_engines)
+def _route_quality(selected_engines, steps, has_results: bool) -> RouteQuality:
+    """Describe attempted fallback providers without changing control flow."""
+    expected = list(dict.fromkeys(selected_engines))
     successful_set = {
         step.provider for step in steps
         if step.ok and step.count > 0 and step.provider in expected
     }
     successful = [name for name in expected if name in successful_set]
     failed = [name for name in expected if name not in successful_set]
-    independent = len({_fusion.source_family(name) for name in successful})
-    min_required = _QUALITY_MIN_SOURCES.get(mode, 1)
-    if mode == "academic" and expected == ["academic"]:
-        # A closed bibliographic lookup verifies metadata, not multiple-source claims.
-        min_required = 1
-
     if not has_results:
-        verdict = "failed"
-        reasons = ["no_valid_results"]
-    elif independent < min_required:
-        verdict = "insufficient"
-        reasons = [f"successful_sources_below_minimum:{independent}<{min_required}"]
-        # 稳定 token（非新 verdict）：多源要求下恰剩单一独立成功来源。
-        if min_required >= 2 and independent == 1:
-            reasons.append("single_source_only")
+        verdict, reasons = "failed", ["no_valid_results"]
     elif failed:
-        verdict = "degraded_success"
-        reasons = ["expected_sources_failed"]
+        verdict, reasons = "degraded_success", ["expected_sources_failed"]
     else:
-        verdict = "complete"
-        reasons = []
-
+        verdict, reasons = "complete", []
     return RouteQuality(
         verdict=verdict,
         expected_sources=expected,
         successful_sources=successful,
         failed_sources=failed,
-        independent_source_count=independent,
-        min_required=min_required,
+        independent_source_count=len({_fusion.source_family(name) for name in successful}),
+        min_required=1,
         reasons=reasons,
     )
-
-
-def resolve_mode(options) -> str:
-    """route_mode 优先；legacy mode 若为 WRR mode 继续兼容，否则自动分类。"""
-    route_mode = getattr(options, "route_mode", None)
-    if route_mode in _V5_MODES:
-        return route_mode
-    legacy_mode = getattr(options, "mode", None)
-    if legacy_mode in _V5_MODES:
-        return legacy_mode
-    return config.classify_intent(getattr(options, "query", "") or "")
-
-
-def legacy_selection_plan(options) -> DecisionSnapshot:
-    """纯选择：从 options 计算 legacy 路由的 DecisionSnapshot（无执行副作用）。
-
-    显式 provider → 单元素 snapshot（mode=None，engine_names=(provider,)）；
-    否则 resolve_mode → mode_engines/MODE_WEIGHTS，weights 收窄到实际引擎组合。
-    """
-    explicit = getattr(options, "provider", None)
-    if explicit:
-        return DecisionSnapshot(
-            source="legacy",
-            mode=None,
-            mode_reason="explicit_provider",
-            explicit_provider=explicit,
-            engine_names=(explicit,),
-            weights=(),
-        )
-    mode = resolve_mode(options)
-    explicit_mode = (
-        getattr(options, "route_mode", None) in _V5_MODES
-        or getattr(options, "mode", None) in _V5_MODES
-    )
-    mode_reason = "explicit" if explicit_mode else "classify_intent"
-    query = getattr(options, "query", "") or ""
-    weights = config.MODE_WEIGHTS.get(mode, config.MODE_WEIGHTS["grounding"])
-    engine_names = config.mode_engines(mode, query)
-    if not explicit_mode and config.academic_lookup_requested(query):
-        engine_names = ["academic"]
-        mode_reason = "academic_lookup"
-    elif _v2ex_only_query(query):
-        # No query-search adapter exists in OpenCLI's V2EX catalog.
-        engine_names = [name for name in engine_names if name != "community"]
-    used = tuple((n, float(weights.get(n, 1.0))) for n in engine_names)
-    return DecisionSnapshot(
-        source="legacy",
-        mode=mode,
-        mode_reason=mode_reason,
-        explicit_provider=None,
-        engine_names=tuple(engine_names),
-        weights=used,
-    )
-
-
-def _elapsed_ms(start: float) -> float:
-    """计算从 start 到现在的毫秒数。"""
-    return (time.monotonic() - start) * 1000.0
-
-
-def _event_from_step(step: FallbackStep, elapsed_ms: float, timeout_ms: Optional[float]) -> DiagnosticEvent:
-    """从 FallbackStep 构造 DiagnosticEvent。"""
-    return DiagnosticEvent(
-        engine=step.provider,
-        ok=step.ok,
-        category="search",
-        elapsed_ms=elapsed_ms,
-        timeout_ms=timeout_ms,
-        count=step.count,
-        message=step.error,
-    )
-
-
-async def _run_engine(registry, name, options, budget):
-    """跑单引擎 search，超时/异常隔离，返回 (name, results_or_None, FallbackStep, DiagnosticEvent)。"""
-    start = time.monotonic()
-    if budget <= 0:
-        step = FallbackStep(name, False, 0, "budget exceeded (skipped)")
-        return name, None, step, _event_from_step(step, 0.0, 0.0)
-    engine = registry.get(name)
-    if engine is None:
-        step = FallbackStep(name, False, 0, f"unknown provider: {name}")
-        event = DiagnosticEvent(
-            engine=name, ok=False, category="search",
-            elapsed_ms=_elapsed_ms(start), count=0, message=step.error
-        )
-        return name, None, step, event
-    per_engine = None
-    try:
-        per_engine = min(engine.timeout, budget)
-        res = await asyncio.wait_for(_invoke(engine, "search", options), timeout=per_engine)
-        elapsed = _elapsed_ms(start)
-        if not res:
-            step = FallbackStep(name, False, 0, "empty result")
-            event = DiagnosticEvent(
-                engine=name, ok=False, category="search",
-                elapsed_ms=elapsed, timeout_ms=per_engine * 1000.0, count=0, message=step.error
-            )
-            return name, None, step, event
-        step = FallbackStep(name, True, len(res))
-        event = DiagnosticEvent(
-            engine=name, ok=True, category="search",
-            elapsed_ms=elapsed, timeout_ms=per_engine * 1000.0, count=len(res),
-            details=_result_diagnostic_details(res)
-        )
-        return name, res, step, event
-    except asyncio.TimeoutError:
-        elapsed = _elapsed_ms(start)
-        step = FallbackStep(name, False, 0, "timeout")
-        event = DiagnosticEvent(
-            engine=name, ok=False, category="search",
-            elapsed_ms=elapsed,
-            timeout_ms=per_engine * 1000.0 if per_engine is not None else None,
-            count=0, message="timeout"
-        )
-        return name, None, step, event
-    except RateLimitError:                        # 归一为稳定 token，供 diversity tripwire 判定
-        elapsed = _elapsed_ms(start)
-        step = FallbackStep(name, False, 0, "rate_limit")
-        event = DiagnosticEvent(
-            engine=name, ok=False, category="search",
-            elapsed_ms=elapsed, count=0, message="rate_limit"
-        )
-        return name, None, step, event
-    except EngineTimeoutError:                    # 引擎级超时同 asyncio timeout 归一为 timeout
-        elapsed = _elapsed_ms(start)
-        step = FallbackStep(name, False, 0, "timeout")
-        event = DiagnosticEvent(
-            engine=name, ok=False, category="search",
-            elapsed_ms=elapsed, count=0, message="timeout"
-        )
-        return name, None, step, event
-    except Exception as e:                       # 单引擎异常不拖垮整组
-        elapsed = _elapsed_ms(start)
-        step = FallbackStep(name, False, 0, str(e) or type(e).__name__)
-        event = DiagnosticEvent(
-            engine=name, ok=False, category="search",
-            elapsed_ms=elapsed, count=0, message=step.error,
-            details=_safe_request_diagnostic_details(getattr(e, "details", None)),
-        )
-        return name, None, step, event
-
-
-async def _dispatch(registry, engine_names, options, weights, mode, budget):
-    """并行发射一组引擎 → 跨源 RRF 融合 → canonical 去重。返回 (payload, steps, events)。"""
-    results = await asyncio.gather(
-        *[_run_engine(registry, n, options, budget) for n in engine_names])
-    per_source: Dict[str, List[SearchResult]] = {}
-    steps: List[FallbackStep] = []
-    events: List[DiagnosticEvent] = []
-    for name, res, step, event in results:
-        steps.append(step)
-        events.append(event)
-        if res:
-            per_source[name] = res
-    if not per_source:
-        return None, steps, events
-    fused = _fusion.rrf_fuse(per_source, k=config.RRF_K, weights=weights)
-    deduped = _fusion.dedup_cluster([f["doc"] for f in fused],
-                                    config.COMMUNITY_DEDUP_THRESHOLD)
-    return deduped[:options.count], steps, events
-
-
-# ── Diversity backfill：Brave 失败 → Tavily 条件性独立补源（不入常规路由）──
-_DIVERSITY_BACKFILL_TRIGGER_ERRORS = ("rate_limit", "timeout", "empty result")
-
-
-def _should_diversity_backfill(mode, payload, quality, steps) -> bool:
-    """纯决策 helper：是否触发一次 Tavily 独立补源。
-
-    仅当 ① mode ∈ config.DIVERSITY_BACKFILL_MODES；② 初次 payload 非空；
-    ③ quality 恰为 insufficient 且独立成功来源数 == 1；④ 某 brave 步骤因
-    rate_limit / timeout / empty result 失败；⑤ tavily 尚未尝试 → True。
-    绝不重跑 brave / _dispatch。"""
-    if mode not in config.DIVERSITY_BACKFILL_MODES:
-        return False
-    if not payload:
-        return False
-    if quality is None or quality.verdict != "insufficient":
-        return False
-    if quality.independent_source_count != 1:
-        return False
-    provider = config.DIVERSITY_BACKFILL_PROVIDER
-    if any(step.provider == provider for step in steps):
-        return False
-    return any(
-        step.provider == "brave" and not step.ok
-        and step.error in _DIVERSITY_BACKFILL_TRIGGER_ERRORS
-        for step in steps
-    )
-
-
-def _merge_diversity_backfill(primary, backfill, count):
-    """把 Tavily 结果作为独立来源与已融合的 primary payload 合并。
-
-    经 RRF 重排让非重叠 Tavily 结果按秩交错（不因 primary 简单截断被抹掉），再
-    canonical/标题去重，最后重新套用 count 上限。primary 原始 fusion_sources
-    保留；Tavily 独有结果标记 fusion_sources=[provider]。"""
-    provider = config.DIVERSITY_BACKFILL_PROVIDER
-    orig_sources: Dict[str, List[str]] = {}
-    for doc in primary:
-        key = _fusion.canonical_url(doc.url) or doc.title
-        orig_sources[key] = list(doc.fusion_sources)
-    fused = _fusion.rrf_fuse({"__primary__": primary, provider: backfill}, k=config.RRF_K)
-    deduped = _fusion.dedup_cluster([f["doc"] for f in fused],
-                                    config.COMMUNITY_DEDUP_THRESHOLD)
-    restored: List[SearchResult] = []
-    for doc in deduped:
-        key = _fusion.canonical_url(doc.url) or doc.title
-        sources = set(orig_sources.get(key, []))
-        if provider in doc.fusion_sources:
-            sources.add(provider)
-        restored.append(replace(doc, fusion_sources=sorted(sources)))
-    return restored[:count]
-
-
-def _v6_router_enabled(env: Optional[Dict[str, str]] = None) -> bool:
-    source = os.environ if env is None else env
-    return source.get("WRR_V6_ROUTER") == "1"
-
-
-def _descriptor_backed_registry() -> SearchRegistry:
-    """Build descriptors from the host-authorized process environment only."""
-
-    from .registry import default_registry_v6_shadow
-
-    report = default_registry_v6_shadow(env_files=[])
-    return report.registry
-
-
-def _route_registry(
-    registry: SearchRegistry,
-    *,
-    descriptor_registry_factory=None,
-    env: Optional[Dict[str, str]] = None,
-) -> SearchRegistry:
-    """Return the registry consumed by v5 routing.
-
-    Normal calls keep the provided legacy registry. Shadow routing is activated
-    only by the env flag or by an explicit injected factory in tests/callers.
-    """
-
-    if descriptor_registry_factory is not None:
-        return descriptor_registry_factory()
-    if _v6_router_enabled(env):
-        return _descriptor_backed_registry()
-    return registry
-
-
-# ══════════════════════════════════════════════════════════════════════
-# P1 3b.2：Stage-S decision evidence（selection-only；不授权/不改变执行）
-# 只投影受控值：mode / terminal / outcome / actual_provider / result_count /
-# quality_verdict / elapsed / 既有 shadow_comparison。绝不传 query/result/error 文本。
-# 构造/附着/记录的任何异常都不得改变 legacy 结果或原始异常。
-# ══════════════════════════════════════════════════════════════════════
-
-class _ExecErrorState:
-    """Private, local terminal-classification holder for a single execution.
-
-    Passed by reference into ``_route_search_v5_execute`` so the Stage-S wrapper
-    can distinguish ``recovery_blocked`` vs ``all_engines_failed`` WITHOUT ever
-    mutating the raised exception object. ``terminal`` stays ``None`` until an
-    expected all-fail raise point sets it.
-    """
-
-    __slots__ = ("terminal",)
-
-    def __init__(self) -> None:
-        self.terminal: Optional[str] = None
-
-
-def _utc_now_z() -> str:
-    """Current UTC time as an RFC3339 'Z' timestamp (matches schema validator)."""
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def _safe_payload_count(payload) -> int:
-    """Non-raising result count; empty/None → 0."""
-    try:
-        return len(payload) if payload else 0
-    except Exception:
-        return 0
-
-
-def _success_terminal(plan: DecisionSnapshot, result: RouterResult) -> str:
-    """Derive the Stage-S terminal for a successful return from controlled state."""
-    if plan.explicit_provider is not None:
-        return "explicit_provider"
-    reason = getattr(result.diagnostics, "mode_reason", None) if result.diagnostics else None
-    if reason == "recovery_fallback":
-        return "recovery"
-    return "routed"
-
-
-def _build_success_evidence(
-    request_key: str,
-    plan: DecisionSnapshot,
-    result: RouterResult,
-    shadow_comparison,
-    route_start: float,
-) -> DecisionEvidence:
-    count = _safe_payload_count(result.payload)
-    quality = result.quality
-    return DecisionEvidence(
-        request_key=request_key,
-        recorded_at=_utc_now_z(),
-        mode=result.mode,
-        terminal=_success_terminal(plan, result),
-        outcome="success" if count > 0 else "empty",
-        actual_provider=result.actual_provider,
-        result_count=count,
-        quality_verdict=quality.verdict if quality is not None else None,
-        route_elapsed_ms=_elapsed_ms(route_start),
-        shadow_comparison=shadow_comparison,
-    )
-
-
-def _build_error_evidence(
-    request_key: str,
-    plan: Optional[DecisionSnapshot],
-    terminal: str,
-    shadow_comparison,
-    route_start: float,
-) -> DecisionEvidence:
-    return DecisionEvidence(
-        request_key=request_key,
-        recorded_at=_utc_now_z(),
-        # None for explicit provider, or when planning itself failed (no plan).
-        mode=plan.mode if plan is not None else None,
-        terminal=terminal,
-        outcome="error",
-        actual_provider=None,
-        result_count=0,
-        quality_verdict="failed",
-        route_elapsed_ms=_elapsed_ms(route_start),
-        shadow_comparison=shadow_comparison,
-    )
-
-
-def _safe_record(sink, evidence: DecisionEvidence | DecisionEvidenceV2) -> None:
-    """Best-effort sink record; never raises. No-op when sink is None."""
-    if sink is None:
-        return
-    try:
-        sink.record(evidence)
-    except Exception:
-        return
-
-
-def _project_v2_or_keep_v1(
-    evidence: DecisionEvidence,
-    observation: Optional[DecisionContextObservation],
-    version: int,
-    comparison_status: str,
-    execution_protection: str,
-) -> DecisionEvidence | DecisionEvidenceV2:
-    """Opt-in v2 projection; incomplete/invalid input preserves the v1 row."""
-    if type(version) is not int or version != 2 or observation is None:
-        return evidence
-    try:
-        return project_decision_evidence_v2(
-            evidence,
-            observation,
-            comparison_status=comparison_status,
-            execution_protection=execution_protection,
-        )
-    except Exception:
-        return evidence
-
-
-def _normalize_decision_context_observation(observation):
-    """Return one exact coherent observation, otherwise the v1 fallback sentinel."""
-    if type(observation) is not DecisionContextObservation:
-        return None
-    context = observation.context
-    status = observation.status
-    cohort_id = observation.cohort_id
-    if type(status) is not str:
-        return None
-    if context is not None and type(context) is not DecisionContext:
-        return None
-    if cohort_id is not None and type(cohort_id) is not str:
-        return None
-    has_context = context is not None
-    has_cohort = cohort_id is not None
-    coherent = (
-        (status == "cold" and not has_context and not has_cohort)
-        or (status == "available" and has_context and has_cohort)
-        or (status == "refresh_failed" and has_context == has_cohort)
-    )
-    return observation if coherent else None
-
-
-def _execution_protection(shadow_comparison, outcome: str) -> str:
-    """Project the router-observed U4 protection state from execution outcome."""
-    if shadow_comparison is None:
-        return "unobservable"
-    if shadow_comparison.descriptor_provider_ids:
-        return "not_required"
-    return {
-        "success": "protected_by_legacy",
-        "empty": "unprotected_empty",
-        "error": "unprotected_error",
-    }[outcome]
-
-
-def _attach_success_evidence(
-    result: RouterResult,
-    sink,
-    request_key: Optional[str],
-    plan: DecisionSnapshot,
-    shadow_comparison,
-    route_start: float,
-    observation=None,
-    evidence_version: int = 1,
-    comparison_status: str = "comparison_failed",
-) -> None:
-    """Build → attach to RouteTrace → record. Fully fault-swallowing.
-
-    Attachment happens before recording so a sink failure still leaves the
-    evidence on the returned RouteTrace.
-    """
-    if request_key is None:
-        return
-    try:
-        evidence = _build_success_evidence(
-            request_key, plan, result, shadow_comparison, route_start
-        )
-        protection = _execution_protection(shadow_comparison, evidence.outcome)
-        evidence = _project_v2_or_keep_v1(
-            evidence,
-            observation,
-            evidence_version,
-            comparison_status,
-            protection,
-        )
-    except Exception:
-        return
-    try:
-        if result.diagnostics is not None:
-            result.diagnostics.decision_evidence = evidence
-    except Exception:
-        return
-    _safe_record(sink, evidence)
-
-
-def _record_error_evidence(
-    sink,
-    request_key: Optional[str],
-    plan: Optional[DecisionSnapshot],
-    terminal: str,
-    shadow_comparison,
-    route_start: float,
-    observation=None,
-    evidence_version: int = 1,
-    comparison_status: str = "comparison_failed",
-) -> None:
-    """Best-effort error-evidence record; never raises (never masks re-raise)."""
-    if request_key is None:
-        return
-    try:
-        evidence = _build_error_evidence(
-            request_key, plan, terminal, shadow_comparison, route_start
-        )
-        protection = _execution_protection(shadow_comparison, evidence.outcome)
-        evidence = _project_v2_or_keep_v1(
-            evidence,
-            observation,
-            evidence_version,
-            comparison_status,
-            protection,
-        )
-    except Exception:
-        return
-    _safe_record(sink, evidence)
-
-
-_PUBLIC_FILTER_PROVIDERS = frozenset({"exa", "deepseek", "brave", "searxng", "tavily", "academic"})
-
-
-async def _apply_search_filter(options, result: RouterResult, route_start: float) -> RouterResult:
-    """One optional post-retrieval decision; never another retrieval or evidence source."""
-    if not config.JEV_FILTER_ENABLED:
-        return result
-    query = getattr(options, "query", "") or ""
-    count = _safe_payload_count(result.payload)
-    reason = None
-    if config.academic_lookup_requested(query):
-        reason = "exact_bibliographic_lookup"
-    elif result.mode == "local" or config.local_triggered(query):
-        reason = "local_scope"
-    elif (not result.fallback_chain or any(
-        step.ok and step.provider not in _PUBLIC_FILTER_PROVIDERS
-        for step in result.fallback_chain
-    )):
-        # Logged-in/custom sources can return private material at public URLs.
-        reason = "non_public_provider_scope"
-    elif not count:
-        reason = "empty_candidates"
-    key = config.get_env("TYPESAFE_API_KEY")
-    remaining = max(0.0, config.budget_for("search") - (time.monotonic() - route_start))
-    if reason is None and not key:
-        reason = "missing_key"
-    if reason is None and remaining <= 0:
-        reason = "budget_exhausted"
-    trace = result.diagnostics
-    if trace is None:
-        trace = RouteTrace(mode=result.mode)
-        result.diagnostics = trace
-    if reason is not None:
-        trace.search_filter = {
-            "status": "skipped", "reason": reason, "input_count": count,
-            "selected_count": count, "evaluated_count": 0, "sent_count": 0,
-            "unjudged_ids": list(range(count)),
-        }
-        return result
-    from .search_filter import filter_results
-    outcome = await filter_results(
-        query, result.payload, api_key=key,
-        timeout=min(config.JEV_FILTER_TIMEOUT, remaining),
-    )
-    result.payload = outcome.results
-    trace.search_filter = outcome.diagnostics
-    trace.elapsed_ms = _elapsed_ms(route_start)
-    quality = trace.quality
-    if quality is not None:
-        if not result.payload:
-            trace.quality = replace(
-                quality, verdict="insufficient",
-                reasons=[*quality.reasons, "search_filter_empty"],
-            )
-        elif outcome.diagnostics["status"] == "fail_open":
-            trace.quality = replace(
-                quality,
-                verdict="degraded_success" if quality.verdict == "complete" else quality.verdict,
-                reasons=[*quality.reasons, "search_filter_unavailable"],
-            )
-    return result
-
-
-async def _route_search_v5_execute(
-    options,
-    registry: SearchRegistry,
-    plan: DecisionSnapshot,
-    shadow_comparison,
-    route_start: float,
-    error_state: _ExecErrorState,
-) -> RouterResult:
-    """Plan execution body (registry already resolved). Returns a RouterResult or
-    raises. Expected all-fail raise points set ``error_state.terminal`` (a private
-    local holder) so the Stage-S wrapper can classify recovery_blocked vs
-    all_engines_failed WITHOUT attaching any metadata to the exception object."""
-    # From this point an AllEnginesFailedError is an execution terminal. Before
-    # this function is entered (for example planning), the holder stays None and
-    # the wrapper classifies that exception as execution_error instead.
-    error_state.terminal = "all_engines_failed"
-
-    # 显式 provider → 单引擎（复用 v4 route 语义，禁用 mode 路由）
-    if plan.explicit_provider:
-        result = await route("search", options, registry,
-                             explicit_provider=plan.explicit_provider)
-        result.shadow_comparison = shadow_comparison
-        return result
-
-    mode = plan.mode
-    mode_reason = plan.mode_reason
-    budget = config.budget_for("search")
-    weights = dict(plan.weights)
-    engine_names = list(plan.engine_names)
-
-    payload, steps, events = await _dispatch(registry, engine_names, options, weights, mode, budget)
-
-    # Diversity backfill：Brave 因 rate_limit/timeout/empty 失败、仅剩单一独立来源时，
-    # 条件性调用一次 Tavily 作为独立补源（不入常规路由；永不重跑 brave/_dispatch，
-    # 不触碰 OpenCLI/browser）。放在 local stale / recovery 之前。
-    if payload is not None:
-        pre_quality = _route_quality(mode, engine_names, steps, True)
-        if _should_diversity_backfill(mode, payload, pre_quality, steps):
-            provider = config.DIVERSITY_BACKFILL_PROVIDER
-            engine_names.append(provider)          # selected_engines 真实记录 tavily 被尝试
-            _, bf_res, bf_step, bf_event = await _run_engine(
-                registry, provider, options,
-                min(config.DIVERSITY_BACKFILL_TIMEOUT_SECONDS,
-                    max(0.0, budget - (time.monotonic() - route_start))))
-            steps.append(bf_step)
-            events.append(bf_event)
-            if bf_res:
-                payload = _merge_diversity_backfill(payload, bf_res, options.count)
-            # 失败/unknown：保留 primary payload；quality 在末尾按 steps 重算。
-
-    # v5.3 全量陈旧门控：local mode 下所有结果 freshness < 0.8 → 追加外网交叉
-    if mode == "local" and payload is not None:
-        if all(getattr(r, "freshness_score", 1.0) < 0.8 for r in payload):
-            web_mode = config.classify_intent(getattr(options, "query", "") or "")
-            if web_mode == "local":
-                web_mode = "discovery"
-            web_engines = config.mode_engines(web_mode, getattr(options, "query", "") or "")
-            attempted = {step.provider for step in steps}
-            web_engines = [name for name in web_engines if name not in attempted]
-            web_weights = config.MODE_WEIGHTS.get(web_mode, config.MODE_WEIGHTS["grounding"])
-            wpayload, wsteps, wevents = await _dispatch(registry, web_engines, options, web_weights,
-                                               web_mode, max(0.0, budget - (time.monotonic() - route_start)))
-            steps.extend(wsteps)
-            events.extend(wevents)
-            if wpayload is not None:
-                # 合并：web 结果在前（更新），本地垫后
-                payload = _fusion.dedup_cluster(
-                    wpayload + payload, config.COMMUNITY_DEDUP_THRESHOLD
-                )[:options.count]
-
-    # 主 mode 空 → recovery 兜底（Brave + Exa + SearXNG）
-    if payload is None and mode != "recovery" and plan.mode_reason != "academic_lookup":
-        if not config.recovery_allowed():
-            reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
-            error_state.terminal = "recovery_blocked"
-            trace = RouteTrace(
-                mode=mode,
-                mode_reason=mode_reason,
-                selected_engines=[step.provider for step in steps],
-                events=events,
-                elapsed_ms=_elapsed_ms(route_start),
-                timeout_ms=budget * 1000.0,
-                quality=_route_quality(mode, engine_names, steps, False),
-            )
-            raise AllEnginesFailedError(
-                f"All engines failed for search (mode={mode}) and recovery is blocked in this runtime:\n{reasons}",
-                diagnostics=trace,
-            )
-        rec_weights = config.MODE_WEIGHTS["recovery"]
-        rec_names = config.mode_engines("recovery", getattr(options, "query", "") or "")
-        attempted = {step.provider for step in steps}
-        rec_names = [name for name in rec_names if name not in attempted]
-        rpayload, rsteps, revents = await _dispatch(registry, rec_names, options, rec_weights,
-                                           "recovery", max(0.0, budget - (time.monotonic() - route_start)))
-        steps.extend(rsteps)
-        events.extend(revents)
-        if rpayload is not None:
-            route_elapsed = _elapsed_ms(route_start)
-            quality = _route_quality("recovery", rec_names, steps, bool(rpayload))
-            trace = RouteTrace(
-                mode="recovery",
-                mode_reason="recovery_fallback",
-                selected_engines=rec_names,
-                events=events,
-                elapsed_ms=route_elapsed,
-                timeout_ms=budget * 1000.0,
-                quality=quality,
-            )
-            return RouterResult(actual_provider=f"rrf:recovery", payload=rpayload,
-                                fallback_chain=steps, mode="recovery",
-                                fusion_method="rrf", weights=dict(rec_weights),
-                                diagnostics=trace,
-                                shadow_comparison=shadow_comparison)
-
-    if payload is None:
-        reasons = "\n".join(f"  - {s.provider}: {s.error}" for s in steps if not s.ok)
-        error_state.terminal = "all_engines_failed"
-        trace = RouteTrace(
-            mode=mode,
-            mode_reason=mode_reason,
-            selected_engines=[step.provider for step in steps],
-            events=events,
-            elapsed_ms=_elapsed_ms(route_start),
-            timeout_ms=budget * 1000.0,
-            quality=_route_quality(mode, [step.provider for step in steps], steps, False),
-        )
-        raise AllEnginesFailedError(
-            f"All engines failed for search (mode={mode}):\n{reasons}",
-            diagnostics=trace,
-        )
-
-    route_elapsed = _elapsed_ms(route_start)
-    quality = _route_quality(
-        mode, [step.provider for step in steps], steps, bool(payload)
-    )
-    trace = RouteTrace(
-        mode=mode,
-        mode_reason=mode_reason,
-        selected_engines=engine_names,
-        events=events,
-        elapsed_ms=route_elapsed,
-        timeout_ms=budget * 1000.0,
-        quality=quality,
-    )
-    used = {n: weights.get(n, 1.0) for n in engine_names}
-    return RouterResult(actual_provider=f"rrf:{mode}", payload=payload,
-                        fallback_chain=steps, mode=mode,
-                        fusion_method="rrf", weights=used,
-                        diagnostics=trace,
-                        shadow_comparison=shadow_comparison)
-
-
-async def route_search_v5(
-    options,
-    registry: SearchRegistry,
-    *,
-    descriptor_registry_factory=None,
-    decision_context: Optional[DecisionContext] = None,
-    decision_context_observation: Optional[DecisionContextObservation] = None,
-    shadow_evaluated_at: Optional[float] = None,
-    stage_s_enabled: Optional[bool] = None,
-    decision_evidence_version: int = 1,
-    decision_evidence_sink: "Optional[DecisionEvidenceSink]" = None,
-    request_key: Optional[str] = None,
-) -> RouterResult:
-    """v5 搜索路由：classify_intent → mode → 并行引擎 → RRF 融合 → 去重排序。
-
-    显式 options.provider 仍走单引擎（兼容 v4 语义）。主 mode 空结果 → recovery 兜底。
-
-    Stage S 三态归一化合同（``stage_s_enabled`` keyword-only）：
-      - ``None`` → 由 context 存在与否推断（保持既有调用兼容）。
-      - ``True`` → Stage S enabled：强制 caller legacy registry，禁止 descriptor
-        replacement（即便 ``WRR_V6_ROUTER=1`` 或注入 factory）。
-      - ``False`` → Stage S disabled：保持旧 ``_route_registry`` 行为。
-    ``False`` 与注入 ``decision_context`` 互斥（语义矛盾）→ ``ValueError``，
-    且在触碰 registry factory 之前抛出。
-    ``decision_evidence_version=2`` 仅在 exact、原子一致的 observation 可用时
-    投影 v2；缺失/partial/incoherent observation 回退 v1，避免半启用。
-    ``request_key`` 允许 composition 层注入 canonical request identity；仅当值为
-    ``None`` 时才保留既有 UUIDv4 fallback。Stage S OFF 不消费该值。
-    """
-    decision_context_observation = _normalize_decision_context_observation(
-        decision_context_observation
-    )
-    if decision_context_observation is not None:
-        decision_context = decision_context_observation.context
-    # 合同校验先于任何 registry factory 执行：False + context 语义矛盾。
-    if stage_s_enabled is False and (
-        decision_context is not None or decision_context_observation is not None
-    ):
-        raise ValueError(
-            "stage_s_enabled=False is incompatible with an injected decision_context"
-        )
-    # 归一化：None 由 context 存在推断，显式 True/False 直接生效。
-    stage_s_on = (decision_context is not None) if stage_s_enabled is None else stage_s_enabled
-
-    route_start = time.monotonic()
-
-    # Stage S OFF：完全保持 legacy 行为，绝不 mint/attach/record evidence（即便传 sink）。
-    # descriptor registry replacement 仅保留给 Stage S 未启用的调用。
-    if not stage_s_on:
-        registry = _route_registry(
-            registry,
-            descriptor_registry_factory=descriptor_registry_factory,
-        )
-        plan = legacy_selection_plan(options)
-        result = await _route_search_v5_execute(
-            options, registry, plan, None, route_start, _ExecErrorState()
-        )
-        return await _apply_search_filter(options, result, route_start)
-
-    # Stage S ON：composition 可显式注入 request identity；旧 caller 仍 best-effort
-    # mint UUIDv4。显式值不重 mint、不规范化；非法值由 evidence schema 拒绝并按
-    # 既有 fail-open 语义仅关闭本请求 evidence，不影响 legacy 用户结果。
-    if request_key is None:
-        try:
-            request_key = str(_uuid.uuid4())
-        except Exception:
-            request_key = None
-    error_state = _ExecErrorState()
-    plan: Optional[DecisionSnapshot] = None
-    shadow_comparison = None
-    if decision_context is not None:
-        comparison_status = "comparison_failed"
-    elif (
-        decision_context_observation is not None
-        and decision_context_observation.status == "refresh_failed"
-    ):
-        comparison_status = "context_build_failed"
-    else:
-        comparison_status = "context_unavailable"
-    try:
-        # P1 S1：纯选择，得到 DecisionSnapshot（显式 provider 也生成单元素 snapshot）。
-        plan = legacy_selection_plan(options)
-
-        # P1 S3a：只消费注入 context。任何异常（含过期）只关闭 shadow，不改变 legacy 执行。
-        if decision_context is not None:
-            try:
-                from .selection_shadow import compare_shadow_selection
-
-                shadow_comparison = compare_shadow_selection(
-                    options,
-                    decision_context,
-                    evaluated_at=(
-                        time.time() if shadow_evaluated_at is None else shadow_evaluated_at
-                    ),
-                    legacy_plan=plan,
-                )
-                comparison_status = "compared"
-            except Exception as exc:
-                shadow_comparison = None
-                try:
-                    reason = getattr(exc, "reason", None)
-                except Exception:
-                    reason = None
-                comparison_status = (
-                    reason
-                    if type(reason) is str
-                    and reason in {"context_expired", "context_mismatch"}
-                    else "comparison_failed"
-                )
-
-        result = await _route_search_v5_execute(
-            options, registry, plan, shadow_comparison, route_start, error_state
-        )
-        result = await _apply_search_filter(options, result, route_start)
-    except AllEnginesFailedError:
-        # Planning-time AllEnginesFailed is still an unexpected planning error;
-        # execute() sets the private state before any expected execution terminal.
-        terminal = error_state.terminal or "execution_error"
-        _record_error_evidence(
-            decision_evidence_sink,
-            request_key,
-            plan,
-            terminal,
-            shadow_comparison,
-            route_start,
-            observation=decision_context_observation,
-            evidence_version=decision_evidence_version,
-            comparison_status=comparison_status,
-        )
-        raise
-    except Exception:
-        # 非预期异常（含 planning 意外抛出）：execution_error，best-effort 记录后
-        # 原样 re-raise（identity 不变）。
-        _record_error_evidence(
-            decision_evidence_sink,
-            request_key,
-            plan,
-            "execution_error",
-            shadow_comparison,
-            route_start,
-            observation=decision_context_observation,
-            evidence_version=decision_evidence_version,
-            comparison_status=comparison_status,
-        )
-        raise
-
-    # 成功：构造 evidence → 附着到 RouteTrace（先于记录）→ best-effort 记录同一对象。
-    _attach_success_evidence(
-        result,
-        decision_evidence_sink,
-        request_key,
-        plan,
-        shadow_comparison,
-        route_start,
-        observation=decision_context_observation,
-        evidence_version=decision_evidence_version,
-        comparison_status=comparison_status,
-    )
-    return result

@@ -565,15 +565,13 @@ def test_doctor_v6_non_deep_reuses_live_cache_with_diagnostic_truth(tmp_path, mo
     assert marker.exists()
     marker.unlink()
 
-    # Inject V6_ROUTER env for diagnostic truth
-    test_env = {"WRR_V6_ROUTER": "auto"}
     monkeypatch.setattr("wrr.engines.registry._live_probe_check", _explode)
 
     # Non-deep doctor_v6 must reuse live cache without probing
     payload = doctor_v6(
         runtime_hint="standalone",
         cwd=tmp_path,
-        env=test_env,
+        env={},
         plugin_paths=[plugin_paths],
         deep=False,
         trust_project=True,
@@ -589,51 +587,11 @@ def test_doctor_v6_non_deep_reuses_live_cache_with_diagnostic_truth(tmp_path, mo
     assert isinstance(probe_health.get("health_cache_age_ms"), (int, float))
     assert probe_health.get("health_cache_expires_at") is not None
 
-    # Router enables descriptor routing only for the literal WRR_V6_ROUTER="1".
-    assert payload["summary"].get("v6_router_enabled") is False
-    assert payload["summary"].get("v6_router_setting") == "auto"
-
     # Assert additive diagnostics in resolved
     probe_descriptor = next(item for item in payload["resolved"] if item["id"] == "probe")
     assert probe_descriptor.get("registry_source") is not None
     assert probe_descriptor.get("routable_reason") is not None
     assert "routable_reasons" in probe_descriptor
-
-
-def test_v6_router_enabled_semantic_bool_from_env(tmp_path, monkeypatch):
-    """Doctor must mirror router.py's strict WRR_V6_ROUTER == "1" contract."""
-    plugin_paths, _marker = _plugin(tmp_path)
-
-    def summary(env):
-        return doctor_v6(
-            runtime_hint="standalone",
-            cwd=tmp_path,
-            env=env,
-            plugin_paths=[plugin_paths],
-            deep=False,
-            trust_project=True,
-        ).to_dict()["summary"]
-
-    enabled = summary({"WRR_V6_ROUTER": "1"})
-    assert enabled["v6_router_enabled"] is True
-    assert enabled["v6_router_setting"] == "1"
-
-    disabled = summary({"WRR_V6_ROUTER": "0"})
-    assert disabled["v6_router_enabled"] is False
-    assert disabled["v6_router_setting"] == "0"
-
-    auto = summary({"WRR_V6_ROUTER": "auto"})
-    assert auto["v6_router_enabled"] is False
-    assert auto["v6_router_setting"] == "auto"
-
-    # router.py ignores this legacy-looking alias entirely.
-    alias_only = summary({"V6_ROUTER": "1"})
-    assert alias_only["v6_router_enabled"] is False
-    assert "v6_router_setting" not in alias_only
-
-    unset = summary({})
-    assert unset["v6_router_enabled"] is False
-    assert "v6_router_setting" not in unset
 
 
 def test_health_source_diagnostic_for_all_paths(tmp_path, monkeypatch, mock_builtin_opencli):

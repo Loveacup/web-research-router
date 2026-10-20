@@ -26,7 +26,6 @@ import asyncio
 import dataclasses
 import json
 import os
-import stat
 import sys
 
 # ── 作为包内模块运行时，wrr 包由 pip 安装保证可 import；不需要手动 sys.path 注入 ──
@@ -76,44 +75,6 @@ def _emit_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
-def cmd_evidence_gate(ns) -> int:
-    """Evaluate an explicit evidence JSONL path without loading runtime env."""
-    from .evidence_gate import MAX_FILE_BYTES, evaluate_jsonl
-
-    fd = None
-    try:
-        fd = os.open(ns.path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            _eprint("evidence-gate: --path must reference a regular file")
-            return 2
-        if metadata.st_size > MAX_FILE_BYTES:
-            _eprint("evidence-gate: input exceeds the supported size limit")
-            return 2
-        with os.fdopen(fd, "rb") as stream:
-            fd = None  # fdopen owns and closes the descriptor.
-            report = evaluate_jsonl(stream, requested_modes=ns.mode).to_dict()
-    except OSError:
-        _eprint("evidence-gate: unable to read --path")
-        return 2
-    except Exception:
-        _eprint("evidence-gate: evaluation failed")
-        return 2
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-    try:
-        if ns.json:
-            print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-        else:
-            print(f"{report['gate']}: {report['status']}")
-            for mode in report["modes"]:
-                reasons = ",".join(mode["reasons"]) or "none"
-                print(f"  {mode['mode']}: {mode['status']} (selection={mode['selection_status']}; {reasons})")
-    except (BrokenPipeError, OSError):
-        return 2
-    return 0 if report["status"] == "READY" else 1
 
 def cmd_host_fetch_result(ns) -> int:
     """Evaluate one accepted host-native fetch return from bounded JSON stdin."""
@@ -196,11 +157,9 @@ def _chain_to_list(result) -> list:
 # ── 运行单个动作（统一异常 → 退出码）─────────────────────────────────
 async def _run(operation: str, options, provider: str | None):
     from wrr.registry import get_registry
-    from wrr.router import route, route_search_v5
+    from wrr.router import route
 
     registry = get_registry()
-    if operation == "search":
-        return await route_search_v5(options, registry)
     return await route(operation, options, registry, explicit_provider=provider)
 
 
@@ -374,7 +333,7 @@ def cmd_similar(ns) -> int:
 
 def cmd_test(ns) -> int:
     """冒烟测试或单元测试入口。"""
-    from wrr.schemas import SearchOptions, ExtractOptions, SimilarOptions
+    from wrr.schemas import ExtractOptions, SimilarOptions
     from wrr.errors import WRRError
 
     if ns.what == "unit":
@@ -382,8 +341,6 @@ def cmd_test(ns) -> int:
 
     prov = ns.provider
     cases = [
-        ("search", SearchOptions(query="hello world", count=3,
-                                 provider=prov, mode=None)),
         ("extract", ExtractOptions(url="https://example.com",
                                    max_characters=500, provider=prov)),
         # similar 仅 Exa 支持；显式 provider 非 exa 时跳过
@@ -434,7 +391,6 @@ def cmd_test_unit(ns) -> int:
     import subprocess
 
     env = os.environ.copy()
-    env["WRR_V6_ROUTER"] = "0"
     args = ["pytest", "tests/unit", "-q"]
     if ns.json:
         args = ["pytest", "tests/unit", "-q", "--json-report"]
@@ -697,7 +653,6 @@ def _cmd_env_report(ns) -> int:
         ("BRAVE_API_KEY", "brave", "web search"),
         ("GITHUB_TOKEN", "github", "GitHub repo/issue search"),
         ("SEARXNG_URL", "searxng", "SearXNG self-hosted / recovery"),
-        ("WRR_V6_ROUTER", "v6 router", "v6 descriptor-backed registry (1=enabled)"),
         ("OPENROUTER_API_KEY", "(not directly used by WRR)", "Hermes/OpenRouter only"),
     ]
     report = []
@@ -729,7 +684,6 @@ def _cmd_env_report(ns) -> int:
         print(f"{r['env']:<20} {mark.get(r['status'], r['status']):<8} {r['engines']:<22} {r['impact']}")
     print()
     print("Notes:")
-    print("  • WRR_V6_ROUTER=1 enables the v6 descriptor router; unset falls back to v5 mode/RRF.")
     print("  • GITHUB_TOKEN absence makes github engine unavailable.")
     print("  • SEARXNG_URL absence uses built-in defaults or disables recovery mode.")
     print("  • OPENROUTER_API_KEY is not consumed by WRR itself; use it in Hermes/OpenRouter.")
@@ -811,16 +765,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="测试类型：smoke（默认）或 unit")
     tp.set_defaults(func=cmd_test)
 
-    from .evidence_gate import MODES
-
-    ep = sub.add_parser(
-        "evidence-gate",
-        help="离线只读聚合 Stage-S decision evidence；不会改 rollout/config",
-    )
-    ep.add_argument("--path", required=True, metavar="FILE", help="显式 JSONL 文件路径（无默认 live path）")
-    ep.add_argument("--mode", action="append", choices=MODES, help="仅评估指定 mode；可重复")
-    ep.add_argument("--json", action="store_true", help="输出稳定机器可读 JSON")
-    ep.set_defaults(func=cmd_evidence_gate)
 
     hp = sub.add_parser(
         "host-fetch-result",
@@ -937,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
 
-    if ns.cmd in {"evidence-gate", "host-fetch-result", "host-fetch-eligibility"}:
+    if ns.cmd in {"host-fetch-result", "host-fetch-eligibility"}:
         return ns.func(ns)
 
     use_v6_env = ns.cmd in {"install", "inventory"} or (ns.cmd == "doctor" and getattr(ns, "v6", False))

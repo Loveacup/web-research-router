@@ -12,7 +12,6 @@ import pytest
 from wrr.engines import community as cm
 from wrr.schemas import SearchOptions
 from wrr.errors import EngineError
-from wrr.router import build_chain
 from wrr import config
 
 
@@ -142,13 +141,6 @@ def test_detect_sources_last30days_gated():
         assert "last30days_en" in s2
     finally:
         config.COMMUNITY_INCLUDE_LAST30DAYS = False
-
-
-def test_community_triggered():
-    assert config.community_triggered("foo site:reddit.com")
-    assert config.community_triggered("X SITE:X.COM")
-    assert not config.community_triggered("site:v2ex.com python")
-    assert not config.community_triggered("plain query")
 
 
 # ── search 聚合（mock 子进程）────────────────────────────────────────
@@ -629,14 +621,6 @@ def test_hackernews_time_enrichment_timeout_bounded():
     # 超时不影响返回（保持原始 item）
     assert len(items) == 1
     assert "time" not in items[0]
-
-
-# ── 自动触发链 ───────────────────────────────────────────────────────
-def test_build_chain_promotes_community():
-    assert build_chain("search", None, "x site:reddit.com") == \
-        ["community", "exa", "deepseek", "brave", "github", "searxng"]
-    assert build_chain("search", None, "plain") == \
-        ["exa", "deepseek", "brave", "github", "community", "searxng"]
 
 
 # ── OpenCLI 断开快速失败（端到端时延）───────────────────────────────────

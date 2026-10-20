@@ -304,16 +304,3 @@ def test_malformed_committed_operation_is_stable_refusal(operation):
         _validate_state(state)
 
 
-def test_evidence_gate_does_not_import_runtime_config(tmp_path):
-    import subprocess
-    import sys
-
-    evidence = tmp_path / "evidence.jsonl"
-    evidence.write_text("")
-    result = subprocess.run([sys.executable, "-c", '''
-import sys
-from wrr import _cli
-assert _cli.main(['evidence-gate', '--path', sys.argv[1], '--json']) == 1
-assert 'wrr.config' not in sys.modules
-''', str(evidence)], capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr

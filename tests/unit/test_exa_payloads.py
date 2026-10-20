@@ -59,16 +59,16 @@ def test_exa_similar_uses_findsimilar_endpoint():
 def test_exa_search_uses_mode_timeout():
     _patch({"results": [{"title": "T", "url": "U", "text": "body", "highlights": []}]}, "k")
     eng = exa_mod.ExaEngine()
-    run(eng.search(SearchOptions("hello", mode="deep")))
+    run(eng.search(SearchOptions("hello", exa_mode="deep")))
     # 从 captured 中找到 INIT 记录
     init_record = [r for r in FakeAsyncClient.captured if r.get("method") == "INIT"][0]
     assert init_record["kwargs"]["timeout"] == config.EXA_MODE_TIMEOUT["deep"]
 
 
-def test_exa_search_payload_uses_exa_mode_when_route_mode_is_also_set():
+def test_exa_search_payload_uses_native_exa_mode():
     _patch({"results": [{"title": "T", "url": "U", "text": "body", "highlights": []}]}, "k")
     eng = exa_mod.ExaEngine()
-    run(eng.search(SearchOptions("hello", route_mode="research", exa_mode="fast")))
+    run(eng.search(SearchOptions("hello", exa_mode="fast")))
     sent = [r for r in FakeAsyncClient.captured if r.get("method") == "POST"][0]
     init_record = [r for r in FakeAsyncClient.captured if r.get("method") == "INIT"][0]
     assert sent["json"]["type"] == "fast"
