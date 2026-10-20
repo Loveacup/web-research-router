@@ -175,3 +175,50 @@ asyncio.run(main())
         if process.poll() is None:
             process.kill()
             process.wait(timeout=3)
+
+
+def test_omp_skill_handoff_projects_only_single_source_core_evidence():
+    from copy import deepcopy
+    import shutil
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the OMP extension contract")
+    evidence = {
+        "plan": {"sources": ["skill"]},
+        "runs": [{"source_id": "skill", "status": "ok"}],
+        "results": [{"title": "demo", "url": "https://github.com/acme/skills/tree/main/demo",
+                     "contributions": [{"source_id": "skill", "rank": 1}]}],
+        "quality": {"executed": "ok"},
+    }
+    rejected = []
+    for field, value in [
+        ("quality", {"executed": "cancelled"}),
+        ("plan", {"sources": ["skill", "exa"]}),
+        ("runs", [{"source_id": "skill", "status": "error"}]),
+        ("results", []),
+        ("results", [{"title": "demo", "url": "https://example.org",
+                      "contributions": [{"source_id": "exa", "rank": 1}]}]),
+    ]:
+        changed = deepcopy(evidence)
+        changed[field] = value
+        rejected.append(changed)
+    rejected.append({"operation": "search", "ok": True, "provider": "skill",
+                     "result": [{"title": "demo", "url": "https://example.org",
+                                 "source_tag": "skill"}]})
+    program = """
+import { readFileSync } from "node:fs";
+import { projectCandidate } from "./integrations/omp.mjs";
+const inputs = JSON.parse(readFileSync(0, "utf8"));
+console.log(JSON.stringify(inputs.map(projectCandidate)));
+"""
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", program],
+        input=json.dumps([evidence, *rejected]), text=True, capture_output=True,
+        cwd=Path(__file__).resolve().parents[2], timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [
+        {"name": "demo", "url": evidence["results"][0]["url"], "source_tag": "skill"},
+        *[None for _ in rejected],
+    ]

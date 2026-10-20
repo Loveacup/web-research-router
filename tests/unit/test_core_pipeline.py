@@ -291,10 +291,6 @@ def test_cli_search_uses_core_evidence_json(monkeypatch, capsys):
     assert "result" not in payload
 
 
-def test_cli_removed_route_mode_reports_error(capsys):
-    from wrr import _cli
-    assert _cli.main(["search", "benchmarks", "--route-mode", "research", "--json"]) == 2
-    assert "--route-mode 已移除" in capsys.readouterr().err
 
 
 def test_judge_failure_cannot_bypass_local_injection_screen():

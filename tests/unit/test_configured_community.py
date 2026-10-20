@@ -82,7 +82,7 @@ def test_configured_catalog_without_optional_mappings_reaches_cli(tmp_path, kind
     path.chmod(0o600)
     envfile = tmp_path / "empty.env"
     envfile.touch()
-    env = dict(os.environ, WRR_V6_ROUTER="0", WRR_COMMUNITY_CONFIG=str(path),
+    env = dict(os.environ, WRR_COMMUNITY_CONFIG=str(path),
                WRR_ENV=str(envfile), TYPESAFE_API_KEY="")
     inventory_run = subprocess.run(
         [sys.executable, str(project / "wrr-cli.py"), "inventory", "--json"],

@@ -299,7 +299,7 @@ def test_text_cli_identifies_target_candidate_and_exact_pin(repo_case):
     empty_env = source.parent / "empty.env"
     empty_env.write_text("")
     env = dict(os.environ, WRR_ENV=str(empty_env), PYTHONPATH=str(root),
-               WRR_CACHE_DIR=str(source.parent / "cache"), WRR_V6_ROUTER="0")
+               WRR_CACHE_DIR=str(source.parent / "cache"))
     completed = subprocess.run(
         [sys.executable, str(root / "wrr-cli.py"), "update", "--apply", "--trust-project",
          "--owned-repo", str(target), "--candidate-root", str(candidates)],

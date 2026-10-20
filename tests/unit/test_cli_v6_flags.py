@@ -58,33 +58,8 @@ def test_old_cli_examples_still_parse():
     assert similar.count == 5
 
 
-def test_search_route_and_exa_mode_flags_are_orthogonal_and_legacy_alias_parses():
-    cli = _load_cli_module()
-    parser = cli.build_parser()
-
-    both = parser.parse_args([
-        "search", "q", "--route-mode", "research", "--exa-mode", "fast",
-    ])
-    assert both.route_mode == "research"
-    assert both.exa_mode == "fast"
-    assert both.mode is None
-
-    legacy = parser.parse_args(["search", "q", "--mode", "deep"])
-    assert legacy.mode == "deep"
-    assert legacy.exa_mode is None
-    assert legacy.route_mode is None
 
 
-@pytest.mark.parametrize("exa_mode", [None, "fast", "deep"])
-def test_cmd_search_rejects_legacy_mode_with_migration_hint(exa_mode):
-    args = ["search", "q", "--mode", "deep", "--json"]
-    if exa_mode is not None:
-        args += ["--exa-mode", exa_mode]
-
-    completed = _run_cli(*args)
-    assert completed.returncode == 2
-    assert "--mode 已移除" in completed.stderr
-    assert "--exa-mode" in completed.stderr
 
 
 def test_search_fetch_similar_provider_choices_are_preserved():

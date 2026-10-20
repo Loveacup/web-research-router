@@ -26,19 +26,6 @@ MODE_ROUTING = config.EXA_MODE_ROUTING
 
 EXA_SEARCH_TYPES = {"auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"}
 
-WRR_MODE_TO_EXA_TYPE = {
-    # WRR router modes are not Exa API search types. Map them at the engine
-    # boundary so explicit WRR modes (e.g. handler arg mode="grounding") don't
-    # leak into Exa's `type` field and cause HTTP 400.
-    "discovery": "auto",
-    "broad": "auto",
-    "grounding": "auto",
-    "platform": "auto",
-    "local": "auto",
-    "recovery": "auto",
-    "research": "deep-lite",
-    "academic": "deep",
-}
 
 
 def classify_query(query: str) -> str:
@@ -62,20 +49,11 @@ def classify_query(query: str) -> str:
 
 
 def get_search_mode(options: SearchOptions) -> str:
-    """确定 Exa API search type；exa_mode 优先，legacy mode 保持兼容。"""
+    """确定 Exa API search type；显式 exa_mode 优先。"""
     exa_mode = getattr(options, "exa_mode", None)
     if exa_mode:
         return exa_mode if exa_mode in EXA_SEARCH_TYPES else "auto"
 
-    legacy_mode = options.mode
-    if legacy_mode:
-        if legacy_mode in EXA_SEARCH_TYPES:
-            return legacy_mode
-        return WRR_MODE_TO_EXA_TYPE.get(legacy_mode, "auto")
-
-    route_mode = getattr(options, "route_mode", None)
-    if route_mode:
-        return WRR_MODE_TO_EXA_TYPE.get(route_mode, "auto")
 
     category = classify_query(options.query)
     return MODE_ROUTING.get(category, "auto")

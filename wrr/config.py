@@ -48,8 +48,7 @@ def _env_bool_from_resolver(key: str, env_resolver: Callable[[str], Optional[str
     return raw.lower() not in {"0", "false", "no", "off"}
 
 
-# ── Fallback 顺序（与历史 extension.ts / v3 __init__.py 一致）─────────────
-SEARCH_FALLBACK_ORDER = ("exa", "deepseek", "brave", "github", "community", "searxng")
+# ── Fetch/similar fallback 顺序 ───────────────────────────────────────
 EXTRACT_FALLBACK_ORDER = ("exa", "brave")   # web_fetch：exa 干净正文 → brave 裸抓取
 SIMILAR_PROVIDERS = ("exa",)                 # findSimilar 仅 Exa 支持
 
@@ -74,13 +73,12 @@ ENGINE_TIMEOUT = {
 DEFAULT_ENGINE_TIMEOUT = 15.0
 
 # ── 预算：fallback 链总响应上限（秒）──────────────────────────────────
-TOTAL_BUDGET_SECONDS = 10.0          # search / similar：交互式，求快
+TOTAL_BUDGET_SECONDS = 10.0          # similar：交互式，求快
 # extract 例外：Exa /contents 正文抽取端点可能慢到接近引擎超时（30s），
 # 10s 总预算会把 exa 卡在 timeout 并跳过 brave 兜底（budget exceeded）。
 # 给 extract 单独的宽预算：容纳 exa 30s engine timeout + brave 10s 兜底。
 EXTRACT_BUDGET_SECONDS = 40.0
 OPERATION_BUDGET_SECONDS = {
-    "search": TOTAL_BUDGET_SECONDS,
     "similar": TOTAL_BUDGET_SECONDS,
     "extract": EXTRACT_BUDGET_SECONDS,
 }
@@ -181,38 +179,6 @@ def early_news_triggered(query: str) -> bool:
 
 
 
-# ── Policy-sensitive 机器信号 ─────────────────────────────────────────
-# 识别政策/法规/监管/政府/法律等高风险查询，仅输出布尔信号供机器消费（如
-# formatter 输出契约）；不改变任何路由选择。
-# 含 false-positive guards：RL 的 "policy gradient"、办公
-# "legal pad"、普通 timeout 等不得触发。
-POLICY_SENSITIVE_CN_KEYWORDS = ("政策", "法规", "法律", "监管", "政府", "合规",
-                                "立法", "条例", "法案", "规章", "备案", "执法")
-POLICY_SENSITIVE_EN_KEYWORDS = ("policy", "policies", "regulation", "regulations",
-                                "regulatory", "legislation", "legislative",
-                                "legal", "government", "governmental",
-                                "compliance", "statute", "statutory")
-# guard 短语：命中即先剔除，避免其中的关键词被误判为政策语义
-POLICY_SENSITIVE_GUARD_PHRASES = ("policy gradient", "legal pad", "legal-size",
-                                  "legal size", "legal paper", "legally blonde")
-
-
-def policy_sensitive_triggered(query: str) -> bool:
-    """查询是否触及政策/法规/监管/政府/法律等高风险语义（纯机器信号）。
-
-    仅输出布尔信号；不改变路由结果。
-    英文关键词按词边界匹配（避免 substring 误伤），中文按子串匹配；guard
-    短语先行剔除，规避 "policy gradient" / "legal pad" 等假阳性。
-    """
-    import re
-    q = (query or "").lower()
-    for phrase in POLICY_SENSITIVE_GUARD_PHRASES:
-        if phrase in q:
-            q = q.replace(phrase, " ")
-    if any(re.search(rf"\b{re.escape(kw)}\b", q, flags=re.ASCII)
-           for kw in POLICY_SENSITIVE_EN_KEYWORDS):
-        return True
-    return any(kw in q for kw in POLICY_SENSITIVE_CN_KEYWORDS)
 
 
 USER_AGENT = "wrr/7.0"

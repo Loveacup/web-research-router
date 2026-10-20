@@ -6,7 +6,7 @@
 
 用法::
 
-    wrr-cli.py search "查询词" [--provider exa] [--count 10] [--exa-mode deep] [--lang zh-CN]
+    wrr-cli.py search "查询词" [--sources exa,deepseek] [--count 8] [--exa-mode deep]
     wrr-cli.py fetch  "https://..." [--provider exa] [--max-chars 5000]
     wrr-cli.py similar "https://..." [--count 10]
     wrr-cli.py test  [--provider exa]
@@ -129,7 +129,7 @@ def cmd_host_fetch_eligibility(ns) -> int:
 
 
 def _result_to_payload(operation: str, result) -> object:
-    """RouterResult.payload → 可 JSON 化结构（search/similar 为 list，extract 为 dict）。"""
+    """RouterResult.payload → 可 JSON 化结构（similar 为 list，extract 为 dict）。"""
     from .schemas import ExtractResult
 
     payload = result.payload
@@ -252,12 +252,6 @@ def cmd_search(ns) -> int:
         _eprint("✗ search 需要 query；或使用 --rpc 从 stdin 接收请求")
         return 2
 
-    if ns.route_mode is not None:
-        _eprint("✗ --route-mode 已移除；请使用自动选源或 --sources a,b")
-        return 2
-    if ns.mode is not None:
-        _eprint("✗ --mode 已移除；Exa search type 请使用 --exa-mode")
-        return 2
     if not 1 <= ns.count <= config.MAX_SEARCH_COUNT:
         _eprint(f"✗ --count 须在 1..{config.MAX_SEARCH_COUNT}")
         return 2
@@ -728,18 +722,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sources", help="显式来源 ID，逗号分隔（最多 4 个）")
     sp.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"])
     sp.add_argument("--trust-project", action="store_true", help="显式信任项目级来源与凭据")
-    sp.add_argument("--route-mode", default=None, help="已移除；使用自动选源或 --sources")
     sp.add_argument(
         "--exa-mode",
         choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
         default=None,
         help="Exa API search type",
-    )
-    sp.add_argument(
-        "--mode",
-        choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
-        default=None,
-        help="已移除；请改用 --exa-mode",
     )
     sp.set_defaults(func=cmd_search)
 
@@ -760,7 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--count", type=int, default=10, help="结果数（默认 10）")
     mp.set_defaults(func=cmd_similar)
 
-    tp = sub.add_parser("test", parents=[common], help="冒烟测试 search/fetch/similar 或运行单元测试")
+    tp = sub.add_parser("test", parents=[common], help="冒烟测试 fetch/similar 或运行单元测试")
     tp.add_argument("what", nargs="?", default="smoke", choices=["smoke", "unit"],
                     help="测试类型：smoke（默认）或 unit")
     tp.set_defaults(func=cmd_test)

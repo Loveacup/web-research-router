@@ -447,12 +447,15 @@ function loadPolicy(path) {
   }
 }
 
-function projectCandidate(details) {
-  if (!isPlainObject(details) || details.operation !== "search" || details.ok !== true || details.provider !== "skill") return null;
-  if (!Array.isArray(details.result) || details.result.length !== 1 || !isPlainObject(details.result[0])) return null;
-  const { title, url, source_tag: sourceTag } = details.result[0];
-  if (typeof title !== "string" || typeof url !== "string" || typeof sourceTag !== "string" || sourceTag !== "skill") return null;
-  return { name: title, url, source_tag: sourceTag };
+export function projectCandidate(details) {
+  if (!isPlainObject(details) || details.quality?.executed !== "ok") return null;
+  if (!Array.isArray(details.plan?.sources) || details.plan.sources.length !== 1 || details.plan.sources[0] !== "skill") return null;
+  if (!Array.isArray(details.runs) || details.runs.length !== 1 || details.runs[0]?.source_id !== "skill" || details.runs[0]?.status !== "ok") return null;
+  if (!Array.isArray(details.results) || details.results.length !== 1 || !isPlainObject(details.results[0])) return null;
+  const { title, url, contributions } = details.results[0];
+  if (typeof title !== "string" || typeof url !== "string" || !Array.isArray(contributions)
+      || contributions.length !== 1 || contributions[0]?.source_id !== "skill") return null;
+  return { name: title, url, source_tag: "skill" };
 }
 
 function createSkillHandoff(pi) {
