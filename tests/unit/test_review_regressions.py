@@ -173,10 +173,9 @@ async def test_flood_readiness_waits_for_complete_pid(tmp_path, monkeypatch, ini
         tasks.append(asyncio.current_task())
         await asyncio.create_subprocess_exec("fake-supervisor")
         try:
-            try:
-                await asyncio.wait_for(publish_pid(), timeout)
-            except asyncio.TimeoutError:
-                return None, "", "configured source timed out"
+            # This fixture publishes before its timeout; wait_for can swallow a
+            # concurrent cancellation as publish_pid completes on Python 3.11.
+            await publish_pid()
             if not cancel:
                 await asyncio.wait_for(pid_ready.wait(), 1)
                 return None, "", "configured source timed out"
