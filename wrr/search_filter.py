@@ -118,6 +118,18 @@ def _public_url(text: str) -> bool:
         return False
 
 
+def _entropy_probe(probe: str) -> str:
+    """Keep URL host/path components separate; leave query/fragment untouched."""
+    def separate(match: re.Match) -> str:
+        url = match.group()
+        end = min((url.index(char) for char in "?#" if char in url), default=len(url))
+        # Dots already delimit _ENTROPY matches. Slashes may be base64 in plain
+        # text, but in URL authority/path they separate ordinary components.
+        return url[:end].replace("/", " ") + url[end:]
+
+    return _URL.sub(separate, probe)
+
+
 def _sensitive(text: str, known_secret: str = "") -> bool:
     # Percent-decoding is screening only: encoded contact details/credentials in
     # a URL must not bypass the gate. Nothing is redacted into a misleading match.
@@ -140,11 +152,82 @@ def _sensitive(text: str, known_secret: str = "") -> bool:
             total += number - 9 if number > 9 else number
         if total % 10 == 0:
             return True
-    for match in _ENTROPY.finditer(probe):
+    for match in _ENTROPY.finditer(_entropy_probe(probe)):
         value = match.group()
         if any(c.isupper() for c in value) and any(c.islower() for c in value) and any(c.isdigit() for c in value):
             return True
     return any(not _public_url(match.group().rstrip(".,;!?)")) for match in _URL.finditer(probe))
+
+
+_CANDIDATE_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:[A-Z][A-Z0-9_-]*[_-])?"
+    r"(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*[:=]\s*[\"']?([A-Za-z0-9+/=_-]{16,})"
+)
+_CANDIDATE_AUTH = re.compile(
+    r"(?i)\b(?:authorization\s*:\s*(?:[A-Za-z]+\s+)?|bearer\s+)[^\s\"'<>]+"
+)
+_CANDIDATE_CONTACT = re.compile(
+    r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b|"
+    r"(?<![\w./+-])(?:\+?1[ .-])?(?:\([2-9]\d{2}\)[ .-]?|[2-9]\d{2}[ .-])"
+    r"[2-9]\d{2}[ .-]\d{4}(?![\w.-])|"
+    r"(?<![\w./+-])1[3-9]\d[ -]\d{4}[ -]\d{4}(?![\w.-])|"
+    r"(?<![\w./+])\+\d{1,3}(?:[ .-]\d{1,5}){2,5}(?![\w.-])|"
+    r"(?<![\w./+-])\d{3}-\d{2}-\d{4}(?![\w.-])|"
+    r"(?<!\w)\d{17}[\dXx](?!\w)"
+)
+_CANDIDATE_URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>\"'`\[\]{}（）【】]+")
+_CANDIDATE_CREDENTIAL_PARAM = re.compile(
+    _CREDENTIAL_PARAM.pattern.replace("[?&;]", "[?#&;]"), re.IGNORECASE
+)
+
+
+def _random_value(value: str) -> bool:
+    """Require a diverse, long value, not just a credential field name."""
+    if len(value) < 16 or len(set(value)) < 8:
+        return False
+    entropy = -sum((value.count(char) / len(value)) * math.log2(value.count(char) / len(value))
+                   for char in set(value))
+    return entropy >= 3
+
+
+def candidate_sensitive(text: str, known_secret: str = "") -> bool:
+    """Screen public candidate material by data shape, never conceptual words.
+
+    This is deliberately separate from the unchanged, stricter query gate.
+    Callers must still exclude local/authenticated provenance before judging.
+    """
+    probe = _normalize(text)
+    for _ in range(3):
+        decoded = _normalize(unquote(probe))
+        if decoded == probe:
+            break
+        probe = decoded
+    if known_secret and _normalize(known_secret) in probe:
+        return True
+    if (_TOKEN.search(probe) or _CANDIDATE_AUTH.search(probe)
+            or re.search(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----", probe)
+            or _CANDIDATE_CONTACT.search(probe) or _LOCAL_PATH.search(probe)):
+        return True
+    if any(_random_value(match[1]) for match in _CANDIDATE_ASSIGNMENT.finditer(probe)):
+        return True
+    for match in _CARD.finditer(probe):
+        digits = re.sub(r"\D", "", match.group())
+        total = 0
+        for position, char in enumerate(reversed(digits)):
+            number = int(char) * (2 if position % 2 else 1)
+            total += number - 9 if number > 9 else number
+        if total % 10 == 0:
+            return True
+    for match in _CANDIDATE_URL.finditer(probe):
+        url = match.group().rstrip(".,;!?)")
+        if not _public_url(url) or _CANDIDATE_CREDENTIAL_PARAM.search(url):
+            return True
+        for token in _ENTROPY.finditer(_entropy_probe(url).replace("=", " ")):
+            value = token.group()
+            if (any(c.isupper() for c in value) and any(c.islower() for c in value)
+                    and any(c.isdigit() for c in value) and _random_value(value)):
+                return True
+    return False
 
 
 def _clip(text: str, limit: int) -> str:
@@ -251,7 +334,7 @@ async def filter_results(
         title, url, snippet = (_normalize(value) for value in (result.title, result.url, result.snippet))
         if not _public_url(url):
             return unchanged("skipped", "non_public_or_unknown_origin")
-        if any(_sensitive(value, api_key) for value in (title, url, snippet, *result.highlights)):
+        if any(candidate_sensitive(value, api_key) for value in (title, url, snippet, *result.highlights)):
             return unchanged("skipped", "sensitive_candidate")
         passage = f"Title: {title}\nURL: {url}\nSnippet: {snippet}"
         if _INSTRUCTION.search(passage):

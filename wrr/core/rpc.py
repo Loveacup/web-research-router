@@ -201,6 +201,7 @@ def _request(message: dict) -> dict:
 
 async def serve_rpc(reader, emit: Callable, *, inventory_factory: Callable, env: Mapping[str, str]) -> int:
     """Serve one search; ``reader.readline`` and ``emit(dict)`` are injectable seams."""
+    from .constraints import SiteConstraintError
     channel = RpcChannel(reader, emit)
     try:
         request = _request(await _read(reader))
@@ -220,18 +221,23 @@ async def serve_rpc(reader, emit: Callable, *, inventory_factory: Callable, env:
         await channel.send({"error": {"reason": "invalid_request"}})
         return 2
     listener = asyncio.create_task(channel.listen())
-    operation = asyncio.create_task(search(**request, inventory=inventory, adapters=adapters, judge=judge))
+    operation = asyncio.create_task(search(**request, inventory=inventory, adapters=adapters, judge=judge,
+                                          known_secret=env.get("TYPESAFE_API_KEY", "")))
     cancellation = asyncio.create_task(channel.cancelled.wait())
     try:
         done, _ = await asyncio.wait((operation, cancellation), return_when=asyncio.FIRST_COMPLETED)
         if cancellation in done and not operation.done():
             operation.cancel()
         evidence = await operation
-        for source in dropped_sources:
-            if source not in evidence.plan.sources:
-                evidence.plan.reasons[source] = "dropped:max_sources"
+        if evidence.quality.executed != "blocked":
+            for source in dropped_sources:
+                if source not in evidence.plan.sources:
+                    evidence.plan.reasons[source] = "dropped:max_sources"
         await channel.send({"result": evidence.to_dict()})
-        return 130 if evidence.quality.executed == "cancelled" else int(evidence.quality.executed == "failed")
+        return 130 if evidence.quality.executed == "cancelled" else int(evidence.quality.executed in {"failed", "blocked"})
+    except SiteConstraintError as error:
+        await channel.send({"error": {"reason": "site_constraint_syntax", "message": str(error)}})
+        return 2
     except ValueError:
         await channel.send({"error": {"reason": "invalid_request"}})
         return 2

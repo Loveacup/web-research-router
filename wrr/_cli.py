@@ -228,6 +228,7 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
 
 # ── 子命令实现 ───────────────────────────────────────────────────────
 def cmd_search(ns) -> int:
+    from wrr.core.constraints import SiteConstraintError
     from wrr import config
     from wrr.core.inventory import build_inventory
     from wrr.core.runtime import prepare_environment, search_evidence
@@ -272,6 +273,12 @@ def cmd_search(ns) -> int:
             trust_project=ns.trust_project, exa_mode=ns.exa_mode,
             count=ns.count, sources=explicit,
         ))
+    except SiteConstraintError as error:
+        if ns.json:
+            _emit_json({"error": {"reason": "site_constraint_syntax", "message": str(error)}})
+        else:
+            _eprint(f"✗ {error}")
+        return 2
     except (ValueError, OSError) as error:
         # Configuration errors are not source runs and must not masquerade as
         # successful evidence. Avoid serializing exception text or credentials.
@@ -285,11 +292,15 @@ def cmd_search(ns) -> int:
             _eprint(f"● sources={','.join(evidence.plan.sources)} "
                     f"executed={quality.executed} relevance={quality.relevance} "
                     f"judge.calls={evidence.judge.calls}")
+            if evidence.constraints:
+                _eprint(f"● site.excluded={evidence.constraints['excluded_count']}")
+                for warning in evidence.constraints.get("warnings", []):
+                    _eprint(f"● {warning}")
         for index, candidate in enumerate(evidence.results, 1):
             print(f"{index}. {candidate.title}\n   {candidate.url}\n   {candidate.snippet}")
     if evidence.quality.executed == "cancelled":
         return 130
-    return 1 if evidence.quality.executed == "failed" else 0
+    return 1 if evidence.quality.executed in {"failed", "blocked"} else 0
 
 
 def cmd_fetch(ns) -> int:

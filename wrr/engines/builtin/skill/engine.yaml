@@ -9,7 +9,7 @@
     "privacy_class": "public", "primary": false, "fresh": false,
     "profile": {"covers": ["agent skill repositories"], "best_for": ["skill discovery"],
                 "weak_for": ["executing skills", "general web"], "freshness": "indexed",
-                "languages": ["en"], "auth": "none"}
+                "languages": ["en"], "auth": "api_key"}
   },
   "capabilities": {
     "actions": ["search"],
@@ -50,14 +50,14 @@
   },
   "requirements": {
     "env": [
-      {"name": "GITHUB_TOKEN", "required": false, "secret": true}
+      {"name": "GITHUB_TOKEN", "required": true, "secret": true}
     ],
     "binaries": [],
     "repos": []
   },
   "health": {
     "checks": [
-      {"type": "env_present", "env": "GITHUB_TOKEN", "required": false}
+      {"type": "env_present", "env": "GITHUB_TOKEN", "required": true}
     ]
   },
   "requires_capabilities": {

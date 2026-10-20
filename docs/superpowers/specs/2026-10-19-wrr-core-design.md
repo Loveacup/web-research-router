@@ -87,12 +87,14 @@ Jev 调用预算：常规 3 次（plan 1 + 候选 1 + 交付充分性 1）；恢
 
 ### 4.2 plan（确定性门 + 检索前 1 次 Jev）
 
-确定性门（0 次 Jev）：
-1. 显式 `sources` 参数 → 跳过选源 judge 直接执行；候选筛选与交付充分性 judge **照常**（质量优先，2026-10-19 裁决）；不触发补搜。
-2. 精确书目（`https://doi.org/...`、`doi:`、裸 DOI、`references:`、`citations:`，复用 `_academic_query` 解析）→ 仅 academic，全程 0 次 Jev。
-3. 本地意图 → 仅 local 来源，禁止送云端。
-4. 隐私门：query 命中敏感启发式 → `judge=skipped:sensitive_query`，走默认计划。
+确定性门（0 次 Jev，按以下优先级）：
+1. `local:` 本地意图 → 仅 local 来源；即使 query 含敏感文本或显式 `sources` 指向 web，也不得外发或进入云端 judge，仍保留本地搜索。
+2. 其余 query 命中 `_sensitive(query)` → 在任何 judge/adapter 调用前终止；空计划 `sources=[]`、`judge=skipped:sensitive_query`、`gate=sensitive_query`，不执行默认主源或恢复。显式 `sources`（包括不可路由来源）和书目门不能绕过。
+3. 显式 `sources` 参数 → 跳过选源 judge 直接执行；候选筛选与交付充分性 judge **照常**（质量优先，2026-10-19 裁决）；不触发补搜。
+4. 精确书目（`https://doi.org/...`、`doi:`、裸 DOI、`references:`、`citations:`，复用 `_academic_query` 解析）→ 仅 academic，全程 0 次 Jev。
 5. 预算：总 deadline、每来源 deadline、最大来源数（默认 4）、最大候选数（默认 20）。
+
+敏感筛选是保守启发式，不等同于识别所有秘密。公开研究 query 中的 `prompt-injection` 或引用攻击指令本身不构成敏感数据；不得仅凭这类关键词禁搜。合成指令型样本若无真实秘密，不应被 harness 当作“必须零外发”的隐私负例；它应独立测试指令不被执行。候选材料中的注入筛选仍按 §4.5 执行。
 
 检索前 Jev（1 次）。state 为命名 JSON：
 ```json
@@ -120,7 +122,13 @@ RRF（k=60）+ `upstream_family` 去重：同规范化 URL 同 family 取最大�
 
 ### 4.5 judge ①：候选筛选（1 次）
 
-隐私门（先于一切）：只有 `privacy_class=public` 来源的结果进入 state；authenticated/local 结果直接保留并标 `unjudged:private`。命中敏感启发式或非公开 URL 的候选**逐条**排除出 state，保留在结果中标 `unjudged:sensitive`，其余照常判断（2026-10-19 裁决，取代整批跳过）；交付 judge 的 `scope` 记录排除数。已知误判：`_ENTROPY` 会把长 GitHub/slug 路径段判为敏感，校准待评估集决定，未放宽。
+隐私门（先于一切）：只有 `privacy_class=public` 来源的结果进入 state；authenticated/local 结果直接保留并标 `unjudged:private`。敏感候选**逐条**排除出候选及交付 state，保留并标 `unjudged:sensitive`，其余照常判断；交付 judge 的 `scope` 记录排除数（2026-10-19 裁决，取代整批跳过）。
+
+**用户 2026-10-21 批准的口径变更：** 仅公开候选的 title/url/snippet 与不外发的 highlights 改用独立 `candidate_sensitive`，不使用查询的概念词规则。按形状保留以下拦截：已知 token（sk-/ghp_/xox/AKIA/AIza/JWT）、KEY/SECRET/TOKEN/PASSWORD 等字段与长随机值赋值、Authorization/Bearer 实值、PEM 私钥头、known_secret 用户 key 值、邮箱、带分隔电话号码、身份证、Luhn 通过的卡号、本地路径、非公开/私网/userinfo URL、query/fragment 凭据参数与 URL 单组件长高熵值。全文在裁剪前检查，百分号最多解码三次；highlights 不进任何 judge state。
+
+概念讨论（password/credentials/API key 等无实值）、重复字符占位赋值、arXiv/DOI/版本标识、年份/价格/issue 编号和不通过 Luhn 的裸长数字，不再仅因词汇或宽泛数字匹配排除。正文中的公开外链不能仅因出现 URL 而拒绝；URL 提取在 Markdown/引用分隔符结束，不拼接相邻主机/路径组件。已有嵌入 URL 的 13 条诊断中，6 条为内部 scheme/loopback/私网示例，7 条为公开非 HTTP 协议、残缺文本或引用边界问题：修正可识别的提取边界，非 HTTP/未知及非公开链接仍保守拦截，不整体停用链接检查。
+
+查询 `_sensitive` 门、执行前 blocked/零外发规则及 local/authenticated 来源边界不变；不按主题词表判秘密。该启发式不保证识别所有隐私，不把送判资格恢复等同于相关性收益。按用户后续简化要求，以红绿回归与一次真实公开查询开发 smoke 为证，不补 tune45 云打分/反事实 capacity 报告，不触碰 validation。
 state：
 ```json
 {"request": {"query": "...", "today": "..."},
@@ -160,7 +168,7 @@ select 产出交付集合（top-k，默认 8）。再问一次（新 state = req
   "runs": [{"source_id": "exa", "status": "ok", "elapsed_ms": 812, "count": 8}],
   "results": [{"title": "...", "url": "...", "snippet": "...", "contributions": [{"source_id": "exa", "rank": 1}],
                "judgment": {"rel": 0.91, "inj": 0.02} , "flags": []}],
-  "quality": {"executed": "ok|partial|failed|cancelled",
+  "quality": {"executed": "ok|partial|failed|cancelled|blocked",
               "relevance": "judged|degraded|unjudged|skipped",
               "sufficiency": {"enough": 0.74, "next_action": "accept", "confidence": 0.7, "scope": "delivered|public_only|after_recovery:raw_scope"},
               "independent_families": 2, "recovered": false},
@@ -168,6 +176,8 @@ select 产出交付集合（top-k，默认 8）。再问一次（新 state = req
 }
 ```
 不变量：`results[i].url` 永远来自某个 `SourceRun`；`quality` 三段独立降级；`judge.calls`（逻辑）与 `posts`（物理）分开。
+
+敏感终止合同：`quality.executed=blocked`、`quality.relevance=skipped`、`runs/results=[]`，judge 的 `calls/posts=0`、`independent_families=0`、`recovered=false`、充分性字段均为空（`scope=none`）。`validate_evidence` 强制该合同，CLI/RPC 返回非成功退出码 1，Hermes/OMP 标错误而不伪称搜索成功。原用户 query 只保留在 Evidence 顶层 `query`；错误类别、plan 理由和诊断不得复制敏感内容。
 
 ### 4.9 remote peers（跨设备合并搜索）
 

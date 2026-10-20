@@ -41,4 +41,4 @@ async def search_evidence(query: str, *, count: int = 8, runtime: str | None = N
     adapters = build_adapters(inventory, env=env, exa_mode=exa_mode)
     judge = resolve_judge(env=env)
     return await search(query, inventory=inventory, adapters=adapters, judge=judge,
-                        count=count, sources=sources)
+                        count=count, sources=sources, known_secret=env.get("TYPESAFE_API_KEY", ""))

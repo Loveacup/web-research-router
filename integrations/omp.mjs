@@ -297,7 +297,7 @@ async function invokeSearchRpc(pi, params, signal, ctx, nativeSearch) {
       cleanup();
       if (failure) { reject(failure); return; }
       if (!result || buffer.trim()) { reject(new Error("WRR returned no complete Evidence")); return; }
-      resolve(toolResult(result, code !== 0 || ["failed", "cancelled"].includes(result.quality?.executed)));
+      resolve(toolResult(result, code !== 0 || ["failed", "cancelled", "blocked"].includes(result.quality?.executed)));
     });
     signal?.addEventListener("abort", abort, { once: true });
     send({

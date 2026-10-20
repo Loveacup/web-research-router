@@ -249,7 +249,7 @@ class Sufficiency:
 
 @dataclass
 class Quality:
-    executed: str                               # ok | partial | failed | cancelled
+    executed: str                               # ok | partial | failed | cancelled | blocked
     relevance: str                              # judged | degraded | unjudged | skipped
     sufficiency: Sufficiency
     independent_families: int
@@ -285,6 +285,8 @@ class Evidence:
     deadline_ms: int
     elapsed_ms: int
     judge: JudgeDiagnostics = field(default_factory=JudgeDiagnostics)
+    constraints: dict[str, Any] = field(default_factory=dict)
+    selection: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -294,7 +296,9 @@ class Evidence:
             "results": [c.to_dict() for c in self.results],
             "quality": self.quality.to_dict(),
             "diagnostics": {"deadline_ms": self.deadline_ms, "elapsed_ms": self.elapsed_ms,
-                            "judge": self.judge.to_dict()},
+                            "judge": self.judge.to_dict(),
+                            **({"selection": dict(self.selection)} if self.selection else {}),
+                            **({"constraints": dict(self.constraints)} if self.constraints else {})},
         }
 
 
@@ -304,6 +308,17 @@ class ContractViolation(ValueError):
 
 def validate_evidence(evidence: Evidence) -> None:
     """Spec §4.8 invariants. Raises ContractViolation."""
+    if evidence.plan.gate == "sensitive_query" or evidence.quality.executed == "blocked":
+        if (evidence.plan.gate != "sensitive_query"
+                or evidence.plan.judge != "skipped:sensitive_query"
+                or evidence.plan.sources or evidence.plan.reasons
+                or evidence.runs or evidence.results
+                or evidence.judge.calls or evidence.judge.posts or evidence.judge.failures
+                or evidence.quality.executed != "blocked"
+                or evidence.quality.relevance != "skipped"
+                or evidence.quality.sufficiency != Sufficiency(None, None, None, "none")
+                or evidence.quality.independent_families or evidence.quality.recovered):
+            raise ContractViolation("sensitive query must terminate before execution")
     run_ids = {run.source_id for run in evidence.runs}
     run_urls = {getattr(r, "url", None) for run in evidence.runs for r in run.results}
     for candidate in evidence.results:
@@ -314,7 +329,7 @@ def validate_evidence(evidence: Evidence) -> None:
                 raise ContractViolation(f"contribution from unknown run: {contribution.source_id}")
         if candidate.privacy_class != PrivacyClass.PUBLIC and candidate.judgment:
             raise ContractViolation(f"private candidate carries cloud judgment: {candidate.url}")
-    if evidence.quality.executed not in {"ok", "partial", "failed", "cancelled"}:
+    if evidence.quality.executed not in {"ok", "partial", "failed", "cancelled", "blocked"}:
         raise ContractViolation("bad executed state")
     if evidence.quality.relevance not in {"judged", "degraded", "unjudged", "skipped"}:
         raise ContractViolation("bad relevance state")

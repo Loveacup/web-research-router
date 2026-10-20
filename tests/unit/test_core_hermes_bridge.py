@@ -209,7 +209,7 @@ def test_provider_errors_never_expose_exception_text(plugin, monkeypatch, error,
     }
 
 
-@pytest.mark.parametrize("executed", ["failed", "cancelled"])
+@pytest.mark.parametrize("executed", ["failed", "cancelled", "blocked"])
 def test_provider_does_not_claim_success_for_failed_execution(plugin, monkeypatch, executed):
     evidence = {"results": [], "plan": {"sources": ["exa"]},
                 "quality": {"executed": executed}, "diagnostics": {"judge": {"calls": 0}}}

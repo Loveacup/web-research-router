@@ -72,6 +72,28 @@ def test_evidence_invariants():
         validate_evidence(_evidence([ok], runs, executed="cancelled", relevance="judged"))
 
 
+@pytest.mark.parametrize("violation", ["plan", "run", "judge", "quality", "sufficiency"])
+def test_sensitive_evidence_enforces_zero_execution_contract(violation):
+    evidence = Evidence(
+        "Contact alice@example.com", Plan([], {}, "skipped:sensitive_query", gate="sensitive_query"),
+        [], [], Quality("blocked", "skipped", Sufficiency(None, None, None, "none"), 0),
+        1000, 0,
+    )
+    validate_evidence(evidence)
+    if violation == "plan":
+        evidence.plan.sources = ["exa"]
+    elif violation == "run":
+        evidence.runs = [SourceRun("exa", RunStatus.ERROR, 0)]
+    elif violation == "judge":
+        evidence.judge.calls = 1
+    elif violation == "quality":
+        evidence.quality.executed = "failed"
+    else:
+        evidence.quality.sufficiency.enough = .8
+    with pytest.raises(ContractViolation, match="sensitive query must terminate before execution"):
+        validate_evidence(evidence)
+
+
 # ── judge ─────────────────────────────────────────────────────────────
 def _transport(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
@@ -238,8 +260,8 @@ def test_select_policy_thresholds_order_and_flags():
              _cand("c5", "https://a/5")]
     answers = _cand_answers({"c0": (0.6, 0.0), "c1": (0.9, 0.4), "c2": (0.9, 0.7), "c3": (0.2, 0.0)})
     out = rubric.select_policy(cands, answers, {"c0", "c1", "c2", "c3"})
-    assert [c.cid for c in out.kept] == ["c1", "c0", "c4", "c5"]
-    assert out.dropped_injection == ["c2"] and out.dropped_relevance == ["c3"]
+    assert [c.cid for c in out.kept] == ["c1", "c0", "c3", "c4", "c5"]
+    assert out.dropped_injection == ["c2"] and out.dropped_relevance == []
     assert "inj:suspect" in cands[1].flags
     assert cands[4].flags == ["unjudged:private"] and cands[4].judgment == {}
     assert cands[5].flags == ["unjudged:overflow"]

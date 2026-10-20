@@ -14,3 +14,10 @@ build/
 # Env
 .env
 .venv/
+
+# Evaluation data derived from private search history: keep local only.
+# Harness code (*.py) is tracked; queries, labels, runs and reports are not.
+evals/**
+!evals/**/
+!evals/**/*.py
+uv.lock

@@ -126,6 +126,8 @@ def test_caller_cancellation_is_not_mapped(monkeypatch):
     (httpx.ReadTimeout("secret"), RunStatus.TIMEOUT),
     (RateLimitError("secret"), RunStatus.RATE_LIMIT),
     (EngineError("EXA_API_KEY not set"), RunStatus.AUTH_ERROR),
+    (EngineError("GITHUB_TOKEN not set"), RunStatus.AUTH_ERROR),
+    (EngineError("GitHub auth failed (check GITHUB_TOKEN)"), RunStatus.AUTH_ERROR),
     (EngineError("HTTP 401"), RunStatus.AUTH_ERROR),
     (EngineError("HTTP 403"), RunStatus.AUTH_ERROR),
     (EngineError("HTTP 429"), RunStatus.RATE_LIMIT),
@@ -142,6 +144,27 @@ def test_engine_failures_are_stable_and_redacted(monkeypatch, exception, status)
         search(fake_engine(monkeypatch, implementation))
     assert error.value.status == status
     assert str(error.value) == status.value
+    assert error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("query", [
+    "BEIR benchmark BM25 dense retrieval zero shot evaluation hybrid retrieval",
+    "For a self-hosted AI agent knowledge base, compare SQLite FTS5 BM25 and hybrid vector search with reciprocal rank fusion. Find official documentation and evaluation evidence.",
+])
+def test_real_skill_missing_token_is_auth_error(query):
+    adapter = sources.build_adapters([
+        descriptor(id="skill", adapter="wrr.engines.skill_discovery:SkillDiscoveryEngine"),
+    ], env={})["skill"]
+
+    async def run():
+        return await adapter.search(
+            query, 8, deadline=asyncio.get_running_loop().time() + 2,
+        )
+
+    with pytest.raises(sources.AdapterError) as error:
+        asyncio.run(run())
+    assert error.value.status == RunStatus.AUTH_ERROR
+    assert str(error.value) == "auth_error"
     assert error.value.__cause__ is None
 
 

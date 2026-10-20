@@ -61,12 +61,32 @@ WRR 不扫描其他宿主的密钥文件，也不把凭据写进 evidence。
 云端外发内容限 query 与公开候选的 title/url/snippet。选源判断还读取公开的来源画像，不读取来源凭据。
 
 - `authenticated`、`local` 结果不进入云端 state，保留并标记为未判断。
-- 敏感 query 跳过云端判断；走确定性默认计划。
-- 敏感候选与非公开 URL 逐条排除；其他公开候选仍可判断。
-- judge 故障保留原结果并披露降级；有效判断全部拒绝时，不额外补搜。
-- 高熵 URL 路径段可能被保守启发式排除；尚未用评估集校准。
+- 非 `local:` 敏感 query 仍使用原 `_sensitive` 严格门：命中即在 judge/adapter 调用前 `blocked`、零外发；显式来源和书目门不能绕过。`local:` 仍只走本地。
+- 仅 `privacy_class=public` 候选改用独立 `candidate_sensitive` 形状检查（**用户 2026-10-21 批准**）。命中者逐条保留并标 `unjudged:sensitive`，不进入候选或交付 judge state，其他公开候选照常判断。highlights 全文仍参与检查，但从不外发。
+- judge 故障保留原结果并披露降级；只有安全硬拒绝导致全空时才标记 `all_rejected` 并停止补搜，低 rel 不触发该分支。
+- 候选仍拦已知 token 形状（sk-/ghp_/xox/AKIA/AIza/JWT）、凭据字段与长随机值赋值、Authorization/Bearer 实值、PEM 私钥头、已知用户 key 值、邮箱／带分隔电话号码／身份证／Luhn 通过的卡号、本地路径，以及非公开、userinfo 或带凭据参数的 URL。URL 熵按单组件检查，保留 query/fragment 检查与百分号解码；公开嵌入链接按 Markdown/引用边界提取，不因链接本身而拒绝。
+- 候选中的 password/credentials/API key 等概念词、无随机实值的占位赋值、arXiv/DOI/版本号、年份/价格/issue 号及不通过 Luhn 的裸长数字不再单凭词汇或数字串拒绝；不使用主题词表推断敏感。以上不改变查询门，也不表示隐私识别完备或相关性质量已验收。
+- 本次形状规则开发烟测：一次真实公开查询 `retrieval augmented generation survey arXiv papers`，DeepSeek/academic 成功、Exa 超时，16 条公开候选；对同批完整原始材料，最终规则离线复筛的 `unjudged:sensitive` 为旧 1 → 新 0。真实运行使用中间版本（1 → 2，新增两条小写 hex 对象 ID 误拦，随后已修复并回归），因此不把最终复筛写成最终版本实跑。3 次 Jev posts，input/output tokens=10546/879，交付 8 条；完整边界见 `evals/runs/20261021T-public-screen-shape-smoke/summary.json`。没有 tune/validation 打分或相关性验收结论。
+- 候选选择策略 `uncertain_tiered_v1`：安全已评候选 `rel>=.65` 按分数降序，`.35<=rel<.65` 保持输入 RRF 原序，`rel<.35` 按分数降序；同分稳定。全部先保留，再截取 top-k；私密、敏感和 overflow 候选仍按既有未评规则透传。`inj>=.5` 与本地注入硬拒不变，suspect 不计充分性。
+- `diagnostics.selection` 区分 `low_confidence_retained_ids` / `uncertain_retained_ids` 与 `topk_truncated_ids`；兼容字段 `dropped_relevance_ids` 为空，不把低分保留称为已验证相关。全低分仍由独立 delivered judge 判断，可 insufficient 或触发一轮补搜；可能增加噪声，不新增云调用，也不代表相关性验收通过。
+- 本次开发烟测使用一次真实公开查询 `Python asyncio TaskGroup documentation site:python.org`：Exa + DeepSeek 均成功，交付 5 条域内结果（4 条高分、1 条不确定保留），3 次 judge calls/posts，耗时 2469 ms；无低分候选，不能由此验证全低分质量。全低分保留、independent delivered insufficient 与一轮补搜由公开 pipeline 回归覆盖；此为开发证据，不是正式留出或新验收。
 
 `quality` 区分执行状态、已判断范围和充分性。多个检索来源不等于多个独立出版者，也不构成事实核验。
+
+### 显式站点约束
+
+`wrr search "Python documentation site:python.org" --json` 将未加引号的正向 `site:hostname` 或 `site:hostname/optional-path` 的 **hostname** 作为确定性来源硬门：只接受该 URL hostname 本身及其点分隔子域。userinfo、路径、查询参数中的域名不算匹配；`python.org.evil.test` 不匹配 `python.org`。保留原 URL，不生成或重写链接。
+
+过滤在融合和候选 judge 之前执行，恢复轮同样执行；无 judge 或 judge 故障也不能绕过。`diagnostics.constraints` 披露 `site_hosts`、按来源计的 `excluded_by_source` 与 `excluded_count`（供应商结果条数，非去重 URL 数）。筛后零候选时返回空结果、`relevance=unjudged`、充分性 `enough=null/scope=site_filtered_empty`，不声称模型判定 `all_rejected`，也不向模型请求空集合充分性。
+
+仅支持一个正向站点（hostname 大小写不敏感，可重复同一站点）。可选路径使用 ASCII URI path 字符或有效 UTF-8 百分号编码；例如 `site:github.com/NousResearch/hermes-agent/releases`、`site:douyin.com/video` 不再整次报错。路径保留在原 query 供 provider 处理，诊断记录 `site_path_hints` 和 `site_path_soft_hint:not_hard_enforced`；**不保证精确路径或路径前缀覆盖，同域其他路径仍可交付**。负向 `-site:`、`NOT`、`OR`/`|`、分组、多个不同站点、完整 URL、userinfo、端口、通配符、路径内 query/fragment、反斜杠和非法编码明确报 `site_constraint_syntax`，不猜测布尔含义。带引号的文字不是操作符。来源继续使用原 query 或既有 keyword-only 转换；当前 adapter/SearchOptions 没有可安全复用的域过滤参数，因此不依赖供应商遵守 `site:` 来保证域约束交付。
+
+普通 Reddit/GitHub 等来源偏好及 `official` 不映射为硬域限制。评估 019/020 的原文分别使用非标准 `site.news.ycombinator.com` / `site.reddit.com`；这不是 `site:`，不会被自动改写，诊断给出 `nonstandard_site_syntax:not_enforced_use_site_colon_hostname`。`source_labels_v2` 对它们的 hard 标注存在语法争议，且仍为 assistant 复核、`user_reviewed=false`；本修复不改标签、不宣称这两条或旧合同误杀率已改善。
+
+公开查询 `Python asyncio TaskGroup documentation site:python.org` 的真实 Exa + DeepSeek 烟测交付 5 条 `docs.python.org` 结果，证据见 [烟测摘要](evals/runs/20261020T-site-constraint-smoke/summary.json)。该次供应商均返回域内候选、硬门排除数为 0；域外及欺骗 URL 的排除由真实 pipeline + ReplayJudge 回归覆盖，不能把烟测当成评估集通过。
+
+路径支持的 [开发烟测](evals/runs/20261020T-site-path-development-smoke/summary.json) 使用一次真实公开 `site:docs.python.org/3/library/asyncio-task.html` 查询：Exa 交付 1 条目标文档，DeepSeek 为空，排除数 0；域外、欺骗域名和恢复过滤由针对性回归覆盖。此为 posthoc 开发证据，不重跑 holdout，不改变冻结 protocol/gold/阈值、历史报告或旧 21.60% 口径，也不是新验收。
+
 
 ## 来源接入：3 档
 

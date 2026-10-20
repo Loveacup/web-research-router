@@ -11,7 +11,13 @@ WRR 7 清洁切换到 `wrr/core` 搜索内核。CLI、OMP 与 Hermes backend 共
 - `wrr search` 仅执行新内核；输出 `plan/runs/results/quality/diagnostics`。
 - Jev 在有宿主 judge 或 WRR 授权环境中的 TypeSafe key 时默认启用。无 judge 时返回确定性默认计划，并标记 `plan.judge=none`。
 - 常规路径最多 3 次 judge；恢复路径最多 4 次，至多补搜 1 轮。显式来源仍接受候选筛选与交付充分性判断，但不自动补搜。
-- 隐私门保留：云端只接收 query、公开候选 title/url/snippet 与公开来源画像。敏感 query 跳过判断；私密、本地、登录态及敏感候选不进入云端 state。
+- 候选选择改为 `uncertain_tiered_v1`：安全已评候选按高分（rel>=.65，降序）、不确定（.35<=rel<.65，保留 RRF 原序）、低分（rel<.35，降序）分层，同分稳定，top-k 前不再因 rel 删除。诊断保留空 `dropped_relevance_ids`，区分低置信保留与 top-k 截断，不宣称已验证相关；可能增加噪声。非公开／敏感／overflow 透传及注入硬拒、suspect 充分性排除不变；只有全安全拒绝才 `all_rejected`。全低分仍接受独立交付充分性判断和至多一轮补搜，不新增云调用；不改冻结协议、历史指标，不据此宣称验收达标。
+- 修复 skill 恢复来源的真实就绪判定：GitHub code search 必需的 `GITHUB_TOKEN` 改为必需依赖及必需轻探针，缺 token 不再标为可路由；直接调用时缺 token／GitHub 认证失败明确保留为 `auth_error`，不伪装空结果。两条原始公开 query 已用真实 adapter／授权环境复验，证据见 `evals/runs/20261020T-skill-readiness-smoke/summary.json`；不据此宣称延迟或相关性验收通过。
+- 隐私门在执行前生效：非 `local:` query 命中 `_sensitive` 时，在任何 judge/adapter 调用前终止，返回 `gate=sensitive_query`、`judge=skipped:sensitive_query`、`quality.executed=blocked/relevance=skipped`、空 `sources/runs/results`、零 judge calls/posts；显式来源和精确书目不可绕过，也不补搜。`local:` 保留本地搜索，即使显式请求 web 来源仍只走 local。原 query 保留于 Evidence 顶层，错误/诊断不复制内容；CLI/RPC 退出码 1，Hermes/OMP 标为错误。敏感检测为启发式；公开 prompt-injection 研究或引用攻击文本不是一律禁搜的理由。私密、本地、登录态及敏感候选仍不进入云端 state。
+- 修复 URL 熵启发式将普通主机／路径组件跨 `/` 拼接后误判敏感：按组件检查，保留单段 token、query／fragment、凭据、解码及非公开 URL 防线；tune45 仅报告可判候选与理论上限，冻结证据缺 Jev 分数，不宣称反事实排序收益。
+- **用户 2026-10-21 批准：仅公开候选改为形状式隐私筛选。** 独立 `candidate_sensitive` 替代候选路径的 `_sensitive`；查询门原样保持，命中仍 blocked、执行前零外发，local/authenticated 仍不进 Jev。公开候选中的概念词、arXiv/DOI/版本标识与普通裸编号不再按词汇或宽泛电话规则误拦；token、长随机凭据赋值、Authorization/Bearer 实值、私钥头、已知用户 key、真实联系形状、Luhn 卡号、本地路径、非公开/带凭据 URL 与 URL 单组件高熵继续拦。highlights 只筛不发。嵌入 URL 的既有 13 条诊断区分私网/内部 scheme 示例与提取边界误报，修正 Markdown/引用边界，不整体关闭 URL 防线；非 HTTP/未知来源仍保守不外发。这是隐私口径变更与误报修正，不是新质量验收；按用户后续简化要求不补 tune45 Jev 分、不作 capacity 反事实报告，也不触碰 validation。
+- 形状规则红绿回归：公开概念/编号先观察到 7 个失败，修复后指定 `test_search_filter.py` 与 `test_core*.py` 共 **669 passed**。仅一次真实公开搜索（DeepSeek/academic 成功，Exa 超时），3 Jev posts、input/output tokens=10546/879；最终规则在该批 16 条完整原始候选上离线复筛，敏感数旧 1 → 新 0。真实调用为中间规则，新增小写 hex URL ID 拦截经红测撤回，不能将最终复筛冒充最终版本实跑；证据与限制见 `evals/runs/20261021T-public-screen-shape-smoke/summary.json`。
+- 明确的正向 `site:hostname[/optional-path]` 新增独立确定性解析和 URL hostname 边界过滤，在融合前及恢复轮执行；不依赖 provider 或 rel 判断，阈值不变。路径仅保留为 provider query 提示，诊断披露 `site_path_hints` / `site_path_soft_hint:not_hard_enforced`，不保证精确路径或路径前缀，同域其他路径不被硬过滤。诊断披露排除条数，筛后零结果为 `site_filtered_empty`，不是模型 `all_rejected`。负 site／OR／分组／多个不同 site／完整 URL／userinfo／端口／非法编码明确报语法错误。普通平台偏好和 `official` 不映射硬域；019/020 原文的非标准 `site.hostname` 只提示争议，不自动当 `site:`。路径回归先红后绿；一次真实公开 Python 文档路径烟测见 `evals/runs/20261020T-site-path-development-smoke/summary.json`，仅为 posthoc 开发证据，不改冻结协议、gold、阈值或历史报告，不宣称新验收通过。
 - README 改写为 WRR 7 的架构、来源接入与宿主指南。旧工程提案顶部标记由 2026-10-19 设计稿取代。
 
 ## 删除清单

@@ -277,6 +277,98 @@ def test_ordinary_public_url_query_parameters_remain_sendable():
     assert outcome.diagnostics["status"] == "ok"
 
 
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/OpenResearchTools/router-v2/documentation",
+    "https://docs.example.org/ResearchTools/router-v2/reference/getting-started",
+    "https://OpenResearchTools.router-v2.documentation.example.org/guide",
+    "https://github.com/OpenResearchTools%2Frouter-v2%2Fdocumentation",
+])
+def test_ordinary_public_url_components_are_not_combined_into_sensitive_tokens(url):
+    assert not search_filter._sensitive(url)
+    results = _results(1)
+    results[0].url = url
+    outcome, requests = _run(results, payload=_payload([(0.9, 0)]))
+    assert len(requests) == 1
+    assert outcome.diagnostics["evaluated_ids"] == [0]
+
+
+@pytest.mark.parametrize("text", [
+    "Documentation discusses password, credentials, API key and private key concepts.",
+    "arXiv:2301.12345 and arXiv:2023.1234567",
+    "DOI 10.1109/ACCESS.20231234567",
+    "Version 123.456.7890 released in 2026; price 1234567890; issue 1234567890123.",
+    "Object identifier 1234567890123456789 is not a Luhn card.",
+    "OpenResearchTools/router-v2/documentation",
+    "PASSWORD=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "See [reference](https://example.org/docs/password).",
+    "See https://example.org/guide` for details.",
+    "See https://example.org/guide】 for details.",
+    "https://example.org/paper/4f8a01bc29d6e75390cfab124875de60123abcdef",
+])
+def test_public_candidate_concepts_and_identifiers_remain_judgeable(text):
+    results = _results(1)
+    results[0].snippet = text
+    outcome, requests = _run(results, payload=_payload([(0.9, 0)]))
+    assert len(requests) == 1
+    assert outcome.diagnostics["evaluated_ids"] == [0]
+    assert outcome.results == results
+
+
+@pytest.mark.parametrize("query", [
+    "password storage research", "credentials documentation", "API key management",
+])
+def test_candidate_policy_does_not_relax_sensitive_query_gate(query):
+    outcome, requests = _run(_results(1), query=query)
+    assert not requests
+    assert outcome.diagnostics["reason"] == "sensitive_query"
+
+
+@pytest.mark.parametrize("value", [
+    "sk-abcdefghijklmnopqrstuv", "ghp_0123456789abcdefghijklmnopqrst",
+    "xox" "b-1234567890-abcdefghijklmn", "AKIA0123456789ABCDEF",  # split: fake token, avoid push-protection match
+    "AIza0123456789abcdefghijklmnopqrstuv",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.aBcD12345",
+    "PASSWORD=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+    "API_KEY=4f8a01bc29d6e75390cfab124875de60",
+    "Authorization: Basic dGVzdDpzZWNyZXQ=", "Bearer actual-value",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "person@example.org", "+44 20 7946 0958", "212-555-0100", "138-1234-5678",
+    "123-45-6789", "11010519491231002X", "4111 1111 1111 1111",
+    "https://127.0.0.1/private", "https://service.internal/guide",
+    "https://person:pass@example.org/guide", "notes /Users/someone/private",
+    "https://example.org/#token=x", "https://example.org/#password=x",
+    "https://example.org/aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+    "https://example.org/?q=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+    "synthetic-test-key", "synthetic%2Dtest%2Dkey",
+])
+@pytest.mark.parametrize("field", ["title", "snippet", "highlights"])
+def test_public_candidate_real_data_shapes_are_never_sent(value, field):
+    results = _results(1)
+    setattr(results[0], field, [value] if field == "highlights" else value)
+    outcome, requests = _run(results)
+    assert not requests
+    assert outcome.diagnostics["reason"] == "sensitive_candidate"
+
+
+@pytest.mark.parametrize("value", [
+    "https://example.org/AKIA0123456789ABCDEF",
+    "https://example.org/sk-abcdefghijklmnopqrstuv",
+    "https://example.org/aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+    "https://example.org/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.aBcD12345",
+    "https://example.org/?q=sk-abcdefghijklmnopqrstuv",
+    "https://example.org/#aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+    "https://example.org/?token=x",
+    "https://example.org/%2573k-abcdefghijklmnopqrstuv",
+    "https://person:pass@example.org/guide",
+    "https://service.internal/guide",
+    "https://127.0.0.1/guide",
+    "OpenResearchTools/router-v2/documentation",
+])
+def test_sensitive_url_components_and_non_url_entropy_remain_blocked(value):
+    assert search_filter._sensitive(value)
+
+
 @pytest.mark.parametrize("field,value", [("source_tag", "local:qmd"), ("source_tag", "local_session"),
                                         ("fusion_sources", ["exa", "local_obsidian"])])
 def test_local_provenance_is_defensively_withheld_even_with_public_url(field, value):

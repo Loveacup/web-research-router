@@ -15,7 +15,9 @@ from .judge import Answer, Question, choice, noul
 # ── Thresholds (spec §4.2, §4.5, §4.6) ───────────────────────────────
 FIT_ACCEPT = 0.65
 FIT_REJECT = 0.35
-REL_KEEP = 0.5
+REL_HIGH = 0.65
+REL_LOW = 0.35
+SELECTION_POLICY = "uncertain_tiered_v1"
 INJ_DROP = 0.5
 INJ_SUSPECT = 0.3
 ENOUGH = 0.6
@@ -217,7 +219,7 @@ def plan_policy(candidates: Sequence[SourceDescriptor], answers: Optional[Mappin
 
 @dataclass
 class SelectionOutcome:
-    kept: list[Candidate]          # ordered for delivery (judged first by rel desc, then unjudged in original order)
+    kept: list[Candidate]          # high rel desc, uncertain RRF order, low rel desc, then unjudged
     dropped_injection: list[str]
     dropped_relevance: list[str]
     answerable: Optional[float]
@@ -227,17 +229,18 @@ class SelectionOutcome:
 def select_policy(candidates: Sequence[Candidate], answers: Optional[Mapping[str, Answer]],
                   judged_ids: set[str], *, local_injection_ids: frozenset[str] | set[str] = frozenset(),
                   sensitive_ids: frozenset[str] | set[str] = frozenset()) -> SelectionOutcome:
-    """Apply rel/inj thresholds. `answers=None` → fail-open: original order, all unjudged.
+    """Rank all safe judged candidates in confidence tiers; never reject by rel.
 
     Local injection screen is a hard gate regardless of judge availability.
     Private candidates (non-public privacy class) are never judged and keep order.
     """
     dropped_inj: list[str] = []
     dropped_rel: list[str] = []
-    judged: list[tuple[float, int, Candidate]] = []
+    judged: list[tuple[int, float, int, Candidate]] = []
     passthrough: list[tuple[int, Candidate]] = []
 
     for index, candidate in enumerate(candidates):
+        candidate.flags[:] = [flag for flag in candidate.flags if not flag.startswith("rel:")]
         if candidate.cid in local_injection_ids:
             dropped_inj.append(candidate.cid)
             continue
@@ -264,13 +267,12 @@ def select_policy(candidates: Sequence[Candidate], answers: Optional[Mapping[str
             continue
         if inj >= INJ_SUSPECT:
             candidate.flags.append("inj:suspect")
-        if rel < REL_KEEP:
-            dropped_rel.append(candidate.cid)
-            continue
-        judged.append((rel, index, candidate))
+        tier = 0 if rel >= REL_HIGH else 1 if rel >= REL_LOW else 2
+        candidate.flags.append(("rel:high_score", "rel:uncertain_retained", "rel:low_confidence_retained")[tier])
+        judged.append((tier, 0 if tier == 1 else -rel, index, candidate))
 
-    judged.sort(key=lambda item: (-item[0], item[1]))
-    kept = [c for _, _, c in judged] + [c for _, c in passthrough]
+    judged.sort(key=lambda item: item[:3])
+    kept = [c for _, _, _, c in judged] + [c for _, c in passthrough]
     answerable = answers["answerable"].p if answers and "answerable" in answers else None
     raw = answers["raw_candidate_sufficiency"].p if answers and "raw_candidate_sufficiency" in answers else None
     return SelectionOutcome(kept, dropped_inj, dropped_rel, answerable, raw)

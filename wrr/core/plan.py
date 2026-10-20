@@ -18,6 +18,15 @@ _BIBLIOGRAPHIC = re.compile(r"(?i)^(?:doi:|references:|citations:|10\.\d{4,9}/\S
 async def plan(query: str, inventory: Sequence[SourceDescriptor], judge: Judge, *,
                deadline: float, sources: Sequence[str] | None = None) -> Plan:
     routable = [s for s in inventory if s.routable and s.capabilities.search]
+    stripped = query.strip()
+    # Privacy gates outrank caller-selected sources and bibliographic routing.
+    # local: is an explicit local-only search, including sensitive local text.
+    if stripped.lower().startswith("local:"):
+        selected = [s.id for s in routable if s.kind == Kind.LOCAL][:rubric.MAX_SOURCES]
+        return Plan(selected, {sid: "gate:local" for sid in selected},
+                    "skipped:local", gate="local")
+    if _sensitive(query):
+        return Plan([], {}, "skipped:sensitive_query", gate="sensitive_query")
     if sources is not None:
         requested = list(dict.fromkeys(sources))
         available = {s.id for s in routable}
@@ -28,18 +37,10 @@ async def plan(query: str, inventory: Sequence[SourceDescriptor], judge: Judge, 
             raise ValueError(f"at most {rubric.MAX_SOURCES} explicit sources allowed")
         return Plan(requested, {sid: "explicit" for sid in requested},
                     "skipped:explicit_sources", gate="explicit_sources")
-    stripped = query.strip()
-    gate = ("bibliographic" if academic_query(stripped) or _BIBLIOGRAPHIC.match(stripped) else
-            "local" if stripped.lower().startswith("local:") else None)
-    if gate:
-        kind = Kind.ACADEMIC if gate == "bibliographic" else Kind.LOCAL
-        selected = [s.id for s in routable if s.kind == kind][:rubric.MAX_SOURCES]
-        return Plan(selected, {sid: f"gate:{gate}" for sid in selected},
-                    f"skipped:{gate}", gate=gate)
-    if _sensitive(query):
-        chosen = rubric.plan_policy(routable, None, "skipped:sensitive_query")
-        chosen.gate = "sensitive_query"
-        return chosen
+    if academic_query(stripped) or _BIBLIOGRAPHIC.match(stripped):
+        selected = [s.id for s in routable if s.kind == Kind.ACADEMIC][:rubric.MAX_SOURCES]
+        return Plan(selected, {sid: "gate:bibliographic" for sid in selected},
+                    "skipped:bibliographic", gate="bibliographic")
     if isinstance(judge, NoJudge) or judge.backend == "none":
         return rubric.plan_policy(routable, None, "none")
     try:

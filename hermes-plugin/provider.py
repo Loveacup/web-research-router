@@ -35,7 +35,7 @@ class WrrWebSearchProvider(BaseWebSearchProvider):
                 key: evidence[key] for key in ("plan", "quality", "diagnostics")
             }
             executed = evidence["quality"]["executed"]
-            if executed in {"failed", "cancelled"}:
+            if executed in {"failed", "cancelled", "blocked"}:
                 response.update(search_fail(f"WRR {executed}"))
             return response
         except ImportError:

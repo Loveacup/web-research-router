@@ -62,6 +62,32 @@ def test_rpc_search_roundtrip_host_judge_provider_and_evidence():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("sources", [None, ["host:web"], ["missing"], ["one", "two", "three", "four", "five"]])
+def test_rpc_sensitive_query_returns_blocked_without_host_requests(sources):
+    async def scenario():
+        query = "Contact alice@example.com"
+        reader = asyncio.StreamReader()
+        feed(reader, {"query": query, "sources": sources, "host": {"judge": True, "search": True}})
+        messages = []
+        code = await serve_rpc(reader, messages.append,
+                               inventory_factory=lambda hosts: (hosts, {}), env={})
+        assert code == 1
+        assert len(messages) == 1
+        evidence = messages[0]["result"]
+        assert evidence["query"] == query
+        assert evidence["plan"]["gate"] == "sensitive_query"
+        assert evidence["plan"]["judge"] == "skipped:sensitive_query"
+        assert evidence["plan"]["sources"] == []
+        assert evidence["plan"]["reasons"] == {}
+        assert evidence["quality"]["executed"] == "blocked"
+        assert evidence["quality"]["relevance"] == "skipped"
+        assert evidence["diagnostics"]["judge"]["calls"] == 0
+        assert evidence["diagnostics"]["judge"]["posts"] == 0
+        assert evidence["runs"] == evidence["results"] == []
+        assert query not in json.dumps(evidence["diagnostics"])
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("provider,expected", [(None, "host-web:opaque"), ("exa", "exa"),
                                                    ("none", "host-web:opaque"), ("bad key value", "host-web:opaque")])
 def test_host_search_provider_family_metadata(provider, expected):
@@ -333,4 +359,20 @@ def test_stdio_rpc_emits_non_ascii_evidence_on_ascii_stdout(monkeypatch):
         monkeypatch.setattr(loop, "connect_read_pipe", connect)
         await stdio_rpc(inventory_factory=lambda hosts: ([], {}), env={})
         assert json.loads(output.getvalue())["result"]["query"] == "地球四季"
+    asyncio.run(scenario())
+
+
+def test_rpc_site_syntax_error_is_visible_without_host_requests():
+    async def scenario():
+        reader = asyncio.StreamReader()
+        feed(reader, {"query": "-site:python.org private-marker",
+                      "host": {"judge": True, "search": True}})
+        messages = []
+        code = await serve_rpc(reader, messages.append,
+                               inventory_factory=lambda hosts: (hosts, {}), env={})
+        assert code == 2
+        assert len(messages) == 1
+        assert messages[0]["error"]["reason"] == "site_constraint_syntax"
+        assert "only positive site:hostname" in messages[0]["error"]["message"]
+        assert "private-marker" not in json.dumps(messages)
     asyncio.run(scenario())

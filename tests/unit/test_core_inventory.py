@@ -192,6 +192,35 @@ def test_cached_healthy_cannot_authorize_missing_key(local_inventory):
     assert source.failure_category == "auth_missing"
 
 
+@pytest.mark.parametrize("source_id,key", [
+    ("exa", "EXA_API_KEY"), ("deepseek", "DEEPSEEK_API_KEY"),
+    ("github", "GITHUB_TOKEN"), ("skill", "GITHUB_TOKEN"),
+    ("brave", "BRAVE_API_KEY"), ("tavily", "TAVILY_API_KEY"),
+])
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("cached_status", ["healthy", "degraded"])
+def test_builtin_api_credentials_gate_cached_readiness(
+    local_inventory, source_id, key, present, cached_status,
+):
+    write, build, state_file = local_inventory
+    path = next(path for path in builtin_manifest_paths() if path.parent.name == source_id)
+    manifest = load_engine_manifest(path, source="builtin", trust_level="builtin").manifest
+    write(manifest.raw)
+    set_cached_health(
+        source_id, "live", EngineHealth(source_id, cached_status).to_dict(), 300,
+        path=state_file,
+    )
+    source = build({key: "test-only-token"} if present else {}, trust_project=True)[0]
+    assert source.routable is present
+    assert source.light_probe_ok is present
+    if present:
+        assert source.provision == Provision.AUTHORIZED
+        assert source.profile.auth == "api_key"
+    else:
+        assert source.provision != Provision.AUTHORIZED
+        assert source.failure_category == "auth_missing"
+
+
 @pytest.mark.parametrize("local_inventory", ["project", "user"], indirect=True)
 @pytest.mark.parametrize("source_kind,source_id", [
     ("local_cli", "local_example"), ("web_api", "example"), ("mcp", "mcp_example"),

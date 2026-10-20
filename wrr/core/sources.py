@@ -82,7 +82,7 @@ def _failure_status(error: Exception) -> RunStatus:
         if isinstance(current, EngineError):
             # Several legacy adapters preserve only a short category message.
             text = str(current).lower()
-            if re.search(r"\b(401|403)\b|unauth|forbidden|api[_ ]?key.*(?:not set|missing)|authentication", text):
+            if re.search(r"\b(401|403)\b|unauth|forbidden|(?:api[_ ]?key|token).*(?:not set|missing)|auth(?:entication)? failed|authentication", text):
                 return RunStatus.AUTH_ERROR
             if re.search(r"\b(429|432)\b|rate.?limit", text):
                 return RunStatus.RATE_LIMIT
