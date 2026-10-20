@@ -4,6 +4,13 @@
   "name": "GitHub",
   "kind": "web_api",
   "adapter": "wrr.engines.github:GitHubEngine",
+  "source": {
+    "transport": "api", "kind": "code", "upstream_family": "github",
+    "privacy_class": "public", "primary": false, "fresh": true,
+    "profile": {"covers": ["GitHub repositories", "issues"], "best_for": ["source code", "project discovery"],
+                "weak_for": ["general web"], "freshness": "indexed",
+                "languages": ["en", "zh"], "auth": "api_key"}
+  },
   "capabilities": {
     "actions": ["search", "extract"],
     "domains": ["code", "issues", "repositories"]

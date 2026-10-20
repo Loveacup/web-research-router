@@ -4,6 +4,13 @@
   "name": "DeepSeek Search",
   "kind": "web_api",
   "adapter": "wrr.engines.deepseek:DeepSeekEngine",
+  "source": {
+    "transport": "api", "kind": "web", "upstream_family": "deepseek",
+    "privacy_class": "public", "primary": true, "fresh": true,
+    "profile": {"covers": ["public web"], "best_for": ["web research", "Chinese sources"],
+                "weak_for": ["exact bibliography"], "freshness": "realtime",
+                "languages": ["zh", "en"], "auth": "api_key"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["web"]

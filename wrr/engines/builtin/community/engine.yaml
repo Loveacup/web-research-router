@@ -4,6 +4,13 @@
   "name": "Community",
   "kind": "web_api",
   "adapter": "wrr.engines.community:CommunityEngine",
+  "source": {
+    "transport": "cli", "kind": "community", "upstream_family": "opencli",
+    "privacy_class": "authenticated", "primary": false, "fresh": true,
+    "profile": {"covers": ["social platforms", "forums"], "best_for": ["community opinions", "recent discussions"],
+                "weak_for": ["authoritative facts"], "freshness": "realtime",
+                "languages": ["zh", "en"], "auth": "login"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["community", "social", "forums", "web"]

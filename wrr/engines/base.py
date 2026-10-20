@@ -14,7 +14,7 @@ class SearchEngine(ABC):
 
     @property
     def timeout(self) -> float:
-        return config.ENGINE_TIMEOUT.get(self.name, config.DEFAULT_ENGINE_TIMEOUT)
+        return config.source_timeout(config.ENGINE_TIMEOUT.get(self.name, config.DEFAULT_ENGINE_TIMEOUT))
 
     async def search(self, options: SearchOptions) -> List[SearchResult]:
         raise EngineError(f"{self.name} does not support search")

@@ -75,54 +75,16 @@ def test_search_route_and_exa_mode_flags_are_orthogonal_and_legacy_alias_parses(
     assert legacy.route_mode is None
 
 
-def test_cmd_search_rejects_conflicting_legacy_and_explicit_exa_modes(monkeypatch):
-    cli = _load_cli_module()
-    ns = cli.build_parser().parse_args([
-        "search", "q", "--mode", "deep", "--exa-mode", "fast",
-    ])
-    monkeypatch.setattr(cli, "_dispatch", lambda *args, **kwargs: pytest.fail("must not dispatch"))
+@pytest.mark.parametrize("exa_mode", [None, "fast", "deep"])
+def test_cmd_search_rejects_legacy_mode_with_migration_hint(exa_mode):
+    args = ["search", "q", "--mode", "deep", "--json"]
+    if exa_mode is not None:
+        args += ["--exa-mode", exa_mode]
 
-    assert cli.cmd_search(ns) == 2
-
-    completed = _run_cli("search", "q", "--mode", "deep", "--exa-mode", "fast", "--json")
+    completed = _run_cli(*args)
     assert completed.returncode == 2
-    assert "值必须一致" in completed.stderr
-
-
-def test_cmd_search_allows_equal_legacy_and_explicit_exa_modes(monkeypatch):
-    cli = _load_cli_module()
-    ns = cli.build_parser().parse_args([
-        "search", "q", "--mode", "deep", "--exa-mode", "deep",
-    ])
-    captured = {}
-
-    def fake_dispatch(operation, options, provider, ident, as_json, quiet, formatter):
-        captured["options"] = options
-        return 0
-
-    monkeypatch.setattr(cli, "_dispatch", fake_dispatch)
-    assert cli.cmd_search(ns) == 0
-    assert captured["options"].mode == "deep"
-    assert captured["options"].exa_mode == "deep"
-
-
-def test_cmd_search_builds_both_mode_fields(monkeypatch):
-    cli = _load_cli_module()
-    ns = cli.build_parser().parse_args([
-        "search", "q", "--route-mode", "research", "--exa-mode", "fast",
-    ])
-    captured = {}
-
-    def fake_dispatch(operation, options, provider, ident, as_json, quiet, formatter):
-        captured["options"] = options
-        return 0
-
-    monkeypatch.setattr(cli, "_dispatch", fake_dispatch)
-    assert cli.cmd_search(ns) == 0
-    assert captured["options"].route_mode == "research"
-    assert captured["options"].exa_mode == "fast"
-
-
+    assert "--mode 已移除" in completed.stderr
+    assert "--exa-mode" in completed.stderr
 
 
 def test_search_fetch_similar_provider_choices_are_preserved():
@@ -338,27 +300,6 @@ def test_cli_test_unit_runs_pytest_with_v6_router_disabled():
         assert called_kwargs["env"]["WRR_V6_ROUTER"] == "0"
 
 
-def test_cli_search_json_includes_diagnostics():
-    """CLI search --json 应输出 diagnostics 字段。"""
-    import os
-    env = os.environ.copy()
-    env["WRR_V6_ROUTER"] = "0"
-    completed = subprocess.run(
-        [sys.executable, str(CLI), "search", "test query", "--json", "--provider", "exa"],
-        cwd=ROOT,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env
-    )
-    if completed.returncode == 0:
-        out = json.loads(completed.stdout)
-        assert out["ok"] is True
-        # 如果 route 返回 diagnostics，CLI 应包含
-        if "diagnostics" in out:
-            assert "events" in out["diagnostics"]
-            assert "elapsed_ms" in out["diagnostics"]
 
 
 def test_direct_cli_skips_python39_default_for_python311_on_path(tmp_path):

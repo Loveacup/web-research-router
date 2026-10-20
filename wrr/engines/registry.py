@@ -1352,7 +1352,7 @@ def _adapter_allowed(
     *,
     trust_project: bool,
 ) -> tuple[bool, str | None]:
-    if not manifest.adapter:
+    if not manifest.adapter and "declarative" not in manifest.raw:
         return False, "adapter_missing"
     if discovery.trust_level == "project" and not trust_project:
         return False, "untrusted_project_plugin"

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """wrr-cli: Web Research Router 的命令行入口。
 
-直接驱动 wrr 包（router + registry + engines），**不经过 Hermes 运行时 / tool handler**，
-便于在终端、脚本、CI 里独立调用 search / fetch / similar。
+独立 CLI：search 驱动 core evidence 流水线；fetch/similar 沿用原有 router，
+不经过宿主运行时或 tool handler。
 
 用法::
 
@@ -14,9 +14,9 @@
 通用选项：--json（机器可读）/ --env PATH（指定 .env）/ -q 静默元信息。
 
 设计取舍：
-  - search 与 Hermes 共用 route_search_v5；fetch/similar 共用 route。
-    宿主只负责参数和输出，不另选默认 search 策略。
-  - --provider 由共享 router 处理：单引擎、禁用 fallback。
+  - search 通过 inventory → adapters → judge → pipeline，不复制路由规则。
+  - --sources 显式指定来源；--provider 在 search 中是单来源快捷方式。
+  - fetch/similar 保持原 router 语义。
   - 仅依赖标准库 + wrr 自身；不引入 click/typer，.env 用内置极简解析器。
 """
 from __future__ import annotations
@@ -269,28 +269,74 @@ def _dispatch(operation: str, options, provider, ident, as_json, quiet, formatte
 
 # ── 子命令实现 ───────────────────────────────────────────────────────
 def cmd_search(ns) -> int:
-    from wrr.schemas import SearchOptions
-    from wrr.formatters import format_search
     from wrr import config
-    if ns.count < 1 or ns.count > config.MAX_SEARCH_COUNT:
+    from wrr.core.inventory import build_inventory
+    from wrr.core.runtime import prepare_environment, search_evidence
+    from wrr.core.sources import build_adapters
+
+    if ns.rpc:
+        from wrr.core.rpc import stdio_rpc
+        try:
+            runtime, snapshot, env = prepare_environment(
+                runtime=ns.runtime, env_path=ns.env, trust_project=ns.trust_project,
+            )
+            def inventory_factory(host_capabilities):
+                inventory = build_inventory(runtime=runtime, env=snapshot,
+                                            trust_project=ns.trust_project,
+                                            host_capabilities=host_capabilities)
+                return inventory, build_adapters(inventory, env=env, exa_mode=ns.exa_mode)
+            return asyncio.run(stdio_rpc(inventory_factory=inventory_factory, env=env))
+        except (ValueError, OSError):
+            print('{"error":{"reason":"configuration_error"}}', flush=True)
+            return 2
+    if ns.query is None:
+        _eprint("✗ search 需要 query；或使用 --rpc 从 stdin 接收请求")
+        return 2
+
+    if ns.route_mode is not None:
+        _eprint("✗ --route-mode 已移除；请使用自动选源或 --sources a,b")
+        return 2
+    if ns.mode is not None:
+        _eprint("✗ --mode 已移除；Exa search type 请使用 --exa-mode")
+        return 2
+    if not 1 <= ns.count <= config.MAX_SEARCH_COUNT:
         _eprint(f"✗ --count 须在 1..{config.MAX_SEARCH_COUNT}")
         return 2
-    legacy_exa_mode = getattr(ns, "mode", None)
-    explicit_exa_mode = getattr(ns, "exa_mode", None)
-    if legacy_exa_mode and explicit_exa_mode and legacy_exa_mode != explicit_exa_mode:
-        _eprint("✗ --mode 是 deprecated Exa alias；与 --exa-mode 同时使用时值必须一致")
+    explicit = None
+    if ns.sources is not None:
+        explicit = [sid.strip() for sid in ns.sources.split(",")]
+        if not explicit or any(not sid for sid in explicit):
+            _eprint("✗ --sources 须为逗号分隔的非空来源 ID")
+            return 2
+    if ns.provider:
+        if explicit is not None and explicit != [ns.provider]:
+            _eprint("✗ --provider 与 --sources 不能指定不同来源")
+            return 2
+        explicit = [ns.provider]
+    try:
+        evidence = asyncio.run(search_evidence(
+            ns.query, runtime=ns.runtime, env_path=ns.env,
+            trust_project=ns.trust_project, exa_mode=ns.exa_mode,
+            count=ns.count, sources=explicit,
+        ))
+    except (ValueError, OSError) as error:
+        # Configuration errors are not source runs and must not masquerade as
+        # successful evidence. Avoid serializing exception text or credentials.
+        _eprint(f"✗ 搜索配置不可用（{type(error).__name__}）；检查 --sources 和 inventory")
         return 2
-    effective_exa_mode = explicit_exa_mode or legacy_exa_mode
-    opts = SearchOptions(
-        query=ns.query,
-        count=ns.count,
-        provider=ns.provider,
-        mode=legacy_exa_mode,
-        route_mode=getattr(ns, "route_mode", None),
-        exa_mode=effective_exa_mode,
-    )
-    return _dispatch("search", opts, ns.provider, ns.query,
-                     ns.json, ns.quiet, format_search)
+    if ns.json:
+        _emit_json(evidence.to_dict())
+    else:
+        if not ns.quiet:
+            quality = evidence.quality
+            _eprint(f"● sources={','.join(evidence.plan.sources)} "
+                    f"executed={quality.executed} relevance={quality.relevance} "
+                    f"judge.calls={evidence.judge.calls}")
+        for index, candidate in enumerate(evidence.results, 1):
+            print(f"{index}. {candidate.title}\n   {candidate.url}\n   {candidate.snippet}")
+    if evidence.quality.executed == "cancelled":
+        return 130
+    return 1 if evidence.quality.executed == "failed" else 0
 
 
 def cmd_fetch(ns) -> int:
@@ -394,6 +440,50 @@ def cmd_test_unit(ns) -> int:
         args = ["pytest", "tests/unit", "-q", "--json-report"]
     print("运行单元测试：" + " ".join(args))
     return subprocess.call(args, env=env)
+
+
+def cmd_inventory(ns) -> int:
+    """List sources using snapshot credentials and non-live registry health."""
+    import os
+    from wrr.core.contracts import Health, Provision
+    from wrr.core.inventory import build_inventory, invalid_manifests
+    from wrr.runtime.detect import detect_runtime
+    from wrr.runtime.env import load_env as load_snapshot
+
+    runtime = detect_runtime(explicit=ns.runtime)
+    env = load_snapshot(
+        runtime, overrides=os.environ, env_files=[ns.env] if ns.env else None,
+        trust_project=ns.trust_project,
+    )
+    sources = build_inventory(runtime=runtime, env=env, trust_project=ns.trust_project)
+    invalid = invalid_manifests(runtime=runtime, trust_project=ns.trust_project)
+    if ns.json:
+        _emit_json({
+            "sources": [source.to_dict() for source in sources],
+            "routable": [source.id for source in sources if source.routable],
+            "invalid": invalid,
+            "summary": {
+                "provision": {
+                    state.value: sum(source.provision == state for source in sources)
+                    for state in Provision
+                },
+                "health": {
+                    state.value: sum(source.health == state for source in sources)
+                    for state in Health
+                },
+            },
+        })
+    else:
+        print(f"{'Source':<24} {'Transport':<10} {'Provision':<12} {'Health':<10} Routable")
+        print("-" * 70)
+        for source in sources:
+            print(f"{source.id:<24} {source.transport.value:<10} "
+                  f"{source.provision.value:<12} {source.health.value:<10} "
+                  f"{'yes' if source.routable else 'no'}")
+        for item in invalid:
+            reasons = ", ".join(item["errors"] + item["blocked"]) or "blocked"
+            print(f"! {item['path']}: {reasons}")
+    return 0
 
 
 def cmd_install(ns) -> int:
@@ -669,27 +759,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("search", parents=[common], help="多引擎 fallback 搜索")
-    sp.add_argument("query")
-    sp.add_argument("--count", type=int, default=10, help="结果数（默认 10）")
-    sp.add_argument(
-        "--route-mode",
-        choices=["discovery", "grounding", "research", "academic", "platform",
-                 "recovery", "local", "broad"],
-        default=None,
-        help="WRR 路由 mode；启用 mode/RRF 多引擎路径",
-    )
+    inv = sub.add_parser("inventory", help="发现本机搜索来源（仅 light 探测与健康缓存）")
+    inv.add_argument("--json", action="store_true", help="输出来源、可路由 ID 与状态计数")
+    inv.add_argument("--env", metavar="PATH", help="指定凭据环境文件")
+    inv.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"],
+                     help="显式指定 runtime")
+    inv.add_argument("--trust-project", action="store_true", help="显式信任项目级来源与凭据")
+    inv.set_defaults(func=cmd_inventory, quiet=True)
+
+    sp = sub.add_parser("search", parents=[common], help="自动选源、融合与质量判断")
+    sp.add_argument("query", nargs="?")
+    sp.add_argument("--rpc", action="store_true", help="单次搜索的 stdin/stdout NDJSON 宿主桥")
+    sp.add_argument("--count", type=int, default=8, help="交付结果数（默认 8）")
+    sp.add_argument("--sources", help="显式来源 ID，逗号分隔（最多 4 个）")
+    sp.add_argument("--runtime", choices=["hermes", "claude_code", "codex", "omp", "standalone", "unknown"])
+    sp.add_argument("--trust-project", action="store_true", help="显式信任项目级来源与凭据")
+    sp.add_argument("--route-mode", default=None, help="已移除；使用自动选源或 --sources")
     sp.add_argument(
         "--exa-mode",
         choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
         default=None,
-        help="Exa API search type；可与 --route-mode 同时使用",
+        help="Exa API search type",
     )
     sp.add_argument(
         "--mode",
         choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
         default=None,
-        help="deprecated：Exa mode 兼容别名；请改用 --exa-mode",
+        help="已移除；请改用 --exa-mode",
     )
     sp.set_defaults(func=cmd_search)
 
@@ -844,7 +940,7 @@ def main(argv: list[str] | None = None) -> int:
     if ns.cmd in {"evidence-gate", "host-fetch-result", "host-fetch-eligibility"}:
         return ns.func(ns)
 
-    use_v6_env = ns.cmd == "install" or (ns.cmd == "doctor" and getattr(ns, "v6", False))
+    use_v6_env = ns.cmd in {"install", "inventory"} or (ns.cmd == "doctor" and getattr(ns, "v6", False))
     try:
         loaded = None if use_v6_env else load_env(getattr(ns, "env", None))
     except (OSError, UnicodeError) as exc:
@@ -859,7 +955,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _eprint(detail)
         return 2
-    if not ns.quiet and not getattr(ns, "json", False):
+    if not ns.quiet and not getattr(ns, "json", False) and not getattr(ns, "rpc", False):
         if loaded:
             _eprint(f"· 已加载 env：{loaded}")
         else:

@@ -4,6 +4,13 @@
   "name": "Skill Discovery",
   "kind": "web_api",
   "adapter": "wrr.engines.skill_discovery:SkillDiscoveryEngine",
+  "source": {
+    "transport": "api", "kind": "code", "upstream_family": "github",
+    "privacy_class": "public", "primary": false, "fresh": false,
+    "profile": {"covers": ["agent skill repositories"], "best_for": ["skill discovery"],
+                "weak_for": ["executing skills", "general web"], "freshness": "indexed",
+                "languages": ["en"], "auth": "none"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["code", "skills", "repositories"]

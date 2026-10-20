@@ -224,6 +224,35 @@ def load_env(
     )
 
 
+def execution_env(snapshot: EnvSnapshot, *, overrides: Mapping[str, str]) -> dict[str, str]:
+    """Resolve only snapshot-authorized values for execution, never reporting.
+
+    Snapshots deliberately omit raw secrets. Re-read their winning authorized
+    file instead of treating a redacted ``value=None`` as a missing credential.
+    Process values are used only when that override won in the snapshot.
+    """
+    resolved: dict[str, str] = {}
+    files: dict[Path, dict[str, str]] = {}
+    for key, value in snapshot.values.items():
+        if value.ignored:
+            continue
+        if not value.secret:
+            if value.value is not None:
+                resolved[key] = value.value
+            continue
+        if not value.secret_allowed:
+            continue
+        if value.source_path is None:
+            if value.source == "overrides" and key in overrides:
+                resolved[key] = overrides[key]
+        else:
+            if value.source_path not in files:
+                files[value.source_path] = _parse_env_file(value.source_path)
+            if key in files[value.source_path]:
+                resolved[key] = files[value.source_path][key]
+    return resolved
+
+
 def _display_path(path: Path | None) -> str | None:
     if path is None:
         return None

@@ -4,6 +4,13 @@
   "name": "Local Supermemory",
   "kind": "hermes_tool",
   "adapter": "wrr.engines.local_supermemory:LocalSupermemoryEngine",
+  "source": {
+    "transport": "api", "kind": "local", "upstream_family": "supermemory",
+    "privacy_class": "local", "primary": false, "fresh": false,
+    "profile": {"covers": ["personal long-term memory"], "best_for": ["saved preferences", "past decisions"],
+                "weak_for": ["public web"], "freshness": "archive",
+                "languages": ["zh", "en"], "auth": "local"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["memory", "local", "personal"]

@@ -4,6 +4,13 @@
   "name": "Local Session Search",
   "kind": "hermes_tool",
   "adapter": "wrr.engines.local_session:LocalSessionEngine",
+  "source": {
+    "transport": "api", "kind": "local", "upstream_family": "hermes-session",
+    "privacy_class": "local", "primary": false, "fresh": false,
+    "profile": {"covers": ["Hermes conversation history"], "best_for": ["past conversations"],
+                "weak_for": ["public web"], "freshness": "archive",
+                "languages": ["zh", "en"], "auth": "local"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["session", "conversation", "local"]

@@ -19,6 +19,7 @@ import tempfile
 from collections.abc import Collection, Mapping
 from typing import Any
 
+from wrr import config
 from wrr.errors import EngineError
 
 _CONFIG_ENV = "WRR_COMMUNITY_CONFIG"
@@ -249,6 +250,8 @@ def _normalize_source(source_id: str, value: Any, authorized: set[str]) -> dict[
 
 def load_source_config(
     reserved: Collection[str],
+    *,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], tuple[str, ...] | None]:
     """Load the single explicitly selected configured-source file.
 
@@ -256,7 +259,7 @@ def load_source_config(
     filesystem lookup. Invalid or unsafe explicit files fail closed.
     """
 
-    path_text = os.environ.get(_CONFIG_ENV)
+    path_text = config.get_env(_CONFIG_ENV) if env is None else env.get(_CONFIG_ENV)
     if path_text is None:
         return {}, None
     if not path_text:
@@ -317,11 +320,11 @@ def isolated_environment(shared_env_keys: Collection[str], home: Path) -> dict[s
         raise _configuration_error("isolated HOME must be absolute")
     env = {"HOME": str(home), "PATH": os.defpath}
     for key in _SAFE_PUBLIC_ENV:
-        value = os.environ.get(key)
+        value = config.get_env(key)
         if value is not None:
             env[key] = value
     for key in normalized_keys:
-        value = os.environ.get(key)
+        value = config.get_env(key)
         if value is not None:
             env[key] = value
     return env

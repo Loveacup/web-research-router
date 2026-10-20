@@ -4,6 +4,13 @@
   "name": "Brave Search",
   "kind": "web_api",
   "adapter": "wrr.engines.brave:BraveEngine",
+  "source": {
+    "transport": "api", "kind": "web", "upstream_family": "brave",
+    "privacy_class": "public", "primary": false, "fresh": true,
+    "profile": {"covers": ["public web"], "best_for": ["keyword search", "recent pages"],
+                "weak_for": ["private content"], "freshness": "indexed",
+                "languages": ["en", "zh"], "auth": "api_key"}
+  },
   "capabilities": {
     "actions": ["search", "extract"],
     "domains": ["web"]

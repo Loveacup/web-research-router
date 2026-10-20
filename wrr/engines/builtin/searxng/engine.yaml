@@ -4,6 +4,13 @@
   "name": "SearXNG",
   "kind": "web_api",
   "adapter": "wrr.engines.searxng:SearxngEngine",
+  "source": {
+    "transport": "api", "kind": "web", "upstream_family": "searxng",
+    "privacy_class": "public", "primary": false, "fresh": true,
+    "profile": {"covers": ["public web"], "best_for": ["metasearch"],
+                "weak_for": ["stable upstream coverage"], "freshness": "indexed",
+                "languages": ["en", "zh"], "auth": "none"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["web"]

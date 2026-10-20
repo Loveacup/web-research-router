@@ -3,6 +3,10 @@
 从单文件 __init__.py 搬迁而来（v4.0）。所有 volatile 阈值集中于此，便于调参。
 """
 import os
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -521,9 +525,32 @@ GITHUB_SCORE_WEIGHTS_V5 = (0.30, 0.30, 0.20, 0.20)  # activity/popularity/freshn
 GITHUB_NEGLECT_RATIO = 0.10                      # open_issues/stars >10% → 被忽视
 
 
+_SOURCE_ENV: ContextVar[Mapping[str, str] | None] = ContextVar("wrr_source_env", default=None)
+_SOURCE_DEADLINE: ContextVar[float | None] = ContextVar("wrr_source_deadline", default=None)
+
+
+@contextmanager
+def source_environment(env: Mapping[str, str], *, deadline: float | None = None):
+    """Bind credentials and a monotonic deadline, including worker threads."""
+    token = _SOURCE_ENV.set(env)
+    deadline_token = _SOURCE_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _SOURCE_ENV.reset(token)
+        _SOURCE_DEADLINE.reset(deadline_token)
+
+
+def source_timeout(default: float) -> float:
+    """Use the core's remaining budget, retaining legacy budgets outside it."""
+    deadline = _SOURCE_DEADLINE.get()
+    return default if deadline is None else max(0.001, deadline - time.monotonic())
+
+
 def get_env(key: str) -> Optional[str]:
-    """读环境变量。懒加载：插件初始化可能早于 .env 加载，故在 handler 内调用。"""
-    return os.environ.get(key)
+    """Read the current source snapshot, or the lazy host environment."""
+    env = _SOURCE_ENV.get()
+    return (os.environ if env is None else env).get(key)
 
 
 def budget_for(operation: str) -> float:

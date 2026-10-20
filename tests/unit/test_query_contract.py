@@ -7,28 +7,54 @@ import pytest
 from conftest import FakeEngine, mk_results
 from wrr import _cli
 from wrr.registry import EngineRegistry
-from wrr.tools.web_search import execute_web_search
 
 
 def test_default_search_has_same_policy_in_cli_and_hermes(monkeypatch, capsys):
-    import wrr.registry as registry_module
+    from wrr.core import hermes_bridge, inventory, judge, sources
+    from wrr.core.contracts import (
+        Health, Kind, PrivacyClass, Provision, SourceDescriptor, Transport,
+    )
+    from wrr.core.judge import ReplayJudge
 
-    registry = EngineRegistry()
-    registry.register(FakeEngine("exa", search_results=mk_results(2)))
-    registry.register(FakeEngine("brave", search_results=mk_results(2)))
-    monkeypatch.setattr(registry_module, "get_registry", lambda: registry)
-    args = _cli.build_parser().parse_args(["search", "needle", "--json"])
+    descriptors = [
+        SourceDescriptor(
+            sid, Kind.WEB, Transport.API, sid, PrivacyClass.PUBLIC,
+            provision=Provision.AUTHORIZED, health=Health.HEALTHY, primary=True,
+        )
+        for sid in ("exa", "deepseek")
+    ]
+    calls = []
 
-    assert _cli.cmd_search(args) == 0
+    class Adapter:
+        async def search(self, query, count, *, deadline):
+            calls.append((query, count))
+            return mk_results(2)
+
+    def respond(state, questions):
+        return {
+            key: (
+                {"type": "choice", "choice": selected, "confidence": .9,
+                 "probabilities": {option: float(option == selected)
+                                   for option in question.criteria}}
+                if question.type == "choice"
+                else {"type": "noul", "noul": .1 if key.startswith("inj.") else .9}
+            )
+            for key, question in questions.items()
+            for selected in ["overview" if key == "evidence_shape" else "accept"]
+        }
+
+    monkeypatch.setattr(inventory, "build_inventory", lambda **kwargs: descriptors)
+    monkeypatch.setattr(sources, "build_adapters", lambda *args, **kwargs:
+                        {descriptor.id: Adapter() for descriptor in descriptors})
+    monkeypatch.setattr(judge, "resolve_judge", lambda **kwargs: ReplayJudge(respond))
+    assert _cli.main(["search", "needle", "--count", "3", "--json"]) == 0
     cli_result = json.loads(capsys.readouterr().out)
-    hermes_result = json.loads(asyncio.run(execute_web_search(
-        {"query": "needle"}, registry=registry, stage_s_enabled=False,
-    )))
-    assert hermes_result["success"] is True
-    details = hermes_result["details"]
-    assert cli_result["provider"] == details["provider"]
-    assert cli_result["quality"] == details["quality"]
-    assert cli_result["fallback_chain"] == details["fallback_chain"]
+    hermes_result = hermes_bridge.search_sync("needle", count=3, runtime="hermes")
+    assert cli_result["plan"] == hermes_result["plan"]
+    assert cli_result["plan"]["sources"] == ["exa", "deepseek"]
+    assert cli_result["plan"]["judge"] == "replay"
+    assert cli_result["quality"] == hermes_result["quality"]
+    assert calls == [("needle", 3)] * 4
 
 
 def test_cli_does_not_probe_another_hosts_credentials(monkeypatch, tmp_path):
@@ -120,30 +146,61 @@ def test_descriptor_search_does_not_reopen_host_credentials(monkeypatch, tmp_pat
     assert opened == []
 
 
-def test_explicit_provider_failure_never_falls_back_across_hosts(monkeypatch, capsys):
-    import wrr.registry as registry_module
+def test_explicit_source_failure_never_falls_back_across_hosts(monkeypatch, capsys):
+    from wrr.core import inventory, judge, sources
+    from wrr.core.contracts import (
+        Health, Kind, PrivacyClass, Provision, SourceDescriptor, Transport,
+    )
+    from wrr.core.judge import ReplayJudge
 
     calls = []
 
-    class BackupEngine(FakeEngine):
-        async def search(self, options):
-            calls.append(self.name)
+    class Adapter:
+        def __init__(self, source_id):
+            self.source_id = source_id
+
+        async def search(self, query, count, *, deadline):
+            calls.append(self.source_id)
+            if self.source_id == "exa":
+                raise RuntimeError("provider unavailable")
             return mk_results(2)
 
-    registry = EngineRegistry()
-    registry.register(FakeEngine("exa", error="provider unavailable"))
-    registry.register(BackupEngine("brave"))
-    monkeypatch.setattr(registry_module, "get_registry", lambda: registry)
-    args = _cli.build_parser().parse_args(["search", "needle", "--provider", "exa", "--json"])
-    assert _cli.cmd_search(args) == 1
-    cli_result = json.loads(capsys.readouterr().out)
-    hermes_result = json.loads(asyncio.run(execute_web_search(
-        {"query": "needle", "provider": "exa"}, registry=registry, stage_s_enabled=False,
-    )))
-    assert cli_result["ok"] is False
-    assert "error" in hermes_result
-    assert cli_result["quality"] == hermes_result["details"]["quality"]
-    assert calls == []
+    descriptors = [
+        SourceDescriptor(
+            source_id, Kind.WEB, transport, source_id, PrivacyClass.PUBLIC,
+            provision=Provision.AUTHORIZED, health=Health.HEALTHY,
+        )
+        for source_id, transport in [("exa", Transport.API), ("host:web", Transport.HOST)]
+    ]
+
+    def request_recovery(state, questions):
+        return {
+            key: (
+                {"type": "choice", "choice": "need_fresher", "confidence": .9,
+                 "probabilities": {option: float(option == "need_fresher")
+                                   for option in question.criteria}}
+                if question.type == "choice" else {"type": "noul", "noul": .1}
+            )
+            for key, question in questions.items()
+        }
+
+    monkeypatch.setattr(inventory, "build_inventory", lambda **kwargs: descriptors)
+    monkeypatch.setattr(sources, "build_adapters", lambda *args, **kwargs: {
+        descriptor.id: Adapter(descriptor.id) for descriptor in descriptors
+    })
+    monkeypatch.setattr(judge, "resolve_judge", lambda **kwargs: ReplayJudge(request_recovery))
+    assert _cli.main(["search", "needle", "--sources", "exa", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["plan"]["sources"] == ["exa"]
+    assert [(run["source_id"], run["status"]) for run in payload["runs"]] == [
+        ("exa", "error")
+    ]
+    assert payload["quality"]["executed"] == "failed"
+    assert payload["quality"]["recovered"] is False
+    assert payload["quality"]["sufficiency"]["next_action"] == "need_fresher"
+    assert payload["quality"]["sufficiency"]["enough"] == .1
+    assert payload["results"] == []
+    assert calls == ["exa"]
 
 
 @pytest.mark.parametrize("operation", ["fetch", "similar"])

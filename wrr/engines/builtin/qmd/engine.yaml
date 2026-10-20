@@ -4,6 +4,13 @@
   "name": "QMD Local Knowledge",
   "kind": "local_cli",
   "adapter": "wrr.engines.local_qmd:LocalQmdEngine",
+  "source": {
+    "transport": "cli", "kind": "local", "upstream_family": "qmd",
+    "privacy_class": "local", "primary": false, "fresh": false,
+    "profile": {"covers": ["indexed local documents"], "best_for": ["local knowledge search"],
+                "weak_for": ["public web", "unindexed files"], "freshness": "indexed",
+                "languages": ["zh", "en"], "auth": "local"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["local_kb", "notes"]

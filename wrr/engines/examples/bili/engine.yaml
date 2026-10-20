@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "id": "bili",
+  "name": "Bilibili CLI (observed 2026-10-19)",
+  "kind": "web_api",
+  "source": {
+    "transport": "cli",
+    "kind": "community",
+    "upstream_family": "bilibili",
+    "privacy_class": "public",
+    "query_style": "keywords",
+    "primary": false,
+    "fresh": false,
+    "profile": {
+      "covers": ["Bilibili public videos"],
+      "best_for": ["Chinese video tutorials"],
+      "weak_for": ["Peer-reviewed research", "Full video transcripts"],
+      "freshness": "indexed",
+      "languages": ["zh"],
+      "auth": "none"
+    }
+  },
+  "capabilities": {
+    "actions": ["search"],
+    "domains": ["community", "video"]
+  },
+  "requirements": {
+    "env": [],
+    "binaries": [
+      {"dep_id": "bili", "name": "bili", "required": true, "version_flag": "--version"}
+    ]
+  },
+  "declarative": {
+    "mode": "cli",
+    "cli": {
+      "command": ["bili", "search", "{query}", "--type", "video", "-n", "{count}", "--json"],
+      "output": "json"
+    },
+    "results": {
+      "root": "$.data",
+      "title": "$.title",
+      "url_template": "https://www.bilibili.com/video/{bvid}"
+    },
+    "timeout_s": 15,
+    "max_output_bytes": 1048576
+  }
+}

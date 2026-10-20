@@ -4,6 +4,13 @@
   "name": "Exa",
   "kind": "web_api",
   "adapter": "wrr.engines.exa:ExaEngine",
+  "source": {
+    "transport": "api", "kind": "web", "upstream_family": "exa",
+    "privacy_class": "public", "primary": true, "fresh": true,
+    "profile": {"covers": ["public web"], "best_for": ["semantic search", "research"],
+                "weak_for": ["private content"], "freshness": "indexed",
+                "languages": ["en", "zh"], "auth": "api_key"}
+  },
   "capabilities": {
     "actions": ["search", "extract", "similar"],
     "domains": ["web"]

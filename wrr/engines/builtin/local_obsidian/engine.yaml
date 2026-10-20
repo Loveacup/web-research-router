@@ -4,6 +4,13 @@
   "name": "Local Obsidian",
   "kind": "local_filesystem",
   "adapter": "wrr.engines.local_obsidian:LocalObsidianEngine",
+  "source": {
+    "transport": "api", "kind": "local", "upstream_family": "obsidian",
+    "privacy_class": "local", "primary": false, "fresh": false,
+    "profile": {"covers": ["local Markdown vaults"], "best_for": ["personal notes"],
+                "weak_for": ["public web"], "freshness": "archive",
+                "languages": ["zh", "en"], "auth": "local"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["local_kb", "notes", "obsidian"]

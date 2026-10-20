@@ -4,6 +4,13 @@
   "name": "Tavily Search",
   "kind": "web_api",
   "adapter": "wrr.engines.tavily:TavilyEngine",
+  "source": {
+    "transport": "api", "kind": "web", "upstream_family": "tavily",
+    "privacy_class": "public", "primary": false, "fresh": true,
+    "profile": {"covers": ["public web"], "best_for": ["research snippets"],
+                "weak_for": ["private content"], "freshness": "indexed",
+                "languages": ["en", "zh"], "auth": "api_key"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["web"]

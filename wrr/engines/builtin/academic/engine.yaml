@@ -4,6 +4,13 @@
   "name": "Academic",
   "kind": "web_api",
   "adapter": "wrr.engines.academic:AcademicEngine",
+  "source": {
+    "transport": "api", "kind": "academic", "upstream_family": "openalex",
+    "privacy_class": "public", "primary": false, "fresh": false,
+    "profile": {"covers": ["scholarly works", "citations"], "best_for": ["DOI lookup", "bibliography"],
+                "weak_for": ["breaking news"], "freshness": "indexed",
+                "languages": ["en"], "auth": "none"}
+  },
   "capabilities": {
     "actions": ["search"],
     "domains": ["academic", "papers", "research", "web"]

@@ -39,13 +39,14 @@ Interactive diagrams (historical snapshot at revision `22d65e7`, v6.1.2): `docs/
 
 | Entrypoint | Router | Registry used for execution |
 |---|---|---|
-| Hermes plugin `web_search` | v5 `route_search_v5` with Stage S on (`__init__.py` sets `stage_s_enabled=True`) | legacy `default_registry()`; `WRR_V6_ROUTER` does **not** change execution |
-| `wrr search` (with or without `--route-mode`) | v5 `route_search_v5`, Stage S off; automatic mode when not explicit | legacy by default; v6 descriptor-backed registry when `WRR_V6_ROUTER=1` |
+| Hermes backend `wrr` (`hermes-plugin/`) | `wrr/core` plan → execute → fuse → judge/select → bounded recovery | local authorized inventory; `TypeSafeJudge` when configured |
+| Legacy Hermes override (`__init__.py`, disabled when enabling backend) | v5 `route_search_v5` with Stage S on | legacy `default_registry()`; retained until slice 7 |
+| `wrr search` | same `wrr/core` pipeline and setup as the Hermes backend | runtime-specific inventory and environment snapshot |
 | `wrr fetch` / `similar` | v4 sequential `route()` — first non-empty engine wins, no RRF | legacy |
 
-### v6 descriptor bridge (shadow, opt-in)
+### Legacy v6 descriptor bridge (shadow, opt-in)
 
-When Stage S is on (the packaged Hermes path) the v6 registry builds a
+When Stage S is on (the legacy override path, not `hermes-plugin/`) the v6 registry builds a
 `DecisionContext` that is compared against the legacy selection plan
 (`wrr/selection_shadow.py`). The comparison is recorded in `RouteTrace` and the
 decision-evidence sink; it never changes which engines run. Only Stage-S-off
@@ -375,21 +376,36 @@ wrr doctor --v6 --json --runtime standalone
 ./wrr-cli.py doctor --json
 ./wrr-cli.py search "your query" --provider exa --count 5
 
-# 3) Hermes plugin — plugin.yaml `entry: __init__.py` registers the wrr toolset;
-#    plugin.yaml `version` is kept aligned with the package version (6.4.0).
-ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
+# 3) Hermes WebSearchProvider backend — install WRR into Hermes's Python environment,
+#    then enable the search-only backend (Hermes must expose register_web_search_provider).
+ln -s ~/code/web-research-router/hermes-plugin ~/.hermes/plugins/web-wrr
+# Back up config.yaml before changing plugin/config selections:
+cp ~/.hermes/config.yaml ~/.hermes/config.yaml.before-web-wrr-$(date +%Y%m%d-%H%M%S)
+hermes plugins disable wrr-hermes
+hermes plugins enable web-wrr
+hermes config set web.search_backend wrr
+# Leave web.backend and web.extract_backend unchanged (e.g. exa for extraction).
+hermes plugins doctor ~/.hermes/plugins/web-wrr
 ```
 
 Notes:
-- CLI and Hermes search now use the same v5 intent/mode routing by default;
-  explicit `--provider` still selects only that provider. `--route-mode` sets
-  WRR policy, while `--exa-mode` (and its legacy `--mode` alias) sets Exa's mode.
-  This policy alignment is not proof of completed OMP integration or credential isolation.
-- CLI credentials come from the existing process environment, then one selected
-  file: `--env`, `WRR_ENV`, or `~/.config/wrr/env.d/default.env`, in that order.
-  Existing process values win. WRR no longer probes `~/.hermes/.env` implicitly;
-  sharing that file requires explicitly selecting it. A missing/unreadable
-  selected file exits with code 2 and never falls back to another credential file.
+- CLI and the Hermes `wrr` backend share the core search policy. Explicit
+  `--provider` is a single-source shortcut for `--sources`; `--route-mode` and
+  `--mode` are rejected. Use `--exa-mode` only for the Exa search type.
+- Hermes keeps its built-in `web_search` tool. The backend returns `data.web`
+  plus `data.wrr.plan`, `data.wrr.quality`, and `data.wrr.diagnostics` (including
+  judge calls/posts). It does not override tools or extract content.
+- User-directory backend plugins require `plugins.enabled` opt-in even though
+  bundled backends auto-load. Disable the old `wrr-hermes` override so Hermes
+  actually dispatches the built-in tool to the new backend. Existing long-lived
+  gateway processes need a plugin reload/restart to see the changed selection;
+  installing/enabling this backend does not restart a gateway.
+- Both entrypoints use an immutable runtime environment snapshot: process
+  values win; `--env` (CLI) / `WRR_ENV` explicitly select one file. Otherwise
+  standalone uses WRR's default env and Hermes uses its own runtime env files.
+  Project secrets require explicit trust. No process environment is mutated,
+  and Hermes never receives a host judge: `TYPESAFE_API_KEY` selects TypeSafe,
+  otherwise judgments are reported as unavailable.
 - `wrr install` remains report-only and requires `--dry-run`. The Python
   `wrr.cli.install.install()` report API also only plans dependency refreshes,
   even with `dry_run=False, refresh_deps=True`; it never clones, fetches, or

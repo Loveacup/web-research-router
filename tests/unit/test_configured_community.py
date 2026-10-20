@@ -82,14 +82,24 @@ def test_configured_catalog_without_optional_mappings_reaches_cli(tmp_path, kind
     path.chmod(0o600)
     envfile = tmp_path / "empty.env"
     envfile.touch()
+    env = dict(os.environ, WRR_V6_ROUTER="0", WRR_COMMUNITY_CONFIG=str(path),
+               WRR_ENV=str(envfile), TYPESAFE_API_KEY="")
+    inventory_run = subprocess.run(
+        [sys.executable, str(project / "wrr-cli.py"), "inventory", "--json"],
+        env=env, capture_output=True, text=True, timeout=15)
+    assert inventory_run.returncode == 0, inventory_run.stderr
+    inventory = json.loads(inventory_run.stdout)
+    catalog = next(source for source in inventory["sources"] if source["id"] == "catalog")
+    assert catalog["id"] in inventory["routable"], catalog
     run = subprocess.run(
         [sys.executable, str(project / "wrr-cli.py"), "search", "Mandarin",
-         "--provider", "community", "--count", "1", "--json"],
-        env=dict(os.environ, WRR_V6_ROUTER="0", WRR_COMMUNITY_CONFIG=str(path),
-                 WRR_ENV=str(envfile)), capture_output=True, text=True, timeout=15)
+         "--sources", catalog["id"], "--count", "1", "--json"],
+        env=env, capture_output=True, text=True, timeout=15)
+    assert run.returncode == 0, (run.stdout, run.stderr)
     payload = json.loads(run.stdout)
-    assert run.returncode == 0, payload
-    assert "https://fixture.invalid/mandarin" in run.stdout
-    if kind == "mcp":
-        sources = payload["diagnostics"]["events"][0]["details"]["sources"]
-        assert sources[0]["detail"] == "mcp_stdio"
+    assert "https://fixture.invalid/mandarin" in {
+        result["url"] for result in payload["results"]
+    }
+    assert [(item["source_id"], item["status"]) for item in payload["runs"]] == [
+        (catalog["id"], "ok")
+    ]

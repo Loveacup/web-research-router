@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Collection
+from typing import TYPE_CHECKING, Any, Callable, Collection
 
 if TYPE_CHECKING:
     from .community_sources import RunCmd, SourceFetchResult
@@ -213,6 +213,8 @@ class McpSourceAdapter:
         options: Any,
         run_cmd: RunCmd,
         timeout: float,
+        *,
+        rows_from_result: Callable[[Any], list[dict[str, Any]]] | None = None,
     ) -> SourceFetchResult:
         # Caller cancellation and the request deadline share one delivery gate.
         # The SDK-owning task must not receive a second cancel during teardown.
@@ -228,7 +230,7 @@ class McpSourceAdapter:
                 timer.cancel()
 
         operation = asyncio.create_task(
-            self._fetch_result(cfg, options, run_cmd, timeout, seal))
+            self._fetch_result(cfg, options, run_cmd, timeout, seal, rows_from_result))
 
         def stop(*, deadline=False):
             nonlocal stop_sent, deadline_expired
@@ -277,6 +279,7 @@ class McpSourceAdapter:
         run_cmd: RunCmd,
         timeout: float,
         seal,
+        rows_from_result: Callable[[Any], list[dict[str, Any]]] | None = None,
     ) -> SourceFetchResult:
         # Method-local imports avoid both the optional-SDK import at module load
         # and the community_sources -> mcp_source registration cycle.
@@ -385,7 +388,7 @@ class McpSourceAdapter:
                                         outcome=SourceOutcome.ERROR,
                                         detail=f"{detail_prefix}.tool_error",
                                     )
-                                rows = _rows_from_tool_result(called)
+                                rows = (rows_from_result or _rows_from_tool_result)(called)
                                 return SourceFetchResult(
                                     items=rows[:count],
                                     outcome=SourceOutcome.READY if rows else SourceOutcome.EMPTY,

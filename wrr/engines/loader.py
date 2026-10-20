@@ -99,6 +99,7 @@ class EnginePluginManifest:
     fusion: dict[str, Any] = field(default_factory=dict)
     repo_requirements: tuple[RepoRequirement, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
+    source: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +115,7 @@ class EnginePluginManifest:
             "adapter": self.adapter,
             "fusion": self.fusion,
             "repo_requirements": [item.to_dict() for item in self.repo_requirements],
+            "source": self.source,
         }
 
 
@@ -265,6 +267,12 @@ def load_engine_manifest(
 def parse_engine_manifest(payload: Mapping[str, Any]) -> tuple[EnginePluginManifest | None, list[str]]:
     errors: list[str] = []
     data = dict(payload)
+    # v7 manifests declare `source`; the v5 `routing`/`health` blocks are then
+    # optional and default to inert values (mode routing no longer exists).
+    if isinstance(data.get("source"), Mapping):
+        data.setdefault("routing", {"modes": ["auto"], "weight": 1.0, "triggers": []})
+        data.setdefault("health", {"checks": []})
+        data.setdefault("requirements", {"env": [], "binaries": [], "repos": []})
     required = (
         "schema_version",
         "id",
@@ -298,6 +306,45 @@ def parse_engine_manifest(payload: Mapping[str, Any]) -> tuple[EnginePluginManif
         errors,
     )
     fusion = _fusion_or_default(data.get("fusion"), errors)
+    source = None
+    if data.get("source") is not None:
+        source = _mapping_or_error(data["source"], "source", errors)
+        if source is not None:
+            _validate_source_schema(source, errors)
+    if "declarative" in data:
+        from wrr.core.exec_declarative import DeclarativeSpec
+
+        spec = DeclarativeSpec.parse(data["declarative"])
+        if isinstance(spec, list):
+            errors.extend(f"invalid:declarative:{error}" for error in spec)
+        elif requirements is not None:
+            # Let the existing registry own all prerequisite checks, including
+            # credentials/binaries omitted from the redundant requirements list.
+            requirements = dict(requirements)
+            if spec.mode == "cli":
+                binaries = requirements.get("binaries", [])
+                if not isinstance(binaries, list):
+                    errors.append("invalid:requirements.binaries")
+                else:
+                    requirements["binaries"] = [
+                        *binaries, {"name": spec.cli["command"][0], "required": True},
+                    ]
+            elif spec.mode == "http":
+                env_names = set(spec.http.get("headers_env", {}).values())
+                env_requirements = requirements.get("env", [])
+                if not isinstance(env_requirements, list):
+                    errors.append("invalid:requirements.env")
+                else:
+                    requirements["env"] = [
+                        *env_requirements,
+                        *({"name": name, "required": True} for name in sorted(env_names)),
+                    ]
+                if health is not None and isinstance(health.get("checks", []), list):
+                    health = {**health, "checks": [
+                        *health.get("checks", []),
+                        *({"type": "env_present", "env": name, "required": True}
+                          for name in sorted(env_names)),
+                    ]}
 
     if capabilities is not None:
         actions = capabilities.get("actions")
@@ -345,9 +392,52 @@ def parse_engine_manifest(payload: Mapping[str, Any]) -> tuple[EnginePluginManif
             fusion=dict(fusion),
             repo_requirements=tuple(repo_requirements),
             raw=data,
+            source=dict(source) if source is not None else None,
         ),
         [],
     )
+
+
+def _validate_source_schema(source: Mapping[str, Any], errors: list[str]) -> None:
+    """Validate the optional v7 source block without changing legacy manifests."""
+    enums = {
+        "transport": {"api", "cli", "mcp", "skill", "host", "remote"},
+        "kind": {"web", "academic", "code", "community", "local", "host"},
+        "privacy_class": {"public", "authenticated", "local"},
+    }
+    for key, choices in enums.items():
+        value = source.get(key)
+        if not isinstance(value, str) or value not in choices:
+            errors.append(f"invalid:source.{key}")
+    if not _non_empty_string(source.get("upstream_family")):
+        errors.append("invalid:source.upstream_family")
+    if "query_style" in source and (
+        not isinstance(source["query_style"], str)
+        or source["query_style"] not in {"natural", "keywords"}
+    ):
+        errors.append("invalid:source.query_style")
+    for key in ("primary", "fresh"):
+        if key in source and not isinstance(source[key], bool):
+            errors.append(f"invalid:source.{key}")
+    if "profile" not in source:
+        return
+    profile = _mapping_or_error(source["profile"], "source.profile", errors)
+    if profile is None:
+        return
+    for key in ("covers", "best_for", "weak_for", "languages"):
+        if key in profile and (
+            not isinstance(profile[key], list)
+            or not all(_non_empty_string(item) for item in profile[key])
+        ):
+            errors.append(f"invalid:source.profile.{key}")
+    for key, choices in (
+        ("freshness", {"realtime", "daily", "indexed", "archive", "unknown"}),
+        ("auth", {"none", "api_key", "login", "local"}),
+    ):
+        if key in profile and (
+            not isinstance(profile[key], str) or profile[key] not in choices
+        ):
+            errors.append(f"invalid:source.profile.{key}")
 
 
 def _validate_health_schema(health: Mapping[str, Any], errors: list[str]) -> None:
@@ -538,12 +628,12 @@ def _with_blocked_reasons(discovery: EngineDiscovery, *, trust_project: bool) ->
     if (
         discovery.valid
         and manifest is not None
-        and manifest.adapter
+        and (manifest.adapter or "declarative" in manifest.raw)
         and discovery.trust_level == TRUST_PROJECT
         and not trust_project
     ):
         reasons.append("untrusted_project_plugin")
-        if manifest.adapter.startswith(".") or manifest.adapter.endswith(".py"):
+        if manifest.adapter and (manifest.adapter.startswith(".") or manifest.adapter.endswith(".py")):
             reasons.append("untrusted_project_adapter_path")
     if not reasons:
         return discovery

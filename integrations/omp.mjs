@@ -132,6 +132,182 @@ function toolResult(details, isError = false) {
   };
 }
 
+// resolveJudge speaks native noul; eval's public bool alias never crosses RPC.
+function nativeQuestion(question) {
+  return { ...question, type: question.type === "bool" ? "noul" : question.type };
+}
+
+function wireAnswer(answer) {
+  if (answer.type === "bool") {
+    const { bool, ...rest } = answer;
+    return { ...rest, type: "noul", noul: bool };
+  }
+  return answer;
+}
+
+async function hostJudge(pi, ctx) {
+  try {
+    const { resolveJudge } = await import("@oh-my-pi/pi-coding-agent/judgment");
+    return resolveJudge({
+      settings: pi.pi.settings, registry: ctx.modelRegistry, sessionModel: ctx.model,
+      sessionId: ctx.sessionManager.getSessionId(), purpose: "wrr-search",
+    });
+  } catch {
+    // Installed hosts without the export use Python's TypeSafe/NoJudge resolver.
+    return null;
+  }
+}
+
+async function invokeSearchRpc(pi, params, signal, ctx, nativeSearch) {
+  if (signal?.aborted) throw new DOMException("WRR call cancelled", "AbortError");
+  const judge = await hostJudge(pi, ctx);
+  if (signal?.aborted) throw new DOMException("WRR call cancelled", "AbortError");
+  const python = process.env.WRR_PYTHON || join(root, ".venv", "bin", "python");
+  if (!process.env.WRR_PYTHON && !existsSync(python)) {
+    throw new Error("WRR Python environment unavailable; install WRR or explicitly set WRR_PYTHON");
+  }
+  const deadlineMs = params.deadline_ms ?? 15000;
+  const env = childEnvironment();
+  const cancellationGrace = env.WRR_COMMUNITY_CONFIG ? 8000 : 1000;
+  return new Promise((resolve, reject) => {
+    const child = spawn(python, [join(root, "wrr-cli.py"), "search", "--rpc", "-q"], {
+      cwd: ctx.cwd, env, shell: false,
+      detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
+    });
+    const active = new Map();
+    let buffer = "";
+    let bytes = 0;
+    let result;
+    let failure;
+    let killTimer;
+    let exited = false;
+    const send = message => {
+      if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.write(JSON.stringify(message) + "\n");
+    };
+    const kill = name => {
+      if (!child.pid || exited) return;
+      try {
+        if (process.platform === "win32") child.kill(name);
+        else process.kill(-child.pid, name);
+      } catch (error) {
+        if (error.code !== "ESRCH") failure ??= new Error("WRR process teardown failed");
+      }
+    };
+    const stop = error => {
+      if (failure) return;
+      failure = error;
+      send({ method: "cancel" });
+      for (const controller of active.values()) controller.abort();
+      // Let Python serialize cancelled evidence and tear down source tasks first.
+      killTimer = setTimeout(() => {
+        kill("SIGINT");
+        killTimer = setTimeout(() => kill("SIGKILL"), cancellationGrace);
+      }, 1000);
+    };
+    const abort = () => stop(new DOMException("WRR call cancelled", "AbortError"));
+    const timer = setTimeout(() => stop(new Error("WRR deadline exceeded")), deadlineMs + 1000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", abort);
+      for (const controller of active.values()) controller.abort();
+    };
+    const dispatch = async message => {
+      if (message.method === "cancel") {
+        active.get(message.id)?.abort();
+        return;
+      }
+      if (Object.hasOwn(message, "result") && !Object.hasOwn(message, "id")) {
+        result = message.result;
+        return;
+      }
+      if (message.error && !message.id) {
+        stop(new Error(`WRR RPC ${message.error.reason ?? "failed"}`));
+        return;
+      }
+      if (!message.id || !["judge", "host_search"].includes(message.method)) {
+        stop(new Error("WRR returned an invalid RPC message"));
+        return;
+      }
+      const controller = new AbortController();
+      active.set(message.id, controller);
+      if (signal?.aborted || failure) controller.abort();
+      try {
+        let response;
+        if (message.method === "judge") {
+          if (!judge) throw new Error("unavailable");
+          const questions = Object.fromEntries(Object.entries(message.params.questions).map(([id, q]) => [id, nativeQuestion(q)]));
+          const value = await judge.judge({ state: message.params.state, questions }, { signal: controller.signal });
+          response = {
+            answers: Object.fromEntries(Object.entries(value.answers).map(([id, answer]) => [id, wireAnswer(answer)])),
+            model: value.model,
+            posts: 1,
+            usage: { input_tokens: value.usage?.input ?? value.usage?.input_tokens ?? 0,
+              output_tokens: value.usage?.output ?? value.usage?.output_tokens ?? 0 },
+          };
+        } else {
+          if (!nativeSearch) throw new Error("unavailable");
+          const value = await nativeSearch({
+            query: message.params.query, limit: message.params.count,
+          }, controller.signal);
+          if (value.details?.error || value.isError) throw new Error("unavailable");
+          const native = value.details?.response;
+          if (!native || !Array.isArray(native.sources ?? native.citations)) throw new Error("malformed_response");
+          response = {
+            provider: native.provider,
+            results: (native.sources?.length ? native.sources : native.citations ?? []).map(row => ({
+              title: row.title ?? row.url, url: row.url, snippet: row.snippet ?? row.citedText ?? "",
+            })),
+          };
+        }
+        if (!controller.signal.aborted) send({ id: message.id, result: response });
+      } catch (error) {
+        const reason = controller.signal.aborted ? "cancelled"
+          : ["unavailable", "malformed_response"].includes(error.message) ? error.message : "network";
+        send({ id: message.id, error: { reason } });
+      } finally {
+        active.delete(message.id);
+      }
+    };
+    child.stdin.on("error", () => {});
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", chunk => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > outputLimit) { stop(new Error("WRR output limit exceeded")); return; }
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        try {
+          const message = JSON.parse(line);
+          if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error();
+          void dispatch(message).catch(() => stop(new Error("WRR RPC dispatch failed")));
+        } catch { stop(new Error("WRR returned invalid NDJSON")); }
+      }
+    });
+    child.stderr.on("data", chunk => {
+      bytes += chunk.length;
+      if (bytes > outputLimit) stop(new Error("WRR output limit exceeded"));
+    });
+    child.once("error", () => { cleanup(); reject(new Error("WRR Python process could not start")); });
+    child.once("exit", () => { exited = true; });
+    child.once("close", code => {
+      cleanup();
+      if (failure) { reject(failure); return; }
+      if (!result || buffer.trim()) { reject(new Error("WRR returned no complete Evidence")); return; }
+      resolve(toolResult(result, code !== 0 || ["failed", "cancelled"].includes(result.quality?.executed)));
+    });
+    signal?.addEventListener("abort", abort, { once: true });
+    send({
+      query: params.query, count: params.count ?? 8, sources: params.sources ?? (params.provider ? [params.provider] : null),
+      deadline_ms: deadlineMs, host: { judge: judge !== null, search: !!nativeSearch },
+    });
+    if (signal?.aborted) abort();
+  });
+}
+
 function handoffReason(result) {
   const raw = result.details?.ok
     ? result.details?.quality?.reasons?.[0] ?? "quality_incomplete"
@@ -560,12 +736,14 @@ export default function wrrExtension(pi) {
   const definitions = [
     {
       name: "wrr_search", operation: "search", label: "WRR Search",
-      description: "Search external sources through WRR's shared routing and quality policy. Results are search excerpts, not fetched page bodies.",
+      description: "Search through WRR's inventory, shared Jev routing and quality policy. Returns Evidence with source runs and judgments; use web_search to also include the host-native search chain.",
       parameters: z.object({
-        query: z.string().min(1), count, provider, mode: z.string().nullable().optional(),
+        query: z.string().min(1), count, provider,
+        sources: z.array(z.string().min(1)).nullable().optional(),
+        deadline_ms: z.number().int().min(1).max(300000).nullable().optional(),
         skill_handoff: z.enum(["request"]).nullable().optional().describe("Request a host skill recommendation. Valid only with provider=skill and count=1; requires a WRR skill-handoff policy. WRR never invokes the skill."),
       }),
-      args: p => [p.query, ...(p.count == null ? [] : ["--count", String(p.count)]), ...(p.mode ? ["--route-mode", p.mode] : [])],
+      args: p => [p.query, ...(p.count == null ? [] : ["--count", String(p.count)])],
     },
     {
       name: "wrr_fetch", operation: "fetch", label: "WRR Fetch",
@@ -598,6 +776,7 @@ export default function wrrExtension(pi) {
         if (definition.operation === "search" && params.skill_handoff != null) {
           return skillHandoff.search(params, signal, ctx);
         }
+        if (definition.operation === "search") return invokeSearchRpc(pi, params, signal, ctx);
         const [identifier, ...options] = definition.args(params);
         const args = [definition.operation, ...options, "--json", "-q"];
         if (params.provider) args.push("--provider", params.provider);
@@ -658,6 +837,26 @@ export default function wrrExtension(pi) {
       },
     });
   }
+
+  pi.registerTool({
+    name: "web_search", label: "WRR Web Search",
+    description: "Search public web through WRR's shared Jev routing and evidence-quality pipeline, including this session's native search role and fallback chain.",
+    parameters: z.object({
+      query: z.string().min(1), count,
+      limit: count, num_search_results: count,
+      sources: z.array(z.string().min(1)).nullable().optional(),
+      deadline_ms: z.number().int().min(1).max(300000).nullable().optional(),
+    }),
+    loadMode: "essential", approval: "read",
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      // Only this same-name context is allowed to reach the original built-in.
+      const nativeSearch = typeof ctx.invokeTool === "function"
+        ? (query, nativeSignal) => ctx.invokeTool(query, { signal: nativeSignal }) : null;
+      return invokeSearchRpc(pi, {
+        ...params, count: params.count ?? params.num_search_results ?? params.limit,
+      }, signal, ctx, nativeSearch);
+    },
+  });
 
   pi.registerTool({
     name: "wrr_host_fetch_handoff",
