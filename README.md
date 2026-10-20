@@ -164,16 +164,16 @@ upgrade shared tools. Set `WRR_LAST30DAYS_EN_PYTHON` to a supported interpreter
 Requires Python >= 3.11 (`pyproject.toml` enforces this). `./wrr-cli.py` selects a supported repository virtual environment or `python3.11+` on `PATH`; if none exists, it exits 126 with an actionable error.
 
 ```bash
-# Install as Hermes plugin
-ln -sf ~/code/web-research-router ~/.hermes/plugins/wrr-hermes
+# Hermes backend activation: follow "Packaging & install" below (backs up config
+# and disables the legacy override before selecting the wrr backend).
 
-# Legacy-compatible CLI examples (requires Python >=3.11)
+# CLI examples (requires Python >=3.11)
 ./wrr-cli.py doctor          # 引擎 + 全量依赖自检
 ./wrr-cli.py doctor --json   # legacy JSON 输出，迁移窗口内 schema 保持不变
 ./wrr-cli.py search "your query" --provider exa --count 5
 ./wrr-cli.py fetch "https://example.com" --provider exa --max-chars 2000
 ./wrr-cli.py similar "https://example.com" --provider exa --count 5
-wrr search "your query" --route-mode research   # explicit override of automatic mode
+wrr search "your query" --sources exa,deepseek   # explicit source selection
 ```
 
 ### OMP native extension
@@ -432,9 +432,9 @@ Notes:
   supervised by the Hermes plugin lifecycle. It calls the registered WRR production
   handler directly and stops on drain/close/disable or the first failed sample;
   Hermes core is not modified.
-- The v6 migration gate stays **opt-in**: installation does not activate
-  descriptor execution. The existing `doctor --v6` control-plane path remains
-  separate from the shared v5 query policy described above.
+- The legacy v6 router gate stays **opt-in** for callers that still use it.
+  CLI search and the Hermes `wrr` backend use core inventory execution directly;
+  `doctor --v6` remains a separate control-plane diagnostic path.
 - Wheel verification should confirm the built-in engine manifests are packaged:
   `pyproject.toml` ships `engines/builtin/*/engine.yaml` via `[tool.*] package-data`
   (`wrr = ["engines/builtin/*/engine.yaml"]`). After `python -m build`, inspect the
